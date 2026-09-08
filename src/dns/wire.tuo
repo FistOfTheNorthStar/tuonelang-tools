@@ -1,0 +1,330 @@
+// dns::wire — the byte-order layer the DNS message format is framed in.
+//
+// RFC 1035 §4 defines every DNS message as a 12-byte header followed by four
+// counted sections, and every multi-byte field in it — the id, the flags word,
+// the four section counts, a record's type, class, and rdlength — is a
+// big-endian unsigned 16-bit integer. The TTL is the one 32-bit field.
+//
+// So this module is to DNS what `db::bytes` is to the PostgreSQL wire protocol:
+// the single place byte order is decided, so that no parser open-codes
+// `b0 * 256 + b1` at its call site.
+//
+// WHY THIS IS NOT JUST `std::bits`.
+//
+// `std::bits::be16` already composes two bytes into a `U16`, and the encoders
+// below are written over it rather than over arithmetic. What this module adds
+// is the **decoder half against a buffer with bounds**: `u16_at` reports
+// `Option[Int]` for a message that ended early, which is the single most common
+// shape of a malformed DNS response and the one a network parser must handle
+// rather than trap on. A truncated datagram is a routine event on the wire, not
+// a programming error, so it is typed as one.
+
+module dns::wire;
+
+/// The width of a DNS header, in bytes (RFC 1035 §4.1.1).
+///
+/// Every message — query or response — begins with exactly this many bytes,
+/// so a datagram shorter than this cannot be a DNS message at all.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::wire::header_len(); // 12
+/// ```
+pub fn header_len() -> Int {
+    12
+}
+
+/// The largest value a DNS `U16` field can hold.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::wire::u16_max(); // 65535
+/// ```
+pub fn u16_max() -> Int {
+    65535
+}
+
+/// Append `v` as a big-endian **U16** — the width of the id, the flags word,
+/// every section count, and a record's type, class, and rdlength.
+///
+/// `v` is masked to 16 bits, so a caller that computes a value out of range
+/// produces a well-formed (if wrong) message rather than a trap. The masking
+/// is what makes this total; the callers that care about range check it.
+///
+/// # Example
+/// ```tuo
+/// var buf = std::string::empty();
+/// dns::wire::put_u16(buf, 256); // buf is now [0x01, 0x00]
+/// ```
+pub fn put_u16(mut buf: String, take v: Int) {
+    let n = v & u16_max();
+    std::string::push_byte(buf, std::bits::byte_of_be16(n, 0));
+    std::string::push_byte(buf, std::bits::byte_of_be16(n, 1));
+}
+
+/// Read the big-endian **U16** that begins at byte `at` of `msg`, or `None`
+/// when the message ends before the field does.
+///
+/// The `None` is the point: a response truncated mid-field is a wire event, not
+/// a bug, and every caller in this crate is written to propagate it.
+///
+/// # Example
+/// ```tuo
+/// let id = dns::wire::u16_at("\x12\x34", 0); // Some(4660)
+/// ```
+pub fn u16_at(in msg: Str, take at: Int) -> Option[Int] {
+    if at < 0 {
+        return None;
+    }
+    if at + 2 > std::str::len(msg) {
+        return None;
+    }
+    Some { value: std::bits::be16(std::str::byte_at(msg, at), std::str::byte_at(msg, at + 1)) }
+}
+
+/// Read the big-endian **U32** that begins at byte `at` of `msg`, or `None`
+/// when the message ends before the field does.
+///
+/// The TTL is the only 32-bit field in a DNS record, so this decoder has
+/// exactly one caller — but it is the field a resolver cache is built on, so
+/// it is decoded here rather than inline.
+///
+/// # Example
+/// ```tuo
+/// let ttl = dns::wire::u32_at("\x00\x00\x01\x00", 0); // Some(256)
+/// ```
+pub fn u32_at(in msg: Str, take at: Int) -> Option[Int] {
+    if at < 0 {
+        return None;
+    }
+    if at + 4 > std::str::len(msg) {
+        return None;
+    }
+    Some { value: std::bits::be32(std::str::byte_at(msg, at), std::str::byte_at(msg, at + 1), std::str::byte_at(msg, at + 2), std::str::byte_at(msg, at + 3)) }
+}
+
+/// Byte `at` of `msg`, or `None` past the end.
+///
+/// The one-byte case of the decoders above — used for a label's length octet
+/// and for the rdata a record carries.
+///
+/// # Example
+/// ```tuo
+/// let b = dns::wire::byte_at("\x05", 0); // Some(5)
+/// ```
+pub fn byte_at(in msg: Str, take at: Int) -> Option[Int] {
+    if at < 0 {
+        return None;
+    }
+    if at >= std::str::len(msg) {
+        return None;
+    }
+    Some { value: std::str::byte_at(msg, at) }
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+//
+// A spec's `then` is an expression, so a codec that writes into a `String` is
+// proven through a named helper that does the mutation and reports one value.
+// These exist for the specs; they are also the smallest honest statement of
+// what each encoder guarantees.
+// ----------------------------------------------------------------------------
+
+/// The `i`th byte that `put_u16` writes for `v`, or `-1` past the field.
+///
+/// # Example
+/// ```tuo
+/// let hi = dns::wire::u16_byte(4660, 0); // 0x12
+/// ```
+pub fn u16_byte(take v: Int, take i: Int) -> Int {
+    var buf = std::string::empty();
+    put_u16(buf, v);
+    let s = std::string::as_str(buf);
+    if i < 0 {
+        return 0 - 1;
+    }
+    if i >= std::str::len(s) {
+        return 0 - 1;
+    }
+    std::str::byte_at(s, i)
+}
+
+/// The number of bytes `put_u16` writes — always 2, whatever the value.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::wire::u16_width(65536); // 2
+/// ```
+pub fn u16_width(take v: Int) -> Int {
+    var buf = std::string::empty();
+    put_u16(buf, v);
+    std::str::len(std::string::as_str(buf))
+}
+
+/// Encode `v` with `put_u16`, decode it back with `u16_at`, and report the
+/// result — the round trip the two halves of this module must agree on.
+///
+/// # Example
+/// ```tuo
+/// let v = dns::wire::roundtrip_u16(4660); // 4660
+/// ```
+pub fn roundtrip_u16(take v: Int) -> Int {
+    var buf = std::string::empty();
+    put_u16(buf, v);
+    match u16_at(std::string::as_str(buf), 0) {
+        Some { value } => value,
+        None => 0 - 1,
+    }
+}
+
+/// `u16_at` over a buffer of `len` `0xFF` bytes, read at `at`, reported as an
+/// `Int` with `-1` for `None` — so truncation is spec-able without a literal
+/// containing raw bytes.
+///
+/// # Example
+/// ```tuo
+/// let v = dns::wire::u16_at_ff(1, 0); // -1: one byte is not a U16
+/// ```
+pub fn u16_at_ff(take len: Int, take at: Int) -> Int {
+    var buf = std::string::empty();
+    var i = 0;
+    while i < len {
+        std::string::push_byte(buf, 255);
+        i = i + 1;
+    }
+    match u16_at(std::string::as_str(buf), at) {
+        Some { value } => value,
+        None => 0 - 1,
+    }
+}
+
+/// `u32_at` over a buffer of `len` `0xFF` bytes, read at `at`, with `-1` for
+/// `None`. The 32-bit counterpart of [`u16_at_ff`].
+///
+/// # Example
+/// ```tuo
+/// let v = dns::wire::u32_at_ff(4, 0); // 4294967295
+/// ```
+pub fn u32_at_ff(take len: Int, take at: Int) -> Int {
+    var buf = std::string::empty();
+    var i = 0;
+    while i < len {
+        std::string::push_byte(buf, 255);
+        i = i + 1;
+    }
+    match u32_at(std::string::as_str(buf), at) {
+        Some { value } => value,
+        None => 0 - 1,
+    }
+}
+
+/// `byte_at` over a buffer of `len` `0xFF` bytes, with `-1` for `None`.
+///
+/// # Example
+/// ```tuo
+/// let b = dns::wire::byte_at_ff(1, 0); // 255
+/// ```
+pub fn byte_at_ff(take len: Int, take at: Int) -> Int {
+    var buf = std::string::empty();
+    var i = 0;
+    while i < len {
+        std::string::push_byte(buf, 255);
+        i = i + 1;
+    }
+    match byte_at(std::string::as_str(buf), at) {
+        Some { value } => value,
+        None => 0 - 1,
+    }
+}
+
+/// `u32_at` over the four bytes of `a`, `b`, `c`, `d`, with `-1` for `None`.
+///
+/// # Example
+/// ```tuo
+/// let v = dns::wire::u32_of(0, 0, 1, 0); // 256
+/// ```
+pub fn u32_of(take a: Int, take b: Int, take c: Int, take d: Int) -> Int {
+    var buf = std::string::empty();
+    std::string::push_byte(buf, a);
+    std::string::push_byte(buf, b);
+    std::string::push_byte(buf, c);
+    std::string::push_byte(buf, d);
+    match u32_at(std::string::as_str(buf), 0) {
+        Some { value } => value,
+        None => 0 - 1,
+    }
+}
+
+spec header_len {
+    then header_len() == 12;
+}
+
+spec u16_max {
+    then u16_max() == 65535;
+}
+
+spec u16_byte {
+    // Byte order: the high half of 0x1234 is written first.
+    then u16_byte(4660, 0) == 18;
+    then u16_byte(4660, 1) == 52;
+    then u16_byte(0, 0) == 0;
+    then u16_byte(0, 1) == 0;
+    then u16_byte(65535, 0) == 255;
+    then u16_byte(65535, 1) == 255;
+    // Out-of-range input is masked to 16 bits, not trapped.
+    then u16_byte(65536, 0) == 0;
+    then u16_byte(65536, 1) == 0;
+    then u16_byte(65537, 1) == 1;
+}
+
+spec u16_width {
+    then u16_width(0) == 2;
+    then u16_width(65535) == 2;
+    then u16_width(65536) == 2;
+}
+
+spec roundtrip_u16 {
+    then roundtrip_u16(0) == 0;
+    then roundtrip_u16(1) == 1;
+    // A DNS id with both bytes distinct, which a byte-swapped codec fails.
+    then roundtrip_u16(4660) == 4660;
+    // The standard-query flags word, and the most-sent U16 in the protocol.
+    then roundtrip_u16(256) == 256;
+    then roundtrip_u16(65535) == 65535;
+}
+
+spec u16_at_ff {
+    then u16_at_ff(2, 0) == 65535;
+    then u16_at_ff(4, 2) == 65535;
+    // A field that runs off the end of the datagram is None, not a trap.
+    then u16_at_ff(1, 0) == 0 - 1;
+    then u16_at_ff(2, 1) == 0 - 1;
+    then u16_at_ff(0, 0) == 0 - 1;
+    then u16_at_ff(2, 0 - 1) == 0 - 1;
+}
+
+spec u32_at_ff {
+    // The full unsigned 32-bit range, which a sign-extending decoder gets wrong.
+    then u32_at_ff(4, 0) == 4294967295;
+    then u32_at_ff(3, 0) == 0 - 1;
+    then u32_at_ff(4, 1) == 0 - 1;
+    then u32_at_ff(4, 0 - 1) == 0 - 1;
+}
+
+spec u32_of {
+    then u32_of(0, 0, 1, 0) == 256;
+    then u32_of(0, 0, 0, 0) == 0;
+    then u32_of(0, 0, 0, 1) == 1;
+    // Byte order across all four positions.
+    then u32_of(1, 0, 0, 0) == 16777216;
+    // A one-hour TTL, the value this decoder exists to read.
+    then u32_of(0, 0, 14, 16) == 3600;
+}
+
+spec byte_at_ff {
+    then byte_at_ff(1, 0) == 255;
+    then byte_at_ff(1, 1) == 0 - 1;
+    then byte_at_ff(0, 0) == 0 - 1;
+    then byte_at_ff(1, 0 - 1) == 0 - 1;
+}

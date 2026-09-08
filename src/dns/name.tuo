@@ -1,0 +1,642 @@
+// dns::name — domain names on the wire, including the compression pointers
+// that make DNS parsing genuinely adversarial.
+//
+// RFC 1035 §3.1 encodes a domain name as a sequence of length-prefixed labels
+// terminated by a zero octet: `www.example.com` is
+// `3 w w w 7 e x a m p l e 3 c o m 0`. A label is at most 63 bytes and a whole
+// name at most 255, and both limits are enforced here rather than assumed.
+//
+// WHY THIS MODULE IS THE DANGEROUS ONE.
+//
+// RFC 1035 §4.1.4 lets a name end in a **compression pointer** — a two-byte
+// field whose top two bits are set and whose low 14 bits are an offset to
+// somewhere earlier in the same message, where parsing resumes. It saves
+// space, and it is the single richest source of DNS parser vulnerabilities:
+//
+//   * a pointer to itself, or a cycle of pointers, is an infinite loop — the
+//     classic decompression denial of service;
+//   * a forward pointer lets a malicious response steer a parser into bytes it
+//     has not validated;
+//   * an unbounded chain of legal-but-short hops is a quadratic blow-up.
+//
+// A resolver that reads untrusted datagrams from the network **must** be total
+// on all three. This module is where that is decided, so it makes the
+// guarantee structural rather than careful:
+//
+//   1. every pointer must point strictly **backwards** (`target < at`), which
+//      alone makes a cycle impossible — each hop lands strictly nearer zero, so
+//      the chain is finite by construction; and
+//   2. a hop budget bounds the work even so.
+//
+// Termination is therefore not a property of a loop bound someone remembered
+// to write. It is a property of the ordering on offsets, and the specs below
+// pin the malicious cases — self-pointer, two-pointer cycle, forward pointer —
+// as first-class expected outcomes rather than as crashes that must not happen.
+
+module dns::name;
+
+/// The maximum length of a single label, in bytes (RFC 1035 §2.3.4).
+///
+/// # Example
+/// ```tuo
+/// let n = dns::name::max_label(); // 63
+/// ```
+pub fn max_label() -> Int {
+    63
+}
+
+/// The maximum length of a whole domain name, in bytes (RFC 1035 §2.3.4).
+///
+/// # Example
+/// ```tuo
+/// let n = dns::name::max_name(); // 255
+/// ```
+pub fn max_name() -> Int {
+    255
+}
+
+/// The two-bit mask marking a length octet as a compression pointer
+/// (RFC 1035 §4.1.4): `0xC0`.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::name::pointer_mask(); // 192
+/// ```
+pub fn pointer_mask() -> Int {
+    192
+}
+
+/// The most compression pointers one name may follow before decoding gives up.
+///
+/// The backwards-only rule already guarantees termination, so this is a second,
+/// independent bound: it caps the *work* a hostile message can extract from a
+/// parser that is already guaranteed to finish.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::name::max_hops(); // 16
+/// ```
+pub fn max_hops() -> Int {
+    16
+}
+
+/// Whether `octet` marks a compression pointer rather than a label length.
+///
+/// # Example
+/// ```tuo
+/// let yes = dns::name::is_pointer(192); // true
+/// ```
+pub fn is_pointer(take octet: Int) -> Bool {
+    (octet & pointer_mask()) == pointer_mask()
+}
+
+/// Whether `octet` is a valid label length — the top two bits clear, and the
+/// value within the 63-byte limit.
+///
+/// The two reserved bit patterns `0x40` and `0x80` are neither pointers nor
+/// lengths; RFC 1035 leaves them undefined, so they are rejected here rather
+/// than silently treated as lengths.
+///
+/// # Example
+/// ```tuo
+/// let yes = dns::name::is_label_len(3); // true
+/// ```
+pub fn is_label_len(take octet: Int) -> Bool {
+    if octet < 0 {
+        return false;
+    }
+    (octet & pointer_mask()) == 0 && octet <= max_label()
+}
+
+/// Encode `name` in wire form: each dot-separated label length-prefixed, and a
+/// zero octet terminating the whole. Appends to `buf`.
+///
+/// The root name — `""` or `"."` — encodes as the single zero octet, which is
+/// what a query for the root asks about. A trailing dot is accepted and means
+/// the same as its absence, since `example.com.` and `example.com` are the
+/// same name.
+///
+/// Returns `true` when the name was encodable, `false` when a label was empty
+/// (a doubled dot), over-long, or the whole name exceeded 255 bytes. On
+/// `false` the buffer holds partial output and the caller must discard it —
+/// every caller in this crate builds into a fresh buffer for exactly that
+/// reason.
+///
+/// # Example
+/// ```tuo
+/// var buf = std::string::empty();
+/// let ok = dns::name::encode(buf, "example.com"); // true
+/// ```
+pub fn encode(mut buf: String, in name: Str) -> Bool {
+    let trimmed = strip_root(name);
+    if std::str::len(trimmed) == 0 {
+        std::string::push_byte(buf, 0);
+        return true;
+    }
+    let labels = std::str::split(trimmed, ".");
+    var i = 0;
+    var total = 1;
+    while i < std::array::len(labels) {
+        let label = std::string::as_str(std::array::get(labels, i));
+        let n = std::str::len(label);
+        if n == 0 {
+            return false;
+        }
+        if n > max_label() {
+            return false;
+        }
+        total = total + n + 1;
+        if total > max_name() {
+            return false;
+        }
+        std::string::push_byte(buf, n);
+        var j = 0;
+        while j < n {
+            std::string::push_byte(buf, std::str::byte_at(label, j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    std::string::push_byte(buf, 0);
+    true
+}
+
+/// `name` without a single trailing root dot, so `"example.com."` and
+/// `"example.com"` encode identically.
+///
+/// # Example
+/// ```tuo
+/// let s = dns::name::strip_root("example.com."); // "example.com"
+/// ```
+pub fn strip_root(in name: Str) -> Str {
+    let n = std::str::len(name);
+    if n == 0 {
+        return name;
+    }
+    if std::str::byte_at(name, n - 1) == 46 {
+        return std::str::slice(name, 0, n - 1);
+    }
+    name
+}
+
+/// The number of bytes the wire-form name beginning at `at` occupies **in this
+/// message**, or `None` when it is malformed.
+///
+/// This is deliberately not the same question as "how long is the name" — a
+/// name ending in a compression pointer occupies only the bytes up to and
+/// including that pointer, however long the name it denotes. This is the
+/// figure a record parser advances by, so it is computed without following any
+/// pointer at all.
+///
+/// # Example
+/// ```tuo
+/// // A name that is one pointer occupies exactly 2 bytes.
+/// ```
+pub fn encoded_len(in msg: Str, take at: Int) -> Option[Int] {
+    if at < 0 {
+        return None;
+    }
+    let limit = std::str::len(msg);
+    var i = at;
+    var answer = 0 - 1;
+    var failed = false;
+    while answer < 0 && !failed {
+        if i >= limit {
+            failed = true;
+        } else {
+            let octet = std::str::byte_at(msg, i);
+            if is_pointer(octet) {
+                // A pointer is two bytes and always ends the name.
+                if i + 2 > limit {
+                    failed = true;
+                } else {
+                    answer = i + 2 - at;
+                }
+            } else {
+                if octet == 0 {
+                    answer = i + 1 - at;
+                } else {
+                    if !is_label_len(octet) {
+                        failed = true;
+                    } else {
+                        i = i + 1 + octet;
+                        if i - at > max_name() {
+                            failed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if failed {
+        return None;
+    }
+    Some { value: answer }
+}
+
+/// Decode the wire-form name beginning at byte `at` into its dotted text form,
+/// following compression pointers.
+///
+/// Returns the empty string for the root name, and `None` for any malformed
+/// encoding — including every hostile pointer shape:
+///
+///   * a pointer to itself or into a cycle (refused: pointers must go strictly
+///     backwards, so a cycle cannot be constructed);
+///   * a pointer forward into unvalidated bytes (refused for the same reason);
+///   * a chain longer than [`max_hops`];
+///   * a label or total name over its RFC limit;
+///   * a truncated message.
+///
+/// The backwards-only rule is what makes this total: each hop lands at a
+/// strictly smaller offset, so the chain cannot be infinite regardless of what
+/// an attacker writes. `max_hops` bounds the work on top of that.
+///
+/// # Example
+/// ```tuo
+/// // dns::name::decode(msg, 12) == Some { value: "example.com" }
+/// ```
+pub fn decode(in msg: Str, take at: Int) -> Option[String] {
+    if at < 0 {
+        return None;
+    }
+    let limit = std::str::len(msg);
+    var out = std::string::empty();
+    var i = at;
+    var hops = 0;
+    var total = 0;
+    var done = false;
+    var failed = false;
+    // `bound` is the offset a pointer must land strictly before. It starts at
+    // the name's own start and tightens with every hop, which is what forbids
+    // both cycles and forward jumps in one comparison.
+    var bound = at;
+    while !done && !failed {
+        if i >= limit {
+            failed = true;
+        } else {
+            let octet = std::str::byte_at(msg, i);
+            if is_pointer(octet) {
+                if i + 2 > limit {
+                    failed = true;
+                } else {
+                    if hops >= max_hops() {
+                        failed = true;
+                    } else {
+                        let target = ((octet & 63) * 256) + std::str::byte_at(msg, i + 1);
+                        // Strictly backwards, or refuse. This single test is
+                        // the whole cycle defence.
+                        if target >= bound {
+                            failed = true;
+                        } else {
+                            bound = target;
+                            i = target;
+                            hops = hops + 1;
+                        }
+                    }
+                }
+            } else {
+                if octet == 0 {
+                    done = true;
+                } else {
+                    if !is_label_len(octet) {
+                        failed = true;
+                    } else {
+                        if i + 1 + octet > limit {
+                            failed = true;
+                        } else {
+                            total = total + octet + 1;
+                            if total > max_name() {
+                                failed = true;
+                            } else {
+                                if std::str::len(std::string::as_str(out)) > 0 {
+                                    std::string::push_byte(out, 46);
+                                }
+                                var j = 0;
+                                while j < octet {
+                                    std::string::push_byte(out, std::str::byte_at(msg, i + 1 + j));
+                                    j = j + 1;
+                                }
+                                i = i + 1 + octet;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if failed {
+        return None;
+    }
+    Some { value: out }
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+//
+// A wire message is bytes, and tuonelang string literals carry no `\x` escape,
+// so the fixtures below build their messages byte by byte. That is a virtue
+// here: each fixture reads as the RFC's own diagram.
+// ----------------------------------------------------------------------------
+
+/// Encode `name` and report the resulting byte count, or `-1` if it was
+/// rejected.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::name::encoded_size("example.com"); // 13
+/// ```
+pub fn encoded_size(in name: Str) -> Int {
+    var buf = std::string::empty();
+    if !encode(buf, name) {
+        return 0 - 1;
+    }
+    std::str::len(std::string::as_str(buf))
+}
+
+/// Byte `i` of `name`'s wire encoding, or `-1` if out of range or rejected.
+///
+/// # Example
+/// ```tuo
+/// let b = dns::name::encoded_byte("example.com", 0); // 7
+/// ```
+pub fn encoded_byte(in name: Str, take i: Int) -> Int {
+    var buf = std::string::empty();
+    if !encode(buf, name) {
+        return 0 - 1;
+    }
+    let s = std::string::as_str(buf);
+    if i < 0 {
+        return 0 - 1;
+    }
+    if i >= std::str::len(s) {
+        return 0 - 1;
+    }
+    std::str::byte_at(s, i)
+}
+
+/// Encode `name`, decode it straight back, and report the text — the round
+/// trip the two halves of this module must agree on. `"!"` marks a failure,
+/// since it cannot occur in a decoded name.
+///
+/// # Example
+/// ```tuo
+/// let s = dns::name::roundtrip("example.com"); // "example.com"
+/// ```
+pub fn roundtrip(in name: Str) -> String {
+    var buf = std::string::empty();
+    if !encode(buf, name) {
+        return std::string::from_str("!");
+    }
+    match decode(std::string::as_str(buf), 0) {
+        Some { value } => value,
+        None => std::string::from_str("!"),
+    }
+}
+
+/// A message consisting of a compression pointer at offset 0 aiming at
+/// `target`, decoded — the self-reference and forward-pointer attacks.
+///
+/// A pointer at offset 0 can never be valid, since nothing precedes it; the
+/// spec pins that as a refusal rather than a hang.
+///
+/// # Example
+/// ```tuo
+/// let s = dns::name::decode_pointer_at_zero(0); // "!" — refused
+/// ```
+pub fn decode_pointer_at_zero(take target: Int) -> String {
+    var buf = std::string::empty();
+    std::string::push_byte(buf, 192 | ((target / 256) & 63));
+    std::string::push_byte(buf, target % 256);
+    match decode(std::string::as_str(buf), 0) {
+        Some { value } => value,
+        None => std::string::from_str("!"),
+    }
+}
+
+/// A two-name message: `example.com` at offset 0, then at `13` a name that is
+/// the single label `www` followed by a pointer back to offset 0.
+///
+/// This is the compression the RFC actually intends, and the case a resolver
+/// meets in nearly every real response. Decoding at 13 must yield
+/// `www.example.com`.
+///
+/// # Example
+/// ```tuo
+/// let s = dns::name::decode_compressed(); // "www.example.com"
+/// ```
+pub fn decode_compressed() -> String {
+    var buf = std::string::empty();
+    let _ = encode(buf, "example.com");
+    std::string::push_byte(buf, 3);
+    std::string::push_byte(buf, 119);
+    std::string::push_byte(buf, 119);
+    std::string::push_byte(buf, 119);
+    std::string::push_byte(buf, 192);
+    std::string::push_byte(buf, 0);
+    match decode(std::string::as_str(buf), 13) {
+        Some { value } => value,
+        None => std::string::from_str("!"),
+    }
+}
+
+/// A message whose name at offset 13 points *forward* to offset 20 — the
+/// attack that steers a parser into bytes it has not validated. Must refuse.
+///
+/// # Example
+/// ```tuo
+/// let s = dns::name::decode_forward_pointer(); // "!" — refused
+/// ```
+pub fn decode_forward_pointer() -> String {
+    var buf = std::string::empty();
+    let _ = encode(buf, "example.com");
+    std::string::push_byte(buf, 192);
+    std::string::push_byte(buf, 20);
+    var pad = 0;
+    while pad < 8 {
+        std::string::push_byte(buf, 0);
+        pad = pad + 1;
+    }
+    match decode(std::string::as_str(buf), 13) {
+        Some { value } => value,
+        None => std::string::from_str("!"),
+    }
+}
+
+/// A message holding a two-pointer **cycle**: offset 0 points to 2, and
+/// offset 2 points back to 0. The classic decompression-loop denial of
+/// service. Must refuse, and must terminate doing so.
+///
+/// # Example
+/// ```tuo
+/// let s = dns::name::decode_pointer_cycle(); // "!" — refused
+/// ```
+pub fn decode_pointer_cycle() -> String {
+    var buf = std::string::empty();
+    std::string::push_byte(buf, 192);
+    std::string::push_byte(buf, 2);
+    std::string::push_byte(buf, 192);
+    std::string::push_byte(buf, 0);
+    match decode(std::string::as_str(buf), 0) {
+        Some { value } => value,
+        None => std::string::from_str("!"),
+    }
+}
+
+/// `encoded_len` over the compressed fixture from [`decode_compressed`], read
+/// at `at`, with `-1` for `None`.
+///
+/// The point it pins: a name ending in a pointer occupies **6** bytes in the
+/// message (`3 w w w` plus the two pointer bytes), not the fifteen its decoded
+/// text is long. A record parser that advanced by the latter would desynchronise
+/// and misread every record after it.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::name::compressed_len_at(13); // 6
+/// ```
+pub fn compressed_len_at(take at: Int) -> Int {
+    var buf = std::string::empty();
+    let _ = encode(buf, "example.com");
+    std::string::push_byte(buf, 3);
+    std::string::push_byte(buf, 119);
+    std::string::push_byte(buf, 119);
+    std::string::push_byte(buf, 119);
+    std::string::push_byte(buf, 192);
+    std::string::push_byte(buf, 0);
+    match encoded_len(std::string::as_str(buf), at) {
+        Some { value } => value,
+        None => 0 - 1,
+    }
+}
+
+/// A label of `n` bytes, encoded and round-tripped, reported as its decoded
+/// length — or `-1` when the encoder refused. Pins the 63-byte label limit.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::name::label_of_size(63); // 63
+/// ```
+pub fn label_of_size(take n: Int) -> Int {
+    var label = std::string::empty();
+    var i = 0;
+    while i < n {
+        std::string::push_byte(label, 97);
+        i = i + 1;
+    }
+    var buf = std::string::empty();
+    if !encode(buf, std::string::as_str(label)) {
+        return 0 - 1;
+    }
+    match decode(std::string::as_str(buf), 0) {
+        Some { value } => std::str::len(std::string::as_str(value)),
+        None => 0 - 1,
+    }
+}
+
+spec max_label {
+    then max_label() == 63;
+}
+
+spec max_name {
+    then max_name() == 255;
+}
+
+spec is_pointer {
+    then is_pointer(192);
+    then is_pointer(255);
+    then is_pointer(193);
+    then !is_pointer(0);
+    then !is_pointer(63);
+    // The two reserved patterns are not pointers.
+    then !is_pointer(64);
+    then !is_pointer(128);
+}
+
+spec is_label_len {
+    then is_label_len(0);
+    then is_label_len(1);
+    then is_label_len(63);
+    // Over the label limit, and the reserved patterns.
+    then !is_label_len(64);
+    then !is_label_len(128);
+    then !is_label_len(192);
+    then !is_label_len(0 - 1);
+}
+
+spec strip_root {
+    then strip_root("example.com.") == "example.com";
+    then strip_root("example.com") == "example.com";
+    then strip_root("") == "";
+    then strip_root(".") == "";
+}
+
+spec encoded_size {
+    // 3 w w w 7 e x a m p l e 3 c o m 0
+    then encoded_size("www.example.com") == 17;
+    then encoded_size("example.com") == 13;
+    // The root is the single zero octet.
+    then encoded_size("") == 1;
+    then encoded_size(".") == 1;
+    // A doubled dot is an empty label, which is not encodable.
+    then encoded_size("a..b") == 0 - 1;
+    then encoded_size(".a") == 0 - 1;
+}
+
+spec encoded_byte {
+    // The RFC's own diagram for `example.com`, byte for byte.
+    then encoded_byte("example.com", 0) == 7;
+    then encoded_byte("example.com", 1) == 101;
+    then encoded_byte("example.com", 7) == 101;
+    then encoded_byte("example.com", 8) == 3;
+    then encoded_byte("example.com", 9) == 99;
+    then encoded_byte("example.com", 12) == 0;
+    then encoded_byte("example.com", 13) == 0 - 1;
+}
+
+spec roundtrip {
+    then std::string::as_str(roundtrip("example.com")) == "example.com";
+    then std::string::as_str(roundtrip("www.example.com")) == "www.example.com";
+    then std::string::as_str(roundtrip("a.b.c.d.e")) == "a.b.c.d.e";
+    // The root decodes to the empty name.
+    then std::string::as_str(roundtrip("")) == "";
+    // A trailing dot is the same name, so it round-trips without one.
+    then std::string::as_str(roundtrip("example.com.")) == "example.com";
+}
+
+spec label_of_size {
+    then label_of_size(1) == 1;
+    then label_of_size(63) == 63;
+    // One byte over the RFC limit is refused by the encoder, not truncated.
+    then label_of_size(64) == 0 - 1;
+}
+
+spec decode_compressed {
+    // The compression the RFC intends, and what nearly every real response uses.
+    then std::string::as_str(decode_compressed()) == "www.example.com";
+}
+
+spec compressed_len_at {
+    // A pointer-terminated name occupies 6 bytes, not the 15 it decodes to.
+    then compressed_len_at(13) == 6;
+    // The uncompressed name before it is its full 13.
+    then compressed_len_at(0) == 13;
+}
+
+spec decode_pointer_at_zero {
+    // A pointer at offset 0 has nothing before it to point at: every target is
+    // a forward or self reference, and all are refused rather than followed.
+    then std::string::as_str(decode_pointer_at_zero(0)) == "!";
+    then std::string::as_str(decode_pointer_at_zero(1)) == "!";
+    then std::string::as_str(decode_pointer_at_zero(100)) == "!";
+}
+
+spec decode_forward_pointer {
+    // Steering the parser forward into unvalidated bytes is refused.
+    then std::string::as_str(decode_forward_pointer()) == "!";
+}
+
+spec decode_pointer_cycle {
+    // The decompression-loop denial of service: refused, and — because this
+    // spec returns at all — proven to terminate.
+    then std::string::as_str(decode_pointer_cycle()) == "!";
+}
