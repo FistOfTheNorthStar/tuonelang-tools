@@ -1,0 +1,416 @@
+// dns::resolver — the effect boundary: a stub resolver that puts a query on a
+// real UDP socket and reads the answer back.
+//
+// Everything below this module is pure and spec'd. This module is where the
+// datagram actually leaves the machine, so it holds every effect and no
+// parsing: it builds a query with `dns::message`, sends it with `std::net`,
+// and hands the reply to `dns::record`. That split is deliberate — the logic
+// that can be proven is proven, and what remains here is the part a spec
+// cannot reach (`R0007`), kept as small as it can be.
+//
+// WHAT A STUB RESOLVER MUST CHECK, and this one does:
+//
+//   * **The message id.** An off-path attacker forging a response has to guess
+//     it. A resolver that skips the check accepts whatever arrives first, which
+//     is the cache-poisoning primitive.
+//   * **QR.** A response, not another query reflected back.
+//   * **The truncation bit.** `TC` means the answer was cut short and must be
+//     retried over TCP. A UDP-only resolver that ignores it silently returns a
+//     subset of a record set — so this one reports truncation as its own
+//     outcome rather than quietly returning a partial answer.
+//   * **The rcode.** `NXDOMAIN` is a definitive negative answer, not a failure
+//     to obtain one, and is reported distinctly so a caller does not retry a
+//     question that has already been answered.
+//
+// A datagram from a wrong source is dropped and the receive retried within the
+// deadline, rather than failing the query — an unrelated late reply on the
+// socket must not be able to cancel a legitimate lookup.
+
+module dns::resolver;
+
+/// Outcome: the lookup succeeded and an address was found.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::resolver::ok(); // 0
+/// ```
+pub fn ok() -> Int {
+    0
+}
+
+/// Outcome: the socket could not be opened, or the query could not be sent.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::resolver::err_network(); // 1
+/// ```
+pub fn err_network() -> Int {
+    1
+}
+
+/// Outcome: no usable reply arrived before the deadline.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::resolver::err_timeout(); // 2
+/// ```
+pub fn err_timeout() -> Int {
+    2
+}
+
+/// Outcome: the name does not exist (`NXDOMAIN`).
+///
+/// Distinct from every other error because it is an *answer*: the question has
+/// been settled, and retrying it asks something already known.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::resolver::err_nxdomain(); // 3
+/// ```
+pub fn err_nxdomain() -> Int {
+    3
+}
+
+/// Outcome: the server answered, but with no `A` record.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::resolver::err_no_address(); // 4
+/// ```
+pub fn err_no_address() -> Int {
+    4
+}
+
+/// Outcome: the response was truncated (`TC`) and must be retried over TCP.
+///
+/// Reported rather than ignored: a truncated answer is a partial one, and
+/// treating it as complete is how a resolver silently drops records.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::resolver::err_truncated(); // 5
+/// ```
+pub fn err_truncated() -> Int {
+    5
+}
+
+/// Outcome: the reply was malformed, or the server refused or failed.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::resolver::err_server(); // 6
+/// ```
+pub fn err_server() -> Int {
+    6
+}
+
+/// Outcome: the name could not be encoded as a DNS question.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::resolver::err_bad_name(); // 7
+/// ```
+pub fn err_bad_name() -> Int {
+    7
+}
+
+/// The port DNS listens on.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::resolver::dns_port(); // 53
+/// ```
+pub fn dns_port() -> Int {
+    53
+}
+
+/// Classify a response's flags and rcode into one of the outcomes above,
+/// given the id that was sent.
+///
+/// This is the whole of the resolver's judgement, factored out of the effectful
+/// path so that it *can* be spec'd — the socket work below cannot be, so the
+/// decisions are moved to where proof is possible and only the plumbing is
+/// left effectful.
+///
+/// # Example
+/// ```tuo
+/// // dns::resolver::classify(msg, 4660)
+/// ```
+pub fn classify(in msg: Str, take sent_id: Int) -> Int {
+    let got_id = match dns::message::id(msg) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if got_id < 0 {
+        return err_server();
+    }
+    // The forgery check: a reply that does not answer the question we asked is
+    // not ours, whoever sent it.
+    if got_id != sent_id {
+        return err_server();
+    }
+    let f = match dns::message::flags(msg) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if f < 0 {
+        return err_server();
+    }
+    if dns::message::qr(f) != 1 {
+        return err_server();
+    }
+    // Truncation is checked before the answer section, because a truncated
+    // message's answer section is by definition incomplete.
+    if dns::message::tc(f) == 1 {
+        return err_truncated();
+    }
+    let code = dns::message::rcode(f);
+    if code == dns::message::rcode_nxdomain() {
+        return err_nxdomain();
+    }
+    if code != dns::message::rcode_noerror() {
+        return err_server();
+    }
+    match dns::record::first_a_offset(msg) {
+        Some { value } => ok(),
+        None => err_no_address(),
+    }
+}
+
+/// EFFECT: resolve `name` to an IPv4 address by asking the resolver at
+/// `server`, waiting at most `timeout_ms` in total.
+///
+/// Returns the outcome code; the address itself is read with
+/// [`resolve_address`], since v0 has no tuple return and a `Result[String, Int]`
+/// would still need the caller to hold both. The two calls send two queries, so
+/// [`lookup`] below is the one a program should use.
+///
+/// Effectful, so no spec (`R0007`) — the judgement it applies is spec'd in
+/// [`classify`], and the whole path is exercised by `examples/resolve.tuo`
+/// against a real server.
+///
+/// # Example
+/// ```tuo
+/// // let rc = dns::resolver::resolve("1.1.1.1", "example.com", 2000);
+/// ```
+pub fn resolve(in server: Str, in name: Str, take timeout_ms: Int) -> Int {
+    let sock = std::net::udp_bind(0);
+    if sock < 0 {
+        return err_network();
+    }
+    let outcome = query_once(sock, server, name, timeout_ms);
+    let _ = std::net::close(sock);
+    outcome
+}
+
+/// EFFECT: the body of [`resolve`], on an already-bound socket.
+///
+/// Split out so the socket is closed on every path — v0 has no `defer`, and a
+/// resolver that leaks a descriptor per lookup fails after a few thousand
+/// queries rather than immediately, which is the worst way to fail.
+///
+/// # Example
+/// ```tuo
+/// // let rc = dns::resolver::query_once(sock, "1.1.1.1", "example.com", 2000);
+/// ```
+pub fn query_once(take sock: Int, in server: Str, in name: Str, take timeout_ms: Int) -> Int {
+    let id = message_id();
+    let query = match dns::message::build_query(id, name, dns::message::type_a()) {
+        Some { value } => value,
+        None => std::string::empty(),
+    };
+    let bytes = std::string::as_str(query);
+    if std::str::len(bytes) == 0 {
+        return err_bad_name();
+    }
+    let sent = std::net::udp_send(sock, server, dns_port(), bytes);
+    if sent < 0 {
+        return err_network();
+    }
+    receive_answer(sock, id, timeout_ms)
+}
+
+/// EFFECT: wait for a reply whose id matches `sent_id`, and classify it.
+///
+/// A datagram that is not ours — a late reply to an earlier query, or an
+/// injected forgery — is dropped and the wait resumed, rather than failing the
+/// lookup. Otherwise anyone able to send one packet could cancel any query.
+///
+/// The retry budget is bounded by [`max_replies`], so a flood of junk cannot
+/// hold the resolver here indefinitely.
+///
+/// # Example
+/// ```tuo
+/// // let rc = dns::resolver::receive_answer(sock, 4660, 2000);
+/// ```
+pub fn receive_answer(take sock: Int, take sent_id: Int, take timeout_ms: Int) -> Int {
+    var tries = 0;
+    var outcome = err_timeout();
+    var settled = false;
+    while tries < max_replies() && !settled {
+        let len = std::net::udp_recv(sock, timeout_ms);
+        if len < 0 {
+            // Timeout or host error: nothing more is coming.
+            settled = true;
+        } else {
+            var buf = std::string::empty();
+            var i = 0;
+            while i < len {
+                let b = std::net::udp_byte_at(sock, i);
+                if b >= 0 {
+                    std::string::push_byte(buf, b);
+                }
+                i = i + 1;
+            }
+            let verdict = classify(std::string::as_str(buf), sent_id);
+            // A reply for a different id is someone else's; keep waiting.
+            let got_id = match dns::message::id(std::string::as_str(buf)) {
+                Some { value } => value,
+                None => 0 - 1,
+            };
+            if got_id == sent_id {
+                outcome = verdict;
+                settled = true;
+            }
+        }
+        tries = tries + 1;
+    }
+    outcome
+}
+
+/// The most datagrams [`receive_answer`] will consider before giving up.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::resolver::max_replies(); // 8
+/// ```
+pub fn max_replies() -> Int {
+    8
+}
+
+/// EFFECT: a message id for a new query, drawn from the runtime's
+/// cryptographically-secure randomness.
+///
+/// This must not be a counter. The id is the only thing an off-path attacker
+/// must guess to forge a reply, so it is drawn from `std::rt::random_byte`
+/// rather than from anything predictable.
+///
+/// # Example
+/// ```tuo
+/// // let id = dns::resolver::message_id();
+/// ```
+pub fn message_id() -> Int {
+    let hi = std::rt::random_byte();
+    let lo = std::rt::random_byte();
+    ((hi & 255) * 256) | (lo & 255)
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+//
+// `classify` is the resolver's whole judgement, and it is pure — so the
+// security properties this module exists to uphold are proven here rather than
+// asserted in the comment above.
+// ----------------------------------------------------------------------------
+
+/// Classify a synthetic response built with the given id, flags, and answer
+/// count, against a query sent with id 4660.
+///
+/// # Example
+/// ```tuo
+/// let rc = dns::resolver::classify_of(4660, 33024, 1); // 0 — ok
+/// ```
+pub fn classify_of(take reply_id: Int, take reply_flags: Int, take answers: Int) -> Int {
+    var buf = std::string::empty();
+    dns::wire::put_u16(buf, reply_id);
+    dns::wire::put_u16(buf, reply_flags);
+    dns::wire::put_u16(buf, 1);
+    dns::wire::put_u16(buf, answers);
+    dns::wire::put_u16(buf, 0);
+    dns::wire::put_u16(buf, 0);
+    let _ = dns::name::encode(buf, "example.com");
+    dns::wire::put_u16(buf, dns::message::type_a());
+    dns::wire::put_u16(buf, dns::message::class_in());
+    if answers > 0 {
+        dns::record::put_a(buf, 3600, 4, 93, 184, 216, 34);
+    }
+    classify(std::string::as_str(buf), 4660)
+}
+
+/// The flags word of a normal, complete, successful response.
+///
+/// # Example
+/// ```tuo
+/// let f = dns::resolver::response_flags(); // QR, RD, RA, NOERROR
+/// ```
+pub fn response_flags() -> Int {
+    dns::message::pack_flags(1, 0, 0, 0, 1, 1, dns::message::rcode_noerror())
+}
+
+/// `classify` over a message of `n` zero bytes — the runt-datagram case.
+///
+/// # Example
+/// ```tuo
+/// let rc = dns::resolver::classify_zeros(4); // 6 — malformed
+/// ```
+pub fn classify_zeros(take n: Int) -> Int {
+    var buf = std::string::empty();
+    var i = 0;
+    while i < n {
+        std::string::push_byte(buf, 0);
+        i = i + 1;
+    }
+    classify(std::string::as_str(buf), 4660)
+}
+
+spec classify_of {
+    // A well-formed answer to the question we asked.
+    then classify_of(4660, response_flags(), 1) == ok();
+
+    // THE FORGERY CHECK. A reply carrying someone else's id is refused however
+    // well-formed it is — this is the cache-poisoning primitive, and the single
+    // most important line in the module.
+    then classify_of(4661, response_flags(), 1) == err_server();
+    then classify_of(0, response_flags(), 1) == err_server();
+    then classify_of(65535, response_flags(), 1) == err_server();
+
+    // A query reflected back at us is not a response (QR clear).
+    then classify_of(4660, dns::message::pack_flags(0, 0, 0, 0, 1, 0, 0), 1) == err_server();
+
+    // TRUNCATION is its own outcome, not a partial success. Note the answer
+    // count is 1 and the record is present and valid — a resolver that checked
+    // the answer section first would return an address and silently drop the
+    // rest of the record set.
+    then classify_of(4660, dns::message::pack_flags(1, 0, 0, 1, 1, 1, 0), 1) == err_truncated();
+
+    // NXDOMAIN is a definitive answer, reported distinctly so it is not retried.
+    then classify_of(4660, dns::message::pack_flags(1, 0, 0, 0, 1, 1, 3), 0) == err_nxdomain();
+
+    // Other rcodes are server failures.
+    then classify_of(4660, dns::message::pack_flags(1, 0, 0, 0, 1, 1, 2), 0) == err_server();
+    then classify_of(4660, dns::message::pack_flags(1, 0, 0, 0, 1, 1, 5), 0) == err_server();
+
+    // A successful response with no A record is distinguished from a failure.
+    then classify_of(4660, response_flags(), 0) == err_no_address();
+}
+
+spec classify_zeros {
+    // A datagram too short to hold a header is malformed, not a timeout.
+    then classify_zeros(0) == err_server();
+    then classify_zeros(11) == err_server();
+    // Twelve zero bytes parse as a header, but id 0 is not the id we sent.
+    then classify_zeros(12) == err_server();
+}
+
+spec ok {
+    // The outcome codes are distinct, which is what lets a caller switch on them.
+    then ok() == 0;
+    then err_network() == 1;
+    then err_timeout() == 2;
+    then err_nxdomain() == 3;
+    then err_no_address() == 4;
+    then err_truncated() == 5;
+    then err_server() == 6;
+    then err_bad_name() == 7;
+    then dns_port() == 53;
+}

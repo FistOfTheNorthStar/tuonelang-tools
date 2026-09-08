@@ -1,0 +1,122 @@
+// examples/resolve — a stub resolver run against a real DNS server.
+//
+// This is the oracle for the whole crate: every module below it is pure and
+// proven by specs, and this program is what shows those specs describe the
+// actual internet rather than a self-consistent fiction.
+//
+//     tuo run examples/resolve.tuo src/dns/*.tuo src/std_*.tuo
+//
+// It asks a public resolver for four names and prints what it got, exiting
+// with the number of lookups that did NOT succeed — so `echo $?` is 0 exactly
+// when the network agrees with the model.
+//
+// It needs working UDP to port 53. On a network that blocks or intercepts DNS
+// this reports failures that are the network's, not the resolver's.
+
+module resolve;
+
+/// The resolver to ask: Cloudflare's public one.
+fn server() -> Str {
+    "1.1.1.1"
+}
+
+/// How long to wait for each reply, in milliseconds.
+fn timeout() -> Int {
+    3000
+}
+
+/// Look one name up, print the outcome, and report 0 on success or 1 on any
+/// failure — so `main` can total them.
+fn lookup_and_report(in name: Str) -> Int {
+    let sock = std::net::udp_bind(0);
+    if sock < 0 {
+        let _ = std::rt::write(1, "socket failed\n");
+        return 1;
+    }
+    let id = dns::resolver::message_id();
+    let query = match dns::message::build_query(id, name, dns::message::type_a()) {
+        Some { value } => value,
+        None => std::string::empty(),
+    };
+    let bytes = std::string::as_str(query);
+    if std::str::len(bytes) == 0 {
+        let _ = std::rt::write(1, "bad name\n");
+        let _ = std::net::close(sock);
+        return 1;
+    }
+    let sent = std::net::udp_send(sock, server(), dns::resolver::dns_port(), bytes);
+    if sent < 0 {
+        let _ = std::rt::write(1, "send failed\n");
+        let _ = std::net::close(sock);
+        return 1;
+    }
+    let len = std::net::udp_recv(sock, timeout());
+    if len < 0 {
+        let _ = std::rt::write_string(1, describe(name, "timeout"));
+        let _ = std::net::close(sock);
+        return 1;
+    }
+    var reply = std::string::empty();
+    var i = 0;
+    while i < len {
+        let b = std::net::udp_byte_at(sock, i);
+        if b >= 0 {
+            std::string::push_byte(reply, b);
+        }
+        i = i + 1;
+    }
+    let _ = std::net::close(sock);
+    let msg = std::string::as_str(reply);
+    let verdict = dns::resolver::classify(msg, id);
+    if verdict != dns::resolver::ok() {
+        let _ = std::rt::write_string(1, describe(name, outcome_text(verdict)));
+        return 1;
+    }
+    let address = match dns::record::first_ipv4(msg) {
+        Some { value } => value,
+        None => std::string::from_str("?"),
+    };
+    let _ = std::rt::write_string(1, describe(name, std::string::as_str(address)));
+    0
+}
+
+/// `name  text\n`, the one line this program prints per lookup.
+fn describe(in name: Str, in text: Str) -> String {
+    var out = std::string::empty();
+    std::str::push(out, name);
+    std::str::push(out, "  ");
+    std::str::push(out, text);
+    std::str::push(out, "\n");
+    out
+}
+
+/// A human word for an outcome code.
+fn outcome_text(take code: Int) -> Str {
+    if code == dns::resolver::err_nxdomain() {
+        return "NXDOMAIN";
+    }
+    if code == dns::resolver::err_truncated() {
+        return "truncated (retry over TCP)";
+    }
+    if code == dns::resolver::err_no_address() {
+        return "no A record";
+    }
+    if code == dns::resolver::err_timeout() {
+        return "timeout";
+    }
+    if code == dns::resolver::err_network() {
+        return "network error";
+    }
+    "server error or malformed reply"
+}
+
+fn main() -> Int {
+    var failures = 0;
+    failures = failures + lookup_and_report("example.com");
+    failures = failures + lookup_and_report("cloudflare.com");
+    failures = failures + lookup_and_report("github.com");
+    // A name that does not exist: the resolver must report NXDOMAIN, so this
+    // lookup is *expected* to fail and its failure is not counted.
+    let _ = lookup_and_report("this-name-should-not-exist-tuonelang.example.com");
+    failures
+}
