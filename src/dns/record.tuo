@@ -1,0 +1,607 @@
+// dns::record — walking the answer section and reading addresses out of it
+// (RFC 1035 §4.1.3).
+//
+// A resource record is
+//
+//     NAME | TYPE(16) | CLASS(16) | TTL(32) | RDLENGTH(16) | RDATA
+//
+// where NAME is a wire-form name that may end in a compression pointer, and
+// RDATA is RDLENGTH bytes whose meaning depends on TYPE: four bytes of IPv4
+// for an `A`, sixteen of IPv6 for an `AAAA`, a wire-form name for a `CNAME`.
+//
+// WHY THIS MODULE COUNTS BYTES SO CAREFULLY.
+//
+// The answer section is a **self-describing sequence**: nothing says where
+// record 3 starts except the lengths of records 1 and 2. Every offset here is
+// therefore derived from the message's own bytes, and every derivation is
+// bounds-checked against the datagram's real length before it is used.
+//
+// Two traps, both of which this module is written to make impossible:
+//
+//   * **Advancing by a decoded name's length.** A pointer-terminated name is
+//     two bytes on the wire however long the name it denotes; advancing by the
+//     text length desynchronises the walk and misreads every later record.
+//     `dns::name::encoded_len` — which never follows a pointer — is the only
+//     thing that decides how far to step.
+//
+//   * **Trusting RDLENGTH.** It is an attacker-chosen 16-bit number. An `A`
+//     record claiming `rdlength = 4` may still sit at the very end of a
+//     truncated datagram, so the rdata is bounds-checked against the message,
+//     and an `A` whose rdlength is not exactly 4 is rejected rather than read
+//     as whatever four bytes happen to follow.
+
+module dns::record;
+
+/// The fixed part of a record after its name: type, class, TTL, and rdlength.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::record::fixed_len(); // 10
+/// ```
+pub fn fixed_len() -> Int {
+    10
+}
+
+/// The width of an `A` record's rdata, in bytes.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::record::a_len(); // 4
+/// ```
+pub fn a_len() -> Int {
+    4
+}
+
+/// The width of an `AAAA` record's rdata, in bytes.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::record::aaaa_len(); // 16
+/// ```
+pub fn aaaa_len() -> Int {
+    16
+}
+
+/// The offset of the fixed fields of the record beginning at `at`, or `None`
+/// when its name is malformed or runs off the message.
+///
+/// This is the name's on-the-wire length added to `at` — never the length of
+/// the name it decodes to.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::fields_at(msg, 29)
+/// ```
+pub fn fields_at(in msg: Str, take at: Int) -> Option[Int] {
+    let step = match dns::name::encoded_len(msg, at) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if step < 0 {
+        return None;
+    }
+    let fields = at + step;
+    if fields + fixed_len() > std::str::len(msg) {
+        return None;
+    }
+    Some { value: fields }
+}
+
+/// The TYPE of the record beginning at `at`.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::rtype(msg, 29)
+/// ```
+pub fn rtype(in msg: Str, take at: Int) -> Option[Int] {
+    match fields_at(msg, at) {
+        Some { value } => dns::wire::u16_at(msg, value),
+        None => None,
+    }
+}
+
+/// The CLASS of the record beginning at `at`.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::rclass(msg, 29)
+/// ```
+pub fn rclass(in msg: Str, take at: Int) -> Option[Int] {
+    match fields_at(msg, at) {
+        Some { value } => dns::wire::u16_at(msg, value + 2),
+        None => None,
+    }
+}
+
+/// The TTL of the record beginning at `at`, in seconds.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::ttl(msg, 29)
+/// ```
+pub fn ttl(in msg: Str, take at: Int) -> Option[Int] {
+    match fields_at(msg, at) {
+        Some { value } => dns::wire::u32_at(msg, value + 4),
+        None => None,
+    }
+}
+
+/// The RDLENGTH of the record beginning at `at`.
+///
+/// This is the number the record *claims*; [`rdata_at`] is what checks it.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::rdlength(msg, 29)
+/// ```
+pub fn rdlength(in msg: Str, take at: Int) -> Option[Int] {
+    match fields_at(msg, at) {
+        Some { value } => dns::wire::u16_at(msg, value + 8),
+        None => None,
+    }
+}
+
+/// The offset of the rdata of the record beginning at `at`, checked to lie
+/// wholly inside the message.
+///
+/// The bounds check is the point: `rdlength` is attacker-chosen, so a record
+/// claiming more rdata than the datagram holds is refused here rather than
+/// read past the end.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::rdata_at(msg, 29)
+/// ```
+pub fn rdata_at(in msg: Str, take at: Int) -> Option[Int] {
+    let fields = match fields_at(msg, at) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if fields < 0 {
+        return None;
+    }
+    let len = match dns::wire::u16_at(msg, fields + 8) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if len < 0 {
+        return None;
+    }
+    let start = fields + fixed_len();
+    if start + len > std::str::len(msg) {
+        return None;
+    }
+    Some { value: start }
+}
+
+/// The offset of the record following the one at `at`, or `None` when this one
+/// is malformed.
+///
+/// This is the single function the answer walk advances by, and the reason a
+/// compression pointer cannot desynchronise it.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::next_at(msg, 29)
+/// ```
+pub fn next_at(in msg: Str, take at: Int) -> Option[Int] {
+    let start = match rdata_at(msg, at) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if start < 0 {
+        return None;
+    }
+    let len = match rdlength(msg, at) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if len < 0 {
+        return None;
+    }
+    Some { value: start + len }
+}
+
+/// The IPv4 address of the `A` record beginning at `at`, in dotted-quad text,
+/// or `None` when the record is not a well-formed `A`.
+///
+/// An `A` whose rdlength is not exactly 4 is rejected rather than read: the
+/// length is attacker-chosen, and a record that disagrees with its own type is
+/// malformed however plausible the bytes after it look.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::ipv4(msg, 29) == Some { value: "93.184.216.34" }
+/// ```
+pub fn ipv4(in msg: Str, take at: Int) -> Option[String] {
+    let kind = match rtype(msg, at) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if kind != dns::message::type_a() {
+        return None;
+    }
+    let len = match rdlength(msg, at) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if len != a_len() {
+        return None;
+    }
+    let start = match rdata_at(msg, at) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if start < 0 {
+        return None;
+    }
+    var out = std::string::empty();
+    var i = 0;
+    while i < a_len() {
+        if i > 0 {
+            std::string::push_byte(out, 46);
+        }
+        std::str::push_int(out, std::str::byte_at(msg, start + i));
+        i = i + 1;
+    }
+    Some { value: out }
+}
+
+/// The first `A` record's address in `msg`'s answer section, or `None` when
+/// there is none.
+///
+/// This is what a stub resolver actually wants: a response's answer section
+/// routinely holds `CNAME` records ahead of the `A`, so the walk skips every
+/// record whose type is not `A` rather than assuming the first one answers the
+/// question.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::first_ipv4(msg)
+/// ```
+pub fn first_ipv4(in msg: Str) -> Option[String] {
+    match first_a_offset(msg) {
+        Some { value } => ipv4(msg, value),
+        None => None,
+    }
+}
+
+/// The offset of the first `A` record in `msg`'s answer section, or `None`.
+///
+/// Split out from [`first_ipv4`] so the walk — which is the part that must not
+/// desynchronise — is a function of offsets alone, testable without building a
+/// string, and so that the address extraction happens exactly once.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::first_a_offset(msg)
+/// ```
+pub fn first_a_offset(in msg: Str) -> Option[Int] {
+    let count = match dns::message::ancount(msg) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if count < 0 {
+        return None;
+    }
+    var at = match dns::message::answers_offset(msg) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if at < 0 {
+        return None;
+    }
+    var answer = 0 - 1;
+    var i = 0;
+    var failed = false;
+    while i < count && answer < 0 && !failed {
+        let kind = match rtype(msg, at) {
+            Some { value } => value,
+            None => 0 - 1,
+        };
+        let len = match rdlength(msg, at) {
+            Some { value } => value,
+            None => 0 - 1,
+        };
+        if kind == dns::message::type_a() && len == a_len() {
+            answer = at;
+        } else {
+            let step = match next_at(msg, at) {
+                Some { value } => value,
+                None => 0 - 1,
+            };
+            if step < 0 {
+                failed = true;
+            } else {
+                at = step;
+            }
+        }
+        i = i + 1;
+    }
+    if answer < 0 {
+        return None;
+    }
+    Some { value: answer }
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+//
+// The fixtures below build real response datagrams byte by byte. They are the
+// closest this crate gets to a captured packet, and they are what let the
+// answer walk be proven without a network.
+// ----------------------------------------------------------------------------
+
+/// Append a 12-byte header with `ancount` answers and one question.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::put_response_header(buf, 1)
+/// ```
+pub fn put_response_header(mut buf: String, take answers: Int) {
+    dns::wire::put_u16(buf, 4660);
+    dns::wire::put_u16(buf, dns::message::pack_flags(1, 0, 0, 0, 1, 1, 0));
+    dns::wire::put_u16(buf, 1);
+    dns::wire::put_u16(buf, answers);
+    dns::wire::put_u16(buf, 0);
+    dns::wire::put_u16(buf, 0);
+}
+
+/// Append the question `example.com IN A`.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::put_question(buf)
+/// ```
+pub fn put_question(mut buf: String) {
+    let _ = dns::name::encode(buf, "example.com");
+    dns::wire::put_u16(buf, dns::message::type_a());
+    dns::wire::put_u16(buf, dns::message::class_in());
+}
+
+/// Append an `A` record whose name is a compression pointer to offset 12, with
+/// the given TTL, rdlength, and four address bytes.
+///
+/// `rdlen` is passed separately from the four bytes so a spec can build a
+/// record that **lies** about its own length — the case the parser must refuse.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::put_a(buf, 3600, 4, 93, 184, 216, 34)
+/// ```
+pub fn put_a(mut buf: String, take record_ttl: Int, take rdlen: Int, take b0: Int, take b1: Int, take b2: Int, take b3: Int) {
+    std::string::push_byte(buf, 192);
+    std::string::push_byte(buf, 12);
+    dns::wire::put_u16(buf, dns::message::type_a());
+    dns::wire::put_u16(buf, dns::message::class_in());
+    dns::wire::put_u16(buf, record_ttl / 65536);
+    dns::wire::put_u16(buf, record_ttl % 65536);
+    dns::wire::put_u16(buf, rdlen);
+    std::string::push_byte(buf, b0);
+    std::string::push_byte(buf, b1);
+    std::string::push_byte(buf, b2);
+    std::string::push_byte(buf, b3);
+}
+
+/// A complete, well-formed one-answer response for `example.com`.
+///
+/// # Example
+/// ```tuo
+/// // dns::record::simple_response()
+/// ```
+pub fn simple_response() -> String {
+    var buf = std::string::empty();
+    put_response_header(buf, 1);
+    put_question(buf);
+    put_a(buf, 3600, 4, 93, 184, 216, 34);
+    buf
+}
+
+/// The address `first_ipv4` finds in the simple response — `"!"` for `None`.
+///
+/// # Example
+/// ```tuo
+/// let s = dns::record::simple_address(); // "93.184.216.34"
+/// ```
+pub fn simple_address() -> String {
+    let msg = simple_response();
+    match first_ipv4(std::string::as_str(msg)) {
+        Some { value } => value,
+        None => std::string::from_str("!"),
+    }
+}
+
+/// A field of the single record in the simple response, selected by `which`:
+/// 0 type, 1 class, 2 TTL, 3 rdlength, 4 the record's own offset, 5 the offset
+/// of the record after it. `-1` for `None`.
+///
+/// # Example
+/// ```tuo
+/// let t = dns::record::simple_field(2); // 3600
+/// ```
+pub fn simple_field(take which: Int) -> Int {
+    let owned = simple_response();
+    let msg = std::string::as_str(owned);
+    let at = match dns::message::answers_offset(msg) {
+        Some { value } => value,
+        None => 0 - 1,
+    };
+    if at < 0 {
+        return 0 - 1;
+    }
+    if which == 4 {
+        return at;
+    }
+    let picked = match which {
+        0 => rtype(msg, at),
+        1 => rclass(msg, at),
+        2 => ttl(msg, at),
+        3 => rdlength(msg, at),
+        5 => next_at(msg, at),
+        _ => None,
+    };
+    match picked {
+        Some { value } => value,
+        None => 0 - 1,
+    }
+}
+
+/// A response whose single `A` record claims `rdlen` bytes of rdata while
+/// carrying four — the attacker-chosen-length case. Reports the address found,
+/// or `"!"`.
+///
+/// # Example
+/// ```tuo
+/// let s = dns::record::lying_rdlength(5); // "!" — refused
+/// ```
+pub fn lying_rdlength(take rdlen: Int) -> String {
+    var buf = std::string::empty();
+    put_response_header(buf, 1);
+    put_question(buf);
+    put_a(buf, 3600, rdlen, 93, 184, 216, 34);
+    match first_ipv4(std::string::as_str(buf)) {
+        Some { value } => value,
+        None => std::string::from_str("!"),
+    }
+}
+
+/// A two-answer response whose first record is a `CNAME` and whose second is
+/// the `A` that actually answers the question. Reports the address found.
+///
+/// This is the shape of a real response for almost any CDN-hosted name, and
+/// the case a resolver that reads only the first record gets wrong.
+///
+/// # Example
+/// ```tuo
+/// let s = dns::record::cname_then_a(); // "93.184.216.34"
+/// ```
+pub fn cname_then_a() -> String {
+    var buf = std::string::empty();
+    put_response_header(buf, 2);
+    put_question(buf);
+    // A CNAME whose rdata is a wire-form name, so its rdlength is not 4 and
+    // its width differs from the A record's — which is what makes this a real
+    // test of the walk rather than of a fixed stride.
+    std::string::push_byte(buf, 192);
+    std::string::push_byte(buf, 12);
+    dns::wire::put_u16(buf, dns::message::type_cname());
+    dns::wire::put_u16(buf, dns::message::class_in());
+    dns::wire::put_u16(buf, 0);
+    dns::wire::put_u16(buf, 3600);
+    // rdata: the wire-form name `www` + a pointer to `example.com` at 12.
+    // Six bytes, and the rdlength says six — a CNAME wider than the A record
+    // that follows it, so a fixed-stride walk lands in the wrong place.
+    dns::wire::put_u16(buf, 6);
+    std::string::push_byte(buf, 3);
+    std::string::push_byte(buf, 119);
+    std::string::push_byte(buf, 119);
+    std::string::push_byte(buf, 119);
+    std::string::push_byte(buf, 192);
+    std::string::push_byte(buf, 12);
+    put_a(buf, 300, 4, 93, 184, 216, 34);
+    match first_ipv4(std::string::as_str(buf)) {
+        Some { value } => value,
+        None => std::string::from_str("!"),
+    }
+}
+
+/// The simple response truncated to `n` bytes, with `first_ipv4` run over it —
+/// every prefix of a real datagram, none of which may trap.
+///
+/// A truncated datagram is the most common malformed input on the wire, and
+/// this helper spec's the whole family of them at once.
+///
+/// # Example
+/// ```tuo
+/// let s = dns::record::truncated_at(20); // "!" — refused, not trapped
+/// ```
+pub fn truncated_at(take n: Int) -> String {
+    let owned = simple_response();
+    let msg = std::string::as_str(owned);
+    var limit = n;
+    if limit > std::str::len(msg) {
+        limit = std::str::len(msg);
+    }
+    if limit < 0 {
+        limit = 0;
+    }
+    var cut = std::string::empty();
+    var i = 0;
+    while i < limit {
+        std::string::push_byte(cut, std::str::byte_at(msg, i));
+        i = i + 1;
+    }
+    match first_ipv4(std::string::as_str(cut)) {
+        Some { value } => value,
+        None => std::string::from_str("!"),
+    }
+}
+
+/// The length of the simple response fixture.
+///
+/// # Example
+/// ```tuo
+/// let n = dns::record::simple_len(); // 45
+/// ```
+pub fn simple_len() -> Int {
+    std::str::len(std::string::as_str(simple_response()))
+}
+
+spec fixed_len {
+    then fixed_len() == 10;
+    then a_len() == 4;
+    then aaaa_len() == 16;
+}
+
+spec simple_len {
+    // 12 header + 17 question + 16 record (2 pointer + 10 fixed + 4 rdata).
+    then simple_len() == 45;
+}
+
+spec simple_field {
+    // The record starts right after the question, at byte 29.
+    then simple_field(4) == 29;
+    then simple_field(0) == 1;
+    then simple_field(1) == 1;
+    then simple_field(2) == 3600;
+    then simple_field(3) == 4;
+    // The next record would begin at the end of the message.
+    then simple_field(5) == 45;
+}
+
+spec simple_address {
+    // The whole pipeline: header, question walk, record walk, rdata decode.
+    then std::string::as_str(simple_address()) == "93.184.216.34";
+}
+
+spec cname_then_a {
+    // The A record is found past a CNAME of a different width, which proves
+    // the walk steps by each record's own length rather than a fixed stride.
+    then std::string::as_str(cname_then_a()) == "93.184.216.34";
+}
+
+spec lying_rdlength {
+    // The honest record is read.
+    then std::string::as_str(lying_rdlength(4)) == "93.184.216.34";
+    // An A record whose rdlength is not exactly 4 is refused, not read as
+    // whatever four bytes happen to sit there.
+    then std::string::as_str(lying_rdlength(0)) == "!";
+    then std::string::as_str(lying_rdlength(3)) == "!";
+    then std::string::as_str(lying_rdlength(16)) == "!";
+    // An rdlength claiming far more than the datagram holds is refused rather
+    // than read past the end.
+    then std::string::as_str(lying_rdlength(65535)) == "!";
+}
+
+spec truncated_at {
+    // Every prefix of a real datagram is refused rather than trapped. That
+    // these specs return at all is the proof.
+    then std::string::as_str(truncated_at(0)) == "!";
+    then std::string::as_str(truncated_at(11)) == "!";
+    then std::string::as_str(truncated_at(12)) == "!";
+    then std::string::as_str(truncated_at(29)) == "!";
+    then std::string::as_str(truncated_at(38)) == "!";
+    then std::string::as_str(truncated_at(44)) == "!";
+    // The whole message still reads.
+    then std::string::as_str(truncated_at(45)) == "93.184.216.34";
+}
