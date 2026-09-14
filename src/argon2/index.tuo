@@ -1,0 +1,329 @@
+// argon2::index — which earlier block each new block depends on.
+//
+// Every block after the first two in a lane is `G(B[i][j-1], B[l][z])`: the
+// previous block in the same lane, and a *reference* block chosen from what
+// has already been computed. RFC 9106 §3.4 is the rule for choosing `[l][z]`,
+// and the choice is the whole security argument. In Argon2d the reference
+// comes from the previous block's contents, so an attacker who wants to
+// recompute a block on demand must have the data — but so must a timing
+// side channel. In Argon2i it comes from a counter run through G, so it is
+// the same for every password and leaks nothing. Argon2id uses the second
+// rule for the first half of the first pass and the first rule after that.
+//
+// TWO 32-BIT VALUES, J_1 AND J_2, drive the choice: J_2 picks the lane, and
+// J_1 picks a position in the window of blocks that lane may still reference,
+// skewed toward recent ones by squaring (§3.4.2, Figure 13). Where J_1 and
+// J_2 come from is the only difference between the three variants
+// (§3.4.1); what is done with them is shared.
+//
+// THE REFERENCE WINDOW is the delicate part and the reason this module
+// exists separately: which blocks may be referenced depends on the pass, the
+// slice, the position within the segment, and whether the reference lane is
+// the current one, in four cases that the RFC's prose describes and the
+// reference implementation's `index_alpha` spells out. The specs below pin
+// each case by hand-computed window sizes.
+
+module argon2::index;
+
+/// The number of slices a lane is divided into — `SL` in the RFC.
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::index::slices(); // 4
+/// ```
+pub fn slices() -> Int {
+    4
+}
+
+/// The number of `J_1 || J_2` pairs an address block holds.
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::index::addresses_per_block(); // 128
+/// ```
+pub fn addresses_per_block() -> Int {
+    argon2::block::words()
+}
+
+/// Whether the reference index at this position is chosen independently of
+/// the data (RFC 9106 §3.4.1): always for Argon2i, never for Argon2d, and
+/// for Argon2id only in the first two slices of the first pass.
+///
+/// # Example
+/// ```tuo
+/// let b = argon2::index::independent(2, 0, 1); // true: Argon2id, pass 0, slice 1
+/// let c = argon2::index::independent(2, 0, 2); // false
+/// ```
+pub fn independent(take kind: Int, take pass: Int, take slice: Int) -> Bool {
+    if kind == 1 {
+        return true;
+    }
+    if kind == 2 {
+        return pass == 0 && slice < 2;
+    }
+    false
+}
+
+/// The input block `Z` for data-independent addressing (§3.4.1.2, Figure
+/// 11): the pass, lane, slice, total block count, total passes, and type,
+/// each as a little-endian 64-bit word, then a counter that
+/// `next_addresses` increments, then zeros.
+///
+/// # Example
+/// ```tuo
+/// var input = argon2::index::address_input(0, 0, 0, 32, 3, 1);
+/// ```
+pub fn address_input(take pass: Int, take lane: Int, take slice: Int, take blocks: Int, take passes: Int, take kind: Int) -> Array[Int] {
+    var z = argon2::block::zero();
+    std::array::set(z, 0, pass);
+    std::array::set(z, 1, lane);
+    std::array::set(z, 2, slice);
+    std::array::set(z, 3, blocks);
+    std::array::set(z, 4, passes);
+    std::array::set(z, 5, kind);
+    z
+}
+
+/// Advance the counter in `input` and produce the next address block:
+/// `G(ZERO, G(ZERO, Z || LE64(counter) || ZERO))` (§3.4.1.2). Each of its
+/// 128 words is one `J_1 || J_2` pair, `J_1` in the low half.
+///
+/// # Example
+/// ```tuo
+/// let addresses = argon2::index::next_addresses(input);
+/// ```
+pub fn next_addresses(mut input: Array[Int]) -> Array[Int] {
+    std::array::set(input, 6, std::array::get(input, 6) + 1);
+    let zero = argon2::block::zero();
+    argon2::block::compress(zero, argon2::block::compress(zero, input))
+}
+
+/// The lane the reference block is taken from: `J_2 mod p`, except during
+/// the first slice of the first pass, when only the current lane has any
+/// blocks and the current lane is used (§3.4.2).
+///
+/// # Example
+/// ```tuo
+/// let l = argon2::index::reference_lane(1, 0, 0, 7, 4); // 3
+/// let m = argon2::index::reference_lane(0, 0, 2, 7, 4); // 2, the current lane
+/// ```
+pub fn reference_lane(take pass: Int, take slice: Int, take lane: Int, take j2: Int, take lanes: Int) -> Int {
+    if pass == 0 && slice == 0 {
+        return lane;
+    }
+    (j2 & argon2::word::mask32()) % lanes
+}
+
+/// `|W|`, the number of blocks that may be referenced from position `index`
+/// of the segment at (`pass`, `slice`), when the reference lane is or is not
+/// the current one (§3.4.2, rules 1 and 2).
+///
+/// On the first pass only the slices already finished exist, plus — in the
+/// current lane — the blocks of this segment before the previous one. On
+/// later passes the three most recently finished segments exist. A reference
+/// to another lane at the very first block of a segment excludes that lane's
+/// latest block, which is still being written by the parallel segment.
+///
+/// # Example
+/// ```tuo
+/// let w = argon2::index::area_size(0, 0, 5, 2, 8, true); // 4: blocks 0..3 of this segment
+/// ```
+pub fn area_size(take pass: Int, take slice: Int, take index: Int, take segment_length: Int, take lane_length: Int, take same_lane: Bool) -> Int {
+    let first_block = if index == 0 {
+        0 - 1
+    } else {
+        0
+    };
+    if pass == 0 {
+        if slice == 0 {
+            return index - 1;
+        }
+        if same_lane {
+            return slice * segment_length + index - 1;
+        }
+        return slice * segment_length + first_block;
+    }
+    if same_lane {
+        return lane_length - segment_length + index - 1;
+    }
+    lane_length - segment_length + first_block
+}
+
+/// `(j * j) >> 32` for a 32-bit `j`, without a trapping multiply: the square
+/// of a value up to 2^32 needs 64 bits, so it is taken through 16-bit halves.
+///
+/// # Example
+/// ```tuo
+/// let x = argon2::index::square_hi32(0xFFFFFFFF); // 0xFFFFFFFE
+/// ```
+pub fn square_hi32(take j: Int) -> Int {
+    let v = j & argon2::word::mask32();
+    let h = v >> 16;
+    let l = v & 65535;
+    let cross = 2 * h * l;
+    h * h + (((cross << 16) + l * l) >> 32)
+}
+
+/// The offset into the reference window, from `J_1` (§3.4.2, Figure 13):
+/// `|W| - 1 - (|W| * (J_1^2 / 2^32)) / 2^32`, which lands nearer the end of
+/// the window — the most recent blocks — for most values of `J_1`.
+///
+/// `|W|` is below 2^31 for any memory tuonelang can allocate, so the second
+/// product cannot trap.
+///
+/// # Example
+/// ```tuo
+/// let z = argon2::index::relative_position(0, 10); // 9: J_1 = 0 selects the newest block
+/// let w = argon2::index::relative_position(0xFFFFFFFF, 10); // 0: J_1 at its max selects the oldest
+/// ```
+pub fn relative_position(take j1: Int, take area: Int) -> Int {
+    let x = square_hi32(j1);
+    let y = (area * x) >> 32;
+    area - 1 - y
+}
+
+/// Where the reference window starts in the lane (§3.4.2): the first pass
+/// references from the start of the lane, and later passes reference from
+/// the segment after the current one, wrapping past the last slice — the
+/// oldest data still standing.
+///
+/// # Example
+/// ```tuo
+/// let s = argon2::index::start_position(1, 1, 2); // 4: slice 2 of an 8-block lane
+/// let t = argon2::index::start_position(1, 3, 2); // 0: wrapped
+/// ```
+pub fn start_position(take pass: Int, take slice: Int, take segment_length: Int) -> Int {
+    if pass == 0 {
+        return 0;
+    }
+    if slice == slices() - 1 {
+        return 0;
+    }
+    (slice + 1) * segment_length
+}
+
+/// `z`, the column of the reference block within its lane, for the block at
+/// `index` of the segment at (`pass`, `slice`), from `J_1`.
+///
+/// # Example
+/// ```tuo
+/// let z = argon2::index::reference_column(0, 0, 5, 0, 2, 8, true); // 3: the newest allowed
+/// ```
+pub fn reference_column(take pass: Int, take slice: Int, take index: Int, take j1: Int, take segment_length: Int, take lane_length: Int, take same_lane: Bool) -> Int {
+    let area = area_size(pass, slice, index, segment_length, lane_length, same_lane);
+    let rel = relative_position(j1, area);
+    (start_position(pass, slice, segment_length) + rel) % lane_length
+}
+
+// ----------------------------------------------------------------------------
+// Specs. The window sizes are hand-derived from §3.4.2 for a lane of 8
+// blocks in segments of 2 — the smallest legal geometry, and the one the
+// argon2-cffi vectors in `argon2::hash` use.
+// ----------------------------------------------------------------------------
+
+spec independent {
+    then independent(0, 0, 0) == false;
+    then independent(1, 2, 3) == true;
+    then independent(2, 0, 0) == true;
+    then independent(2, 0, 1) == true;
+    then independent(2, 0, 2) == false;
+    then independent(2, 1, 0) == false;
+}
+
+spec address_input {
+    then std::array::len(address_input(1, 2, 3, 32, 3, 1)) == 128;
+    then std::array::get(address_input(1, 2, 3, 32, 3, 1), 0) == 1;
+    then std::array::get(address_input(1, 2, 3, 32, 3, 1), 3) == 32;
+    then std::array::get(address_input(1, 2, 3, 32, 3, 1), 5) == 1;
+    then std::array::get(address_input(1, 2, 3, 32, 3, 1), 6) == 0;
+    then std::array::get(address_input(1, 2, 3, 32, 3, 1), 127) == 0;
+}
+
+fn counter_after(take calls: Int) -> Int {
+    var input = address_input(0, 0, 0, 32, 3, 1);
+    var i = 0;
+    while i < calls {
+        let _ = next_addresses(input);
+        i = i + 1;
+    }
+    std::array::get(input, 6)
+}
+
+fn address_block_len() -> Int {
+    var input = address_input(0, 0, 0, 32, 3, 1);
+    std::array::len(next_addresses(input))
+}
+
+fn first_address_word() -> Int {
+    var input = address_input(0, 0, 0, 32, 3, 1);
+    std::array::get(next_addresses(input), 0)
+}
+
+spec next_addresses {
+    then counter_after(0) == 0;
+    then counter_after(1) == 1;
+    then counter_after(3) == 3;
+    // Two address blocks for the same segment differ, because the counter
+    // differs; and neither is zero, because G(ZERO, non-zero) is not.
+    then first_address_word() != 0;
+    then address_block_len() == 128;
+}
+
+spec reference_lane {
+    then reference_lane(0, 0, 2, 7, 4) == 2;
+    then reference_lane(0, 1, 2, 7, 4) == 3;
+    then reference_lane(1, 0, 0, 7, 4) == 3;
+    then reference_lane(1, 0, 0, 4, 4) == 0;
+    // J_2 is unsigned: a pair with the top bit set is not a negative index.
+    then reference_lane(1, 0, 0, 0xFFFFFFFF, 4) == 3;
+}
+
+spec area_size {
+    // Pass 0, slice 0: everything in this segment before the previous block.
+    then area_size(0, 0, 2, 2, 8, true) == 1;
+    then area_size(0, 0, 5, 2, 8, true) == 4;
+    // Pass 0, later slice, same lane: finished slices plus this segment so far.
+    then area_size(0, 1, 0, 2, 8, true) == 1;
+    then area_size(0, 2, 1, 2, 8, true) == 4;
+    // Pass 0, later slice, other lane: finished slices only; one fewer at the
+    // segment's first block.
+    then area_size(0, 1, 0, 2, 8, false) == 1;
+    then area_size(0, 1, 1, 2, 8, false) == 2;
+    then area_size(0, 3, 0, 2, 8, false) == 5;
+    // Later passes: three finished segments, plus this one so far if same lane.
+    then area_size(1, 0, 0, 2, 8, true) == 5;
+    then area_size(1, 0, 1, 2, 8, true) == 6;
+    then area_size(1, 2, 0, 2, 8, false) == 5;
+    then area_size(1, 2, 1, 2, 8, false) == 6;
+}
+
+spec square_hi32 {
+    then square_hi32(0) == 0;
+    then square_hi32(65536) == 1;
+    then square_hi32(0xFFFFFFFF) == 0xFFFFFFFE;
+    then square_hi32(0x89abcdef) == 0x4a0955b6;
+}
+
+spec relative_position {
+    then relative_position(0, 10) == 9;
+    then relative_position(0xFFFFFFFF, 10) == 0;
+    then relative_position(0x80000000, 10) == 7;
+    then relative_position(0, 1) == 0;
+}
+
+spec start_position {
+    then start_position(0, 3, 2) == 0;
+    then start_position(1, 0, 2) == 2;
+    then start_position(1, 1, 2) == 4;
+    then start_position(1, 2, 2) == 6;
+    then start_position(1, 3, 2) == 0;
+}
+
+spec reference_column {
+    // Pass 0, slice 0, block 5: window is blocks 0..3; J_1 = 0 picks the newest.
+    then reference_column(0, 0, 5, 0, 2, 8, true) == 3;
+    then reference_column(0, 0, 5, 0xFFFFFFFF, 2, 8, true) == 0;
+    // Pass 1, slice 1: window starts at block 4 and wraps around the lane.
+    then reference_column(1, 1, 0, 0, 2, 8, false) == (4 + 4) % 8;
+    then reference_column(1, 1, 0, 0xFFFFFFFF, 2, 8, false) == 4;
+}
