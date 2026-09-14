@@ -19,8 +19,10 @@ SHA-256/HMAC/PBKDF2, `std::bignum`, `std::json`, `std::fs`, `std::sync`,
 |---|---|---|
 | [`tuonelang-db`](../tuonelang-db) | `psycopg2` / `asyncpg` + a vector store | PostgreSQL v3 wire protocol over raw TCP; 130 specs |
 | [`tuolang-celery`](../tuolang-celery) | `celery` + `redis` broker | queue engine, routing, retries, beat; 57 specs |
+| this repo, `dns` | `socket.getaddrinfo` | stub resolver over UDP; 82 specs; resolves real names |
+| this repo, `argon2` | `passlib[argon2]` | Argon2id/i/d + BLAKE2b + PHC strings; 125 specs; verifies the backend's own hashes |
 
-Both prove the thesis: the *engine* of a Python library is pure logic, and pure
+All four prove the thesis: the *engine* of a Python library is pure logic, and pure
 logic is what tuonelang specs pin best.
 
 ---
@@ -42,13 +44,14 @@ verification, and X.509 certificate parsing. Certificate chain validation is
 where the real bugs live, and it is *exactly* the kind of pure, spec-shaped
 logic tuonelang is good at pinning.
 
-### 2. DNS resolution — replaces `socket.getaddrinfo`
+### 2. DNS resolution — replaces `socket.getaddrinfo` — ✅ done
 
 Explicitly named in the tuonelang README as belonging *in tuonelang* on the UDP
 primitives, which already exist (`std::net::udp_send` / `udp_recv`). This is a
 small, self-contained, entirely achievable port: A/AAAA/CNAME record parsing
-over UDP, with a wire-format parser that specs cleanly. Do this one first as a
-warm-up — it is the shortest path to a real win.
+over UDP, with a wire-format parser that specs cleanly. Done first as a
+warm-up — it was the shortest path to a real win, and it surfaced a runtime
+bug (`udp_bind` on loopback) that ADR-0017 had to be amended for.
 
 ### 3. HTTP/1.1 client + server — replaces `httpx`, `requests`, `uvicorn`, `gunicorn`
 
@@ -75,12 +78,15 @@ migrations. Skip the ORM identity map and lazy loading — they need capturing
 closures and recursive types, both refused today. Build a typed query builder
 instead; it is a better fit for the language and a better tool anyway.
 
-### 6. Argon2 password hashing — replaces `passlib[argon2]`
+### 6. Argon2 password hashing — replaces `passlib[argon2]` — ✅ done
 
-`std::crypto::pbkdf2_sha256` already exists, so the KDF pattern is established.
-Argon2id needs BLAKE2b and a memory-hard fill — both expressible on
-`Array[Int]` today. Small, self-contained, high-security-value, and fully
-spec-able against the RFC 9106 test vectors. **Good second port after DNS.**
+`std::crypto::pbkdf2_sha256` already existed, so the KDF pattern was
+established. Argon2id needed BLAKE2b and a memory-hard fill — both
+expressible on `Array[Int]`, with every 64-bit operation spelled out over
+the trapping signed `Int`. Spec'd against RFC 7693, argon2-cffi, and the
+PHC string format at the smallest geometry; RFC 9106's own vectors and the
+backend's production 64 MiB hash exceed the spec sandbox's instruction fuel
+and are asserted natively by `examples/argon2.tuo` instead.
 
 ---
 
@@ -121,9 +127,9 @@ Be honest about these rather than half-porting them.
 
 ## Recommended order
 
-1. **DNS** — small, unblocks name resolution, proves the UDP primitives.
-2. **Argon2** — small, self-contained, RFC test vectors, real security value.
-3. **Redis client** — makes `tuolang-celery` talk to a real broker.
+1. ✅ **DNS** — small, unblocks name resolution, proves the UDP primitives.
+2. ✅ **Argon2** — small, self-contained, RFC test vectors, real security value.
+3. **Redis client** — makes `tuolang-celery` talk to a real broker. **Next.**
 4. **HTTP/1.1** — the backbone of everything outbound and inbound.
 5. **TLS 1.3** — the big one; unlocks every external integration at once.
 6. **Router + validation**, then **query layer** — the application framework.
