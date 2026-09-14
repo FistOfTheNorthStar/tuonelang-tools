@@ -1,0 +1,103 @@
+// argon2::hprime — the variable-length hash H' (RFC 9106 §3.3).
+//
+// BLAKE2b produces at most 64 bytes, and Argon2 needs two things it cannot
+// give directly: 1024-byte blocks to start each lane, and a tag of whatever
+// length the caller asked for. H' bridges both. For lengths up to 64 it is
+// BLAKE2b of the length and the message. Beyond that it chains 64-byte
+// digests, keeping the first half of each, and finishes with one digest of
+// the odd remainder — a construction chosen so that each 32-byte piece
+// depends on all the previous ones.
+//
+// THE LENGTH PREFIX IS PART OF THE INPUT. `H'^T(A)` hashes `LE32(T) || A`,
+// so the tag for length 32 is not a prefix of the tag for length 64, and two
+// callers asking for different lengths get unrelated outputs. Forgetting the
+// prefix produces a function that agrees with itself and with nothing else,
+// which is why the specs assert an external transcription.
+
+module argon2::hprime;
+
+/// The width of each chained piece, in bytes: half a BLAKE2b digest.
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::hprime::piece(); // 32
+/// ```
+pub fn piece() -> Int {
+    32
+}
+
+/// `H'^out_len(message)`: `out_len` bytes derived from `message`
+/// (RFC 9106 §3.3, Figure 8). `out_len` below 1 is treated as 1.
+///
+/// # Example
+/// ```tuo
+/// let tag = argon2::hprime::hash(final_block_bytes, 32);
+/// let lane_start = argon2::hprime::hash(seed, 1024);
+/// ```
+pub fn hash(in message: Array[Int], take out_len: Int) -> Array[Int] {
+    var t = out_len;
+    if t < 1 {
+        t = 1;
+    }
+    var input = std::array::empty();
+    argon2::word::push_le32(input, t);
+    argon2::word::push_bytes(input, message);
+    if t <= argon2::blake2b::max_out() {
+        return argon2::blake2b::hash(input, t);
+    }
+    // r = ceil(T / 32) - 2 full pieces, then one digest of T - 32r bytes
+    // (which is between 33 and 64, since T > 64).
+    let r = (t + piece() - 1) / piece() - 2;
+    var v = argon2::blake2b::hash(input, argon2::blake2b::max_out());
+    var out = std::array::empty();
+    push_piece(out, v);
+    var i = 1;
+    while i < r {
+        v = argon2::blake2b::hash(v, argon2::blake2b::max_out());
+        push_piece(out, v);
+        i = i + 1;
+    }
+    let tail = argon2::blake2b::hash(v, t - piece() * r);
+    argon2::word::push_bytes(out, tail);
+    out
+}
+
+/// Append the first 32 bytes of `v` — `W_i` in the RFC's notation — to `out`.
+fn push_piece(mut out: Array[Int], in v: Array[Int]) {
+    var i = 0;
+    while i < piece() {
+        std::array::push(out, std::array::get(v, i));
+        i = i + 1;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Spec fixtures: a Python transcription of Figure 8 over `hashlib.blake2b`.
+// ----------------------------------------------------------------------------
+
+fn hex_of(take out_len: Int) -> String {
+    std::crypto::to_hex(hash(argon2::blake2b::abc(), out_len))
+}
+
+fn long_word(take i: Int) -> String {
+    argon2::word::hex(argon2::word::le64_at(hash(argon2::blake2b::abc(), 1024), i * 8))
+}
+
+spec hash {
+    // The short path: one BLAKE2b of LE32(T) || A.
+    then std::string::as_str(hex_of(4)) == "3e6c02ac";
+    then std::string::as_str(hex_of(32)) == "6cfcbf5d43e547674bfbc009070570bcb84e272d359c1e9277e416d74cbbe1c6";
+    then std::string::as_str(hex_of(64)) == "f32577a3172f56657d531faaa43077bb8c9726ada7bb04dd337ec5a65454abff241ad6b87a72440e5127c6f9caa70327f2a699096e52d163eb52d9cd99620593";
+    // The chained path, at its shortest (r = 1: one piece, then a 33-byte tail)
+    // and at an odd length.
+    then std::string::as_str(hex_of(65)) == "77baa447fe6f777c9bcb519545ce80badaf08ecb973fbb4ff45af7d8b569ec7caad65f72669d05153cdeaa563a162bb5ae4c42214551593816008dc560c5a65391";
+    then std::string::as_str(hex_of(100)) == "4c9ba23bcafae5e571a5d41673bb8084a4a1de2688416ed390f669d33d364f3d4d9bfa7fe762680c6b2362711c4ce5b2c60ddcd14c1277ec1369c79f44c2896698a2b0773a3ce2e410532fa7c72f0bb61ccca0c24c362f337555cbf2998f2d3601be70d1";
+    then std::array::len(hash(argon2::blake2b::abc(), 100)) == 100;
+    // The block-sized output the lanes start from.
+    then std::array::len(hash(argon2::blake2b::abc(), 1024)) == 1024;
+    then std::string::as_str(long_word(0)) == "5afa855ceaa03840";
+    then std::string::as_str(long_word(127)) == "a0f8ffc9cdc70e94";
+    // Lengths are part of the input: 32 is not a prefix of 64.
+    then std::string::as_str(hex_of(32)) != std::string::as_str(hex_of(64));
+    then std::array::len(hash(argon2::blake2b::abc(), 0)) == 1;
+}

@@ -1,5 +1,5 @@
 [package]
-name = "tuo_dns"
+name = "tuo_python_tools"
 version = "0.1.0"
 edition = "2024"
 

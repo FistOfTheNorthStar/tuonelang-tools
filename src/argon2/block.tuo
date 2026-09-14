@@ -1,0 +1,452 @@
+// argon2::block — the 1024-byte memory block and the compression function G.
+//
+// Argon2's memory is a matrix of 1024-byte blocks, and every block after the
+// first two in a lane is G of two earlier ones (RFC 9106 §3.2 step 5). G is
+// where the work happens: it is what makes filling the memory cost time, and
+// its dependence on a *data-chosen* earlier block is what makes skipping the
+// memory cost more time still.
+//
+// A BLOCK IS 128 WORDS. RFC 9106 §3.5 views it as an 8x8 matrix of 16-byte
+// registers; in words, register `k` is words `2k` and `2k + 1`, register
+// `R_i` of the matrix has `i = 8 * row + col`, and so a row is sixteen
+// consecutive words while a column is eight pairs sixteen words apart. That
+// is the whole of `permute`'s `base` and `stride` arithmetic.
+//
+// G IS NOT BLAKE2b. The permutation P has BLAKE2b's round *shape* — the same
+// eight GB calls over a 4x4 matrix of words, the same rotation amounts — but
+// its mixing step adds a 32-bit multiply (§3.6, and `argon2::word::mix_add`),
+// and there is no message schedule and no IV. Sharing code with
+// `argon2::blake2b::g` would parameterise the one thing that differs.
+//
+// THE MEMORY IS ONE FLAT `Array[Int]` of `blocks * 128` words, addressed by
+// block index; `argon2::hash` owns it and passes it to `fill` by `mut`. A
+// block is never a struct or a nested array because v0 has neither a `[Int;
+// 128]` value in a growable array nor an `Array[Array[Int]]` element copy
+// that is free, and one flat array is what the native code would be anyway.
+
+module argon2::block;
+
+/// The size of one block, in 64-bit words.
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::block::words(); // 128
+/// ```
+pub fn words() -> Int {
+    128
+}
+
+/// The size of one block, in bytes.
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::block::bytes(); // 1024
+/// ```
+pub fn bytes() -> Int {
+    1024
+}
+
+/// A block of 128 zero words — `ZERO(1024)` in RFC 9106 §3.4.1.2.
+///
+/// # Example
+/// ```tuo
+/// let z = argon2::block::zero();
+/// ```
+pub fn zero() -> Array[Int] {
+    var z = std::array::empty();
+    var i = 0;
+    while i < words() {
+        std::array::push(z, 0);
+        i = i + 1;
+    }
+    z
+}
+
+/// The block whose bytes are `bytes`, little-endian word by word, zero-padded
+/// past the end and truncated after 1024 bytes.
+///
+/// # Example
+/// ```tuo
+/// let b = argon2::block::of_bytes(argon2::hprime::hash(seed, 1024));
+/// ```
+pub fn of_bytes(in bytes: Array[Int]) -> Array[Int] {
+    var z = std::array::empty();
+    var i = 0;
+    while i < words() {
+        std::array::push(z, argon2::word::le64_at(bytes, i * 8));
+        i = i + 1;
+    }
+    z
+}
+
+/// The 1024 bytes of `block`, little-endian word by word.
+///
+/// # Example
+/// ```tuo
+/// let tag = argon2::hprime::hash(argon2::block::to_bytes(final_block), 32);
+/// ```
+pub fn to_bytes(in block: Array[Int]) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < words() {
+        argon2::word::push_le64(out, std::array::get(block, i));
+        i = i + 1;
+    }
+    out
+}
+
+/// Argon2's GB (RFC 9106 §3.6, Figure 19), applied in place to the words of
+/// `v` at indices `a`, `b`, `c`, `d`.
+///
+/// BLAKE2b's G with the message words removed and each addition replaced by
+/// `mix_add`, which folds in the low-half multiplication.
+///
+/// # Example
+/// ```tuo
+/// argon2::block::gb(v, 0, 4, 8, 12);
+/// ```
+pub fn gb(mut v: Array[Int], take a: Int, take b: Int, take c: Int, take d: Int) {
+    var va = std::array::get(v, a);
+    var vb = std::array::get(v, b);
+    var vc = std::array::get(v, c);
+    var vd = std::array::get(v, d);
+    va = argon2::word::mix_add(va, vb);
+    vd = argon2::word::rotr64(vd ^ va, 32);
+    vc = argon2::word::mix_add(vc, vd);
+    vb = argon2::word::rotr64(vb ^ vc, 24);
+    va = argon2::word::mix_add(va, vb);
+    vd = argon2::word::rotr64(vd ^ va, 16);
+    vc = argon2::word::mix_add(vc, vd);
+    vb = argon2::word::rotr64(vb ^ vc, 63);
+    std::array::set(v, a, va);
+    std::array::set(v, b, vb);
+    std::array::set(v, c, vc);
+    std::array::set(v, d, vd);
+}
+
+/// The word index of `v_j` (`j` in `0 ..= 15`) for a permutation whose eight
+/// registers start at word `base` and are `stride` words apart.
+///
+/// A row's registers are adjacent (`stride` 2); a column's are one row apart
+/// (`stride` 16). Register `k` holds `v_{2k}` then `v_{2k+1}` (§3.6:
+/// `S_i = (v_{2i+1} || v_{2i})`, low word first in memory).
+///
+/// # Example
+/// ```tuo
+/// let i = argon2::block::slot(2, 16, 3); // 2 + 16 + 1 = 19: v_3 of column 1
+/// ```
+pub fn slot(take base: Int, take stride: Int, take j: Int) -> Int {
+    base + (j / 2) * stride + (j % 2)
+}
+
+/// The permutation P (RFC 9106 §3.6) applied in place to the sixteen words of
+/// `z` that `slot(base, stride, j)` selects.
+///
+/// The eight GB calls are BLAKE2b's: four down the columns of the 4x4 word
+/// matrix, then four along its diagonals.
+///
+/// # Example
+/// ```tuo
+/// argon2::block::permute(z, 16, 2); // row 1
+/// argon2::block::permute(z, 2, 16); // column 1
+/// ```
+pub fn permute(mut z: Array[Int], take base: Int, take stride: Int) {
+    var v = std::array::empty();
+    var j = 0;
+    while j < 16 {
+        std::array::push(v, std::array::get(z, slot(base, stride, j)));
+        j = j + 1;
+    }
+    gb(v, 0, 4, 8, 12);
+    gb(v, 1, 5, 9, 13);
+    gb(v, 2, 6, 10, 14);
+    gb(v, 3, 7, 11, 15);
+    gb(v, 0, 5, 10, 15);
+    gb(v, 1, 6, 11, 12);
+    gb(v, 2, 7, 8, 13);
+    gb(v, 3, 4, 9, 14);
+    j = 0;
+    while j < 16 {
+        std::array::set(z, slot(base, stride, j), std::array::get(v, j));
+        j = j + 1;
+    }
+}
+
+/// The compression function G(X, Y) (RFC 9106 §3.5): `R = X ^ Y`, P over
+/// every row of R, then P over every column, then the result xored with R.
+///
+/// The final xor is what makes G non-invertible from its output alone, and
+/// it is also why `G(X, X)` is the zero block for every X: `R` is zero, P
+/// fixes zero, and zero xor zero is zero. The specs pin that identity.
+///
+/// # Example
+/// ```tuo
+/// let z = argon2::block::compress(prev, reference);
+/// ```
+pub fn compress(in x: Array[Int], in y: Array[Int]) -> Array[Int] {
+    var r = std::array::empty();
+    var z = std::array::empty();
+    var i = 0;
+    while i < words() {
+        let w = std::array::get(x, i) ^ std::array::get(y, i);
+        std::array::push(r, w);
+        std::array::push(z, w);
+        i = i + 1;
+    }
+    var row = 0;
+    while row < 8 {
+        permute(z, 16 * row, 2);
+        row = row + 1;
+    }
+    var col = 0;
+    while col < 8 {
+        permute(z, 2 * col, 16);
+        col = col + 1;
+    }
+    i = 0;
+    while i < words() {
+        std::array::set(z, i, std::array::get(z, i) ^ std::array::get(r, i));
+        i = i + 1;
+    }
+    z
+}
+
+// ----------------------------------------------------------------------------
+// The flat memory.
+// ----------------------------------------------------------------------------
+
+/// A copy of block `index` of `memory`.
+///
+/// # Example
+/// ```tuo
+/// let prev = argon2::block::at(memory, offset - 1);
+/// ```
+pub fn at(in memory: Array[Int], take index: Int) -> Array[Int] {
+    var out = std::array::empty();
+    let base = index * words();
+    var i = 0;
+    while i < words() {
+        std::array::push(out, std::array::get(memory, base + i));
+        i = i + 1;
+    }
+    out
+}
+
+/// Overwrite block `index` of `memory` with `block`.
+///
+/// # Example
+/// ```tuo
+/// argon2::block::store(memory, 0, first);
+/// ```
+pub fn store(mut memory: Array[Int], take index: Int, in block: Array[Int]) {
+    let base = index * words();
+    var i = 0;
+    while i < words() {
+        std::array::set(memory, base + i, std::array::get(block, i));
+        i = i + 1;
+    }
+}
+
+/// Xor `block` into block `index` of `memory` — the `XOR B[i][j]` of every
+/// pass after the first (RFC 9106 §3.2 step 6).
+///
+/// # Example
+/// ```tuo
+/// argon2::block::merge(memory, offset, fresh);
+/// ```
+pub fn merge(mut memory: Array[Int], take index: Int, in block: Array[Int]) {
+    let base = index * words();
+    var i = 0;
+    while i < words() {
+        std::array::set(memory, base + i, std::array::get(memory, base + i) ^ std::array::get(block, i));
+        i = i + 1;
+    }
+}
+
+/// Compute `G(B[prev], B[reference])` into block `dst` of `memory`: stored
+/// outright on the first pass, xored into the existing block on later ones.
+///
+/// # Example
+/// ```tuo
+/// argon2::block::fill(memory, offset, offset - 1, ref_offset, pass > 0);
+/// ```
+pub fn fill(mut memory: Array[Int], take dst: Int, take prev: Int, take reference: Int, take with_xor: Bool) {
+    let fresh = compress(at(memory, prev), at(memory, reference));
+    if with_xor {
+        merge(memory, dst, fresh);
+    } else {
+        store(memory, dst, fresh);
+    }
+}
+
+/// A memory of `blocks` zero blocks.
+///
+/// # Example
+/// ```tuo
+/// var memory = argon2::block::memory(32);
+/// ```
+pub fn memory(take blocks: Int) -> Array[Int] {
+    var m = std::array::empty();
+    let n = blocks * words();
+    var i = 0;
+    while i < n {
+        std::array::push(m, 0);
+        i = i + 1;
+    }
+    m
+}
+
+// ----------------------------------------------------------------------------
+// Spec fixtures.
+//
+// RFC 9106 publishes no vector for G on its own — only for whole memory
+// fills, which `argon2::hash` asserts. The vectors here come from a direct
+// Python transcription of §3.5–3.6 over `hashlib`-free integer arithmetic,
+// so they check the transcription *into tuonelang* (register layout, row and
+// column addressing, the multiply) rather than the RFC's own arithmetic. The
+// end-to-end tags in `argon2::hash` check the rest.
+// ----------------------------------------------------------------------------
+
+/// The block whose word `i` is `i`.
+///
+/// # Example
+/// ```tuo
+/// let x = argon2::block::counting();
+/// ```
+pub fn counting() -> Array[Int] {
+    var z = std::array::empty();
+    var i = 0;
+    while i < words() {
+        std::array::push(z, i);
+        i = i + 1;
+    }
+    z
+}
+
+/// The block whose word `i` is `i * 0x0101010101010101 + 0x0123456789abcdef`
+/// mod 2^64 — every word different, most with their top bit set.
+///
+/// # Example
+/// ```tuo
+/// let y = argon2::block::striped();
+/// ```
+pub fn striped() -> Array[Int] {
+    var z = std::array::empty();
+    let stripe = argon2::word::from_halves(0x01010101, 0x01010101);
+    let offset = argon2::word::from_halves(0x01234567, 0x89abcdef);
+    var acc = offset;
+    var i = 0;
+    while i < words() {
+        std::array::push(z, acc);
+        acc = argon2::word::add64(acc, stripe);
+        i = i + 1;
+    }
+    z
+}
+
+fn compress_word_hex(take i: Int) -> String {
+    argon2::word::hex(std::array::get(compress(counting(), striped()), i))
+}
+
+fn is_zero_block(in block: Array[Int]) -> Bool {
+    if std::array::len(block) != words() {
+        return false;
+    }
+    var i = 0;
+    while i < words() {
+        if std::array::get(block, i) != 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn permuted_row0_word(take i: Int) -> Int {
+    var z = counting();
+    permute(z, 0, 2);
+    std::array::get(z, i)
+}
+
+fn gb_word(take i: Int) -> String {
+    var v = std::array::empty();
+    std::array::push(v, 1);
+    std::array::push(v, 2);
+    std::array::push(v, 3);
+    std::array::push(v, 4);
+    gb(v, 0, 1, 2, 3);
+    argon2::word::hex(std::array::get(v, i))
+}
+
+fn memory_word_after_fill(take with_xor: Bool) -> Int {
+    var m = memory(3);
+    store(m, 0, counting());
+    store(m, 1, striped());
+    // Block 2 starts as the counting block so a merge has something to xor.
+    store(m, 2, counting());
+    fill(m, 2, 0, 1, with_xor);
+    std::array::get(m, 2 * words() + 1)
+}
+
+fn roundtrip_word(take i: Int) -> Int {
+    std::array::get(of_bytes(to_bytes(striped())), i)
+}
+
+spec slot {
+    then slot(0, 2, 0) == 0;
+    then slot(0, 2, 15) == 15;
+    then slot(16, 2, 3) == 19;
+    then slot(2, 16, 0) == 2;
+    then slot(2, 16, 1) == 3;
+    then slot(2, 16, 2) == 18;
+    then slot(2, 16, 15) == 115;
+}
+
+spec gb {
+    then std::string::as_str(gb_word(0)) == "0000010000002d07";
+    then std::string::as_str(gb_word(1)) == "5a0e02060e2a0606";
+    then std::string::as_str(gb_word(2)) == "2d07000307150003";
+    then std::string::as_str(gb_word(3)) == "2d07000001030000";
+}
+
+spec permute {
+    then std::string::as_str(argon2::word::hex(permuted_row0_word(0))) == "3bce1ccd56d0db35";
+    then std::string::as_str(argon2::word::hex(permuted_row0_word(15))) == "4c1b185e3a641fc4";
+    // Words outside the addressed row are untouched.
+    then permuted_row0_word(16) == 16;
+    then permuted_row0_word(127) == 127;
+}
+
+spec compress {
+    then std::string::as_str(compress_word_hex(0)) == "3e1abb0b0786bc06";
+    then std::string::as_str(compress_word_hex(1)) == "ec9b8d022ad8f5f5";
+    then std::string::as_str(compress_word_hex(64)) == "6efc0a3e2d427116";
+    then std::string::as_str(compress_word_hex(127)) == "fe88944a584d5bec";
+    then std::array::len(compress(counting(), striped())) == 128;
+    // G(X, X) is the zero block for every X.
+    then is_zero_block(compress(zero(), zero()));
+    then is_zero_block(compress(striped(), striped()));
+}
+
+spec fill {
+    // Stored outright: word 1 of G(counting, striped).
+    then std::string::as_str(argon2::word::hex(memory_word_after_fill(false))) == "ec9b8d022ad8f5f5";
+    // Merged: the same word xored with the block's prior contents (word 1 of
+    // the counting block is 1).
+    then memory_word_after_fill(true) == (memory_word_after_fill(false) ^ 1);
+}
+
+spec of_bytes {
+    then roundtrip_word(0) == argon2::word::from_halves(0x01234567, 0x89abcdef);
+    then roundtrip_word(127) == std::array::get(striped(), 127);
+    then std::array::len(to_bytes(striped())) == 1024;
+    then std::array::len(of_bytes(std::array::empty())) == 128;
+    then is_zero_block(of_bytes(std::array::empty()));
+}
+
+spec memory {
+    then std::array::len(memory(4)) == 512;
+    then std::array::len(zero()) == 128;
+    then is_zero_block(zero());
+    then std::array::get(at(memory(2), 1), 0) == 0;
+}

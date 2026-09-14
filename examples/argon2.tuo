@@ -1,0 +1,74 @@
+// examples/argon2 — the native oracle for the Argon2 port.
+//
+// Every module under `src/argon2/` is pure and proven by specs, but the spec
+// sandbox grants ten million instructions per assertion, and a memory-hard
+// hash is built to spend more than that. So the vectors that matter most —
+// RFC 9106 §5's three published tags at 32 KiB, and the hash `shallowflaws`
+// itself produced at its production 64 MiB — are asserted here, compiled
+// natively, where the same code runs unbounded.
+//
+//     tuo run examples/argon2.tuo src/argon2/*.tuo src/std_crypto.tuo src/std_ct.tuo src/std_bits.tuo src/std_str.tuo
+//
+// It prints one line per check and exits with the number that failed, so
+// `echo $?` is 0 exactly when this port agrees with the RFC and with
+// argon2-cffi. Nothing here touches the network or the filesystem. Time it
+// with the shell: the last two checks each fill 64 MiB three times over.
+
+module argon2_check;
+
+/// The PHC string `app/api/auth_utils.py`'s `hash_password("testpassword")`
+/// returned on 2026-09-14, salt and all. Verifying it is the whole point:
+/// a hash the Python backend wrote, checked by this port at full strength.
+fn backend_hash() -> Str {
+    "$argon2id$v=19$m=65536,t=3,p=4$LSVEyHlPKeX8H6MUAqAUgg$Oi3eSjP4fdW0xxgFUTTwmAy9JeDc6J2v6DnyGRazITI"
+}
+
+/// Print one result line and report 0 on success or 1 on failure, so `main`
+/// can total them.
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn hex_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+fn main() -> Int {
+    var failed = 0;
+
+    // RFC 9106 §5: the published tags, all three variants.
+    failed = failed + report("RFC 9106 §5.1 Argon2d tag", hex_is(argon2::hash::rfc_tag_hex(argon2::hash::kind_d()), "512b391b6f1162975371d30919734294f868e3be3984f3c1a13a4db9fabe4acb"));
+    failed = failed + report("RFC 9106 §5.2 Argon2i tag", hex_is(argon2::hash::rfc_tag_hex(argon2::hash::kind_i()), "c814d9d1dc7f37aa13f0d77f2494bda1c8de6b016dd388d29952a4c4672b6ce8"));
+    failed = failed + report("RFC 9106 §5.3 Argon2id tag", hex_is(argon2::hash::rfc_tag_hex(argon2::hash::kind_id()), "0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659"));
+
+    // RFC 9106 §5: the interim "After pass 0" block values.
+    failed = failed + report("RFC 9106 §5.1 Argon2d block 0 word 0 after pass 0", hex_is(argon2::hash::rfc_after_pass0(argon2::hash::kind_d(), 0, 0), "db2fea6b2c6f5c8a"));
+    failed = failed + report("RFC 9106 §5.1 Argon2d block 31 word 127 after pass 0", hex_is(argon2::hash::rfc_after_pass0(argon2::hash::kind_d(), 31, 127), "6a6c49d2cb75d5b6"));
+    failed = failed + report("RFC 9106 §5.2 Argon2i block 0 word 0 after pass 0", hex_is(argon2::hash::rfc_after_pass0(argon2::hash::kind_i(), 0, 0), "f8f9e84545db08f6"));
+    failed = failed + report("RFC 9106 §5.2 Argon2i block 31 word 127 after pass 0", hex_is(argon2::hash::rfc_after_pass0(argon2::hash::kind_i(), 31, 127), "c570f2ab2a86cf00"));
+    failed = failed + report("RFC 9106 §5.3 Argon2id block 0 word 0 after pass 0", hex_is(argon2::hash::rfc_after_pass0(argon2::hash::kind_id(), 0, 0), "6b2e09f10671bd43"));
+    failed = failed + report("RFC 9106 §5.3 Argon2id block 31 word 127 after pass 0", hex_is(argon2::hash::rfc_after_pass0(argon2::hash::kind_id(), 31, 127), "81f88b28683ea8e5"));
+
+    // argon2-cffi: geometries beyond one lane, which the sandbox cannot afford.
+    failed = failed + report("argon2-cffi Argon2id, 2 lanes, 16 KiB, 2 passes", hex_is(argon2::hash::cffi_hex(2, 16, 2, argon2::hash::kind_id(), 32), "747d7631b182faf749d7efc31aec31df4ecfe3b57c792f53800ac2c9978b4888"));
+    failed = failed + report("argon2-cffi Argon2id, 3 lanes, 24 KiB, 1 pass", hex_is(argon2::hash::cffi_hex(3, 24, 1, argon2::hash::kind_id(), 32), "df463990c5b71978acf7b68773aaa9e2a299c708c3d128cf638793db9b956845"));
+
+    // The backend's own hash, at its production cost.
+    failed = failed + report("shallowflaws hash_password(\"testpassword\") verifies at m=65536, t=3, p=4", argon2::password::verify("testpassword", backend_hash()));
+    failed = failed + report("a wrong password against the same hash is rejected", !argon2::password::verify("Testpassword", backend_hash()));
+
+    failed
+}
