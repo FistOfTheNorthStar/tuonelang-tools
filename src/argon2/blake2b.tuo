@@ -1,0 +1,371 @@
+// argon2::blake2b — BLAKE2b (RFC 7693), the hash Argon2 is built from.
+//
+// Argon2 uses BLAKE2b in three places: the 64-byte pre-hash H_0 of every
+// input parameter, the variable-length H' that expands H_0 into the first two
+// blocks of each lane and squeezes the final block down to the tag, and the
+// permutation P inside the compression function G. The first two are the
+// real hash function, unkeyed, with a caller-chosen digest length from 1 to
+// 64 bytes; this module is that function. The third borrows only the round
+// structure, with a different mixing step, and lives in `argon2::block`.
+//
+// CORRECTNESS IS EXTERNALLY DEFINED. RFC 7693 Appendix A publishes the
+// 512-bit digest of "abc", and Python's `hashlib.blake2b` — which is the
+// reference implementation — gives every other length and size below. The
+// specs assert those, never this module's own output.
+//
+// EVERY WORD OPERATION GOES THROUGH `argon2::word`. The state, the message
+// words, and the IV are 64-bit words held in a trapping signed `Int`, so a
+// bare `+` here would abort on the first carry into the sign bit. See that
+// module's header for the representation.
+
+module argon2::blake2b;
+
+/// The digest length BLAKE2b is named for, in bytes; also its largest.
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::blake2b::max_out(); // 64
+/// ```
+pub fn max_out() -> Int {
+    64
+}
+
+/// The size of one message block, in bytes.
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::blake2b::block_len(); // 128
+/// ```
+pub fn block_len() -> Int {
+    128
+}
+
+/// The number of rounds of the compression function.
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::blake2b::rounds(); // 12
+/// ```
+pub fn rounds() -> Int {
+    12
+}
+
+/// The `i`th word of the initialisation vector (RFC 7693 §2.6): the first 64
+/// bits of the fractional parts of the square roots of the first eight
+/// primes, and the same constants SHA-512 starts from.
+///
+/// Spelled in halves because five of the eight have their top bit set and
+/// do not fit a signed literal.
+///
+/// # Example
+/// ```tuo
+/// let w = argon2::blake2b::iv(0); // 0x6a09e667f3bcc908
+/// ```
+pub fn iv(take i: Int) -> Int {
+    if i == 0 {
+        return argon2::word::from_halves(0x6a09e667, 0xf3bcc908);
+    }
+    if i == 1 {
+        return argon2::word::from_halves(0xbb67ae85, 0x84caa73b);
+    }
+    if i == 2 {
+        return argon2::word::from_halves(0x3c6ef372, 0xfe94f82b);
+    }
+    if i == 3 {
+        return argon2::word::from_halves(0xa54ff53a, 0x5f1d36f1);
+    }
+    if i == 4 {
+        return argon2::word::from_halves(0x510e527f, 0xade682d1);
+    }
+    if i == 5 {
+        return argon2::word::from_halves(0x9b05688c, 0x2b3e6c1f);
+    }
+    if i == 6 {
+        return argon2::word::from_halves(0x1f83d9ab, 0xfb41bd6b);
+    }
+    argon2::word::from_halves(0x5be0cd19, 0x137e2179)
+}
+
+/// The message schedule (RFC 7693 §2.7) as one flat array of 160 entries:
+/// row `r` of SIGMA is entries `16 * r` to `16 * r + 15`. Rounds 10 and 11
+/// reuse rows 0 and 1, which `compress` does by indexing `round % 10`.
+///
+/// Built fresh per call because v0 has no `const` arrays; `compress` calls it
+/// once per block, which is noise next to the 96 `g` calls that follow.
+///
+/// # Example
+/// ```tuo
+/// let s = argon2::blake2b::sigma(); // s[16] is 14, the first entry of row 1
+/// ```
+pub fn sigma() -> Array[Int] {
+    var s = std::array::empty();
+    push_row(s, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+    push_row(s, 14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3);
+    push_row(s, 11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4);
+    push_row(s, 7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8);
+    push_row(s, 9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13);
+    push_row(s, 2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9);
+    push_row(s, 12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11);
+    push_row(s, 13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10);
+    push_row(s, 6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5);
+    push_row(s, 10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0);
+    s
+}
+
+/// Append one sixteen-entry row of SIGMA to `s`.
+fn push_row(mut s: Array[Int], take a: Int, take b: Int, take c: Int, take d: Int, take e: Int, take f: Int, take g0: Int, take h: Int, take i: Int, take j: Int, take k: Int, take l: Int, take m: Int, take n: Int, take o: Int, take p: Int) {
+    std::array::push(s, a);
+    std::array::push(s, b);
+    std::array::push(s, c);
+    std::array::push(s, d);
+    std::array::push(s, e);
+    std::array::push(s, f);
+    std::array::push(s, g0);
+    std::array::push(s, h);
+    std::array::push(s, i);
+    std::array::push(s, j);
+    std::array::push(s, k);
+    std::array::push(s, l);
+    std::array::push(s, m);
+    std::array::push(s, n);
+    std::array::push(s, o);
+    std::array::push(s, p);
+}
+
+/// The mixing function G (RFC 7693 §3.1), applied in place to the four
+/// words of `v` at indices `a`, `b`, `c`, `d`, with message words `x` and
+/// `y`.
+///
+/// # Example
+/// ```tuo
+/// argon2::blake2b::g(v, 0, 4, 8, 12, m0, m1);
+/// ```
+pub fn g(mut v: Array[Int], take a: Int, take b: Int, take c: Int, take d: Int, take x: Int, take y: Int) {
+    var va = std::array::get(v, a);
+    var vb = std::array::get(v, b);
+    var vc = std::array::get(v, c);
+    var vd = std::array::get(v, d);
+    va = argon2::word::add64(argon2::word::add64(va, vb), x);
+    vd = argon2::word::rotr64(vd ^ va, 32);
+    vc = argon2::word::add64(vc, vd);
+    vb = argon2::word::rotr64(vb ^ vc, 24);
+    va = argon2::word::add64(argon2::word::add64(va, vb), y);
+    vd = argon2::word::rotr64(vd ^ va, 16);
+    vc = argon2::word::add64(vc, vd);
+    vb = argon2::word::rotr64(vb ^ vc, 63);
+    std::array::set(v, a, va);
+    std::array::set(v, b, vb);
+    std::array::set(v, c, vc);
+    std::array::set(v, d, vd);
+}
+
+/// The compression function F (RFC 7693 §3.2): fold the sixteen-word message
+/// block `m` into the eight-word state `h`, where `counter` is the number of
+/// message bytes hashed so far including this block, and `last` marks the
+/// final block.
+///
+/// The counter is a 128-bit quantity in the RFC; its high word is always
+/// zero for any message tuonelang can hold, so only the low word is mixed in.
+///
+/// # Example
+/// ```tuo
+/// argon2::blake2b::compress(h, m, 128, false);
+/// ```
+pub fn compress(mut h: Array[Int], in m: Array[Int], take counter: Int, take last: Bool) {
+    var v = std::array::empty();
+    var i = 0;
+    while i < 8 {
+        std::array::push(v, std::array::get(h, i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < 8 {
+        std::array::push(v, iv(i));
+        i = i + 1;
+    }
+    std::array::set(v, 12, std::array::get(v, 12) ^ counter);
+    if last {
+        // Invert every bit of v[14]: xor with the all-ones word, which is -1.
+        std::array::set(v, 14, std::array::get(v, 14) ^ (0 - 1));
+    }
+    let s = sigma();
+    var round = 0;
+    while round < rounds() {
+        let base = (round % 10) * 16;
+        g(v, 0, 4, 8, 12, std::array::get(m, std::array::get(s, base)), std::array::get(m, std::array::get(s, base + 1)));
+        g(v, 1, 5, 9, 13, std::array::get(m, std::array::get(s, base + 2)), std::array::get(m, std::array::get(s, base + 3)));
+        g(v, 2, 6, 10, 14, std::array::get(m, std::array::get(s, base + 4)), std::array::get(m, std::array::get(s, base + 5)));
+        g(v, 3, 7, 11, 15, std::array::get(m, std::array::get(s, base + 6)), std::array::get(m, std::array::get(s, base + 7)));
+        g(v, 0, 5, 10, 15, std::array::get(m, std::array::get(s, base + 8)), std::array::get(m, std::array::get(s, base + 9)));
+        g(v, 1, 6, 11, 12, std::array::get(m, std::array::get(s, base + 10)), std::array::get(m, std::array::get(s, base + 11)));
+        g(v, 2, 7, 8, 13, std::array::get(m, std::array::get(s, base + 12)), std::array::get(m, std::array::get(s, base + 13)));
+        g(v, 3, 4, 9, 14, std::array::get(m, std::array::get(s, base + 14)), std::array::get(m, std::array::get(s, base + 15)));
+        round = round + 1;
+    }
+    i = 0;
+    while i < 8 {
+        std::array::set(h, i, std::array::get(h, i) ^ std::array::get(v, i) ^ std::array::get(v, i + 8));
+        i = i + 1;
+    }
+}
+
+/// The sixteen little-endian message words of the 128-byte block of
+/// `message` beginning at byte `offset`, zero-padded past the end.
+///
+/// # Example
+/// ```tuo
+/// let m = argon2::blake2b::block_words(message, 128); // the second block
+/// ```
+pub fn block_words(in message: Array[Int], take offset: Int) -> Array[Int] {
+    var m = std::array::empty();
+    var i = 0;
+    while i < 16 {
+        std::array::push(m, argon2::word::le64_at(message, offset + i * 8));
+        i = i + 1;
+    }
+    m
+}
+
+/// The unkeyed BLAKE2b digest of `message`, `out_len` bytes long
+/// (RFC 7693 §3.3). `out_len` is clamped to `1 ..= 64`.
+///
+/// This is the `H^x` of RFC 9106 §3.2: the parameter block folds the digest
+/// length into the first state word, so BLAKE2b-256 of a message is not a
+/// prefix of BLAKE2b-512 of it, and Argon2 depends on that.
+///
+/// An empty message is one zero block with a zero counter, per the RFC —
+/// not zero blocks.
+///
+/// # Example
+/// ```tuo
+/// let d = argon2::blake2b::hash(argon2::blake2b::abc(), 64); // ba 80 a5 3f ...
+/// ```
+pub fn hash(in message: Array[Int], take out_len: Int) -> Array[Int] {
+    var nn = out_len;
+    if nn < 1 {
+        nn = 1;
+    }
+    if nn > max_out() {
+        nn = max_out();
+    }
+    var h = std::array::empty();
+    var i = 0;
+    while i < 8 {
+        std::array::push(h, iv(i));
+        i = i + 1;
+    }
+    // The parameter block for an unkeyed hash: fanout 1, depth 1, digest
+    // length nn, key length 0 — all in the first word.
+    std::array::set(h, 0, std::array::get(h, 0) ^ (0x01010000 ^ nn));
+
+    let n = std::array::len(message);
+    var offset = 0;
+    var counter = 0;
+    // Every block but the last is full and not final. The last block is
+    // whatever remains — up to and including a full 128 bytes — and is
+    // final. An empty message falls straight through to one zero block.
+    while n - offset > block_len() {
+        counter = counter + block_len();
+        compress(h, block_words(message, offset), counter, false);
+        offset = offset + block_len();
+    }
+    counter = counter + (n - offset);
+    compress(h, block_words(message, offset), counter, true);
+
+    var full = std::array::empty();
+    i = 0;
+    while i < 8 {
+        argon2::word::push_le64(full, std::array::get(h, i));
+        i = i + 1;
+    }
+    var out = std::array::empty();
+    i = 0;
+    while i < nn {
+        std::array::push(out, std::array::get(full, i));
+        i = i + 1;
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Spec fixtures: RFC 7693 Appendix A and `hashlib.blake2b`.
+// ----------------------------------------------------------------------------
+
+/// The bytes of "abc", RFC 7693's one published test message.
+///
+/// # Example
+/// ```tuo
+/// let m = argon2::blake2b::abc(); // [97, 98, 99]
+/// ```
+pub fn abc() -> Array[Int] {
+    var m = std::array::empty();
+    std::array::push(m, 97);
+    std::array::push(m, 98);
+    std::array::push(m, 99);
+    m
+}
+
+/// The bytes `0, 1, 2, ..., (n - 1) mod 256` — a message of any length with
+/// no repeated structure at block boundaries.
+///
+/// # Example
+/// ```tuo
+/// let m = argon2::blake2b::counting(129); // exactly one byte past a block
+/// ```
+pub fn counting(take n: Int) -> Array[Int] {
+    var m = std::array::empty();
+    var i = 0;
+    while i < n {
+        std::array::push(m, i & 255);
+        i = i + 1;
+    }
+    m
+}
+
+fn hex_of(in message: Array[Int], take out_len: Int) -> String {
+    std::crypto::to_hex(hash(message, out_len))
+}
+
+spec iv {
+    then std::string::as_str(argon2::word::hex(iv(0))) == "6a09e667f3bcc908";
+    then std::string::as_str(argon2::word::hex(iv(1))) == "bb67ae8584caa73b";
+    then std::string::as_str(argon2::word::hex(iv(7))) == "5be0cd19137e2179";
+}
+
+spec sigma {
+    then std::array::len(sigma()) == 160;
+    then std::array::get(sigma(), 0) == 0;
+    then std::array::get(sigma(), 16) == 14;
+    then std::array::get(sigma(), 159) == 0;
+    then std::array::get(sigma(), 144) == 10;
+}
+
+spec block_words {
+    then std::array::len(block_words(abc(), 0)) == 16;
+    // "abc" little-endian: 0x636261, and the rest is zero padding.
+    then std::array::get(block_words(abc(), 0), 0) == 6513249;
+    then std::array::get(block_words(abc(), 0), 1) == 0;
+    then std::array::get(block_words(abc(), 128), 0) == 0;
+}
+
+spec hash {
+    // RFC 7693 Appendix A: BLAKE2b-512("abc").
+    then std::string::as_str(hex_of(abc(), 64)) == "ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923";
+    // The empty message is one zero block, not none.
+    then std::string::as_str(hex_of(std::array::empty(), 64)) == "786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419d25e1031afee585313896444934eb04b903a685b1448b755d56f701afe9be2ce";
+    // The digest length is a parameter, not a truncation: BLAKE2b-256("abc")
+    // shares no prefix with BLAKE2b-512("abc").
+    then std::string::as_str(hex_of(abc(), 32)) == "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319";
+    then std::string::as_str(hex_of(abc(), 4)) == "63906248";
+    then std::string::as_str(hex_of(abc(), 1)) == "6b";
+    then std::array::len(hash(abc(), 4)) == 4;
+    // Exactly one block is a final block with a full counter, not a full
+    // block followed by an empty final one.
+    then std::string::as_str(hex_of(counting(128), 64)) == "2319e3789c47e2daa5fe807f61bec2a1a6537fa03f19ff32e87eecbfd64b7e0e8ccff439ac333b040f19b0c4ddd11a61e24ac1fe0f10a039806c5dcc0da3d115";
+    then std::string::as_str(hex_of(counting(129), 64)) == "f59711d44a031d5f97a9413c065d1e614c417ede998590325f49bad2fd444d3e4418be19aec4e11449ac1a57207898bc57d76a1bcf3566292c20c683a5c4648f";
+    then std::string::as_str(hex_of(counting(256), 32)) == "39a7eb9fedc19aabc83425c6755dd90e6f9d0c804964a1f4aaeea3b9fb599835";
+    then std::string::as_str(hex_of(counting(1000), 64)) == "9fe687126e6566313081b43167cbfa0b4f721b45a5afd4076af327765d63a616478ffbd1cd5fbe4033e8638b8bcf8de6b3978b54a30f1d9d8d68fbe66c2b74cf";
+    // Out-of-range lengths clamp rather than trap.
+    then std::array::len(hash(abc(), 0)) == 1;
+    then std::array::len(hash(abc(), 100)) == 64;
+}

@@ -1,0 +1,367 @@
+// argon2::word — 64-bit words on a trapping signed `Int`.
+//
+// Argon2 (RFC 9106) and the BLAKE2b it is built on (RFC 7693) are defined
+// over *unsigned* 64-bit words with wrapping addition, logical shifts, and
+// rotations. tuonelang's `Int` is a **signed** i64 whose `+` and `*` trap on
+// overflow (ADR-0026), and whose `>>` is arithmetic. Every word operation the
+// two RFCs use therefore has to be spelled out so that no intermediate ever
+// leaves the representable range — the same problem `std::bits` solves for
+// 32-bit checksums, one width up, where the sign bit is now in play.
+//
+// THE REPRESENTATION. A word is stored as the `Int` with the same 64-bit
+// pattern. A word whose top bit is set is therefore a *negative* `Int`, and
+// that is fine: `^`, `&`, `|`, and `<<` act on the pattern, and the shift
+// drops the bits it pushes out rather than trapping (the language brief
+// pins this). Only `+`, `*`, and `>>` need help, and that help is below.
+//
+// WHY MULTIPLICATION IS SPLIT INTO 16-BIT HALVES. Argon2's `GB` multiplies
+// the low 32 bits of two words. The product of two 32-bit values needs 64
+// bits and can set the sign bit, which a signed `*` reports as overflow. Four
+// 16-by-16 products never exceed 32 bits each, and their shifted sum is taken
+// through `add64`, so the full 64-bit product is assembled without a single
+// trapping operation.
+
+module argon2::word;
+
+/// A mask selecting the low 32 bits.
+///
+/// # Example
+/// ```tuo
+/// let m = argon2::word::mask32(); // 4294967295
+/// ```
+pub fn mask32() -> Int {
+    4294967295
+}
+
+/// The low 32 bits of `value`, as a non-negative `Int`.
+///
+/// # Example
+/// ```tuo
+/// let lo = argon2::word::lo32(0x0000000100000002); // 2
+/// ```
+pub fn lo32(take value: Int) -> Int {
+    value & mask32()
+}
+
+/// The high 32 bits of `value`, as a non-negative `Int` — a logical shift,
+/// so a word with its top bit set reads as `0x8000_0000` or more rather than
+/// as a negative number.
+///
+/// # Example
+/// ```tuo
+/// let hi = argon2::word::hi32(0x0000000100000002); // 1
+/// ```
+pub fn hi32(take value: Int) -> Int {
+    shr64(value, 32)
+}
+
+/// The word whose high 32 bits are `hi` and low 32 bits are `lo`.
+///
+/// This is how a constant above `Int`'s positive range is written: the RFC
+/// gives BLAKE2b's IV as sixteen-digit hex, and a literal like
+/// `0xbb67ae8584caa73b` does not fit a signed literal, so it is spelled as
+/// `from_halves(0xbb67ae85, 0x84caa73b)`.
+///
+/// # Example
+/// ```tuo
+/// let w = argon2::word::from_halves(1, 2); // 0x0000000100000002
+/// ```
+pub fn from_halves(take hi: Int, take lo: Int) -> Int {
+    ((hi & mask32()) << 32) | (lo & mask32())
+}
+
+/// Addition modulo 2^64.
+///
+/// Done through 32-bit halves because `+` traps on signed overflow, and two
+/// words with their high bits set — which a hash state produces constantly —
+/// would abort the process. The halves keep every intermediate positive.
+///
+/// # Example
+/// ```tuo
+/// let s = argon2::word::add64(argon2::word::from_halves(0xFFFFFFFF, 0xFFFFFFFF), 1); // 0
+/// ```
+pub fn add64(take a: Int, take b: Int) -> Int {
+    let lo = (a & mask32()) + (b & mask32());
+    let hi = ((a >> 32) & mask32()) + ((b >> 32) & mask32()) + ((lo >> 32) & mask32());
+    ((hi & mask32()) << 32) | (lo & mask32())
+}
+
+/// Logical right shift by `n`, without sign extension.
+///
+/// `>>` is arithmetic on a signed type, so shifting a word whose high bit is
+/// set would smear ones down from the top. One single-bit shift followed by
+/// a mask clears whatever the sign extension brought in; the remaining
+/// `n - 1` bits are then shifted from a value that is already positive.
+///
+/// # Example
+/// ```tuo
+/// let r = argon2::word::shr64(argon2::word::from_halves(0x80000000, 0), 63); // 1
+/// ```
+pub fn shr64(take value: Int, take n: Int) -> Int {
+    if n <= 0 {
+        return value;
+    }
+    if n >= 64 {
+        return 0;
+    }
+    ((value >> 1) & 0x7FFFFFFFFFFFFFFF) >> (n - 1)
+}
+
+/// Rotate right by `n` within 64 bits.
+///
+/// The four rotation amounts BLAKE2b and Argon2 use are 32, 24, 16, and 63.
+///
+/// # Example
+/// ```tuo
+/// let r = argon2::word::rotr64(1, 1); // 0x8000000000000000, as a negative Int
+/// ```
+pub fn rotr64(take value: Int, take n: Int) -> Int {
+    let r = n % 64;
+    if r == 0 {
+        return value;
+    }
+    shr64(value, r) | (value << (64 - r))
+}
+
+/// The 64-bit product of the low 32 bits of `a` and the low 32 bits of `b`
+/// — `trunc(a) * trunc(b)` in RFC 9106 §3.6 — computed without a trapping
+/// multiply.
+///
+/// Each of the four 16-by-16 partial products is below 2^32; the cross term
+/// is below 2^33 and is shifted by 16 rather than multiplied; the high term
+/// is shifted straight into the top half. `add64` assembles them.
+///
+/// # Example
+/// ```tuo
+/// let p = argon2::word::mul_lo32(0xFFFFFFFF, 0xFFFFFFFF); // 0xFFFFFFFE00000001
+/// ```
+pub fn mul_lo32(take a: Int, take b: Int) -> Int {
+    let x = a & mask32();
+    let y = b & mask32();
+    let xh = x >> 16;
+    let xl = x & 65535;
+    let yh = y >> 16;
+    let yl = y & 65535;
+    let cross = xh * yl + xl * yh;
+    add64(add64((xh * yh) << 32, cross << 16), xl * yl)
+}
+
+/// Argon2's modified addition, `a + b + 2 * trunc(a) * trunc(b)` mod 2^64
+/// (RFC 9106 §3.6, Figure 19).
+///
+/// This is the one place Argon2's permutation differs from BLAKE2b's: the
+/// extra multiplication deepens the circuit an ASIC would need without
+/// slowing a CPU, and it is why `GB` cannot simply reuse BLAKE2b's `G`.
+///
+/// # Example
+/// ```tuo
+/// let m = argon2::word::mix_add(3, 4); // 3 + 4 + 2 * 12 = 31
+/// ```
+pub fn mix_add(take a: Int, take b: Int) -> Int {
+    add64(add64(a, b), mul_lo32(a, b) << 1)
+}
+
+// ----------------------------------------------------------------------------
+// Little-endian byte order.
+//
+// Both RFCs are little-endian throughout: BLAKE2b reads its message words and
+// writes its digest that way, and every length field in Argon2's H_0 is
+// LE32. These are the only two decoders and encoders the port needs.
+// ----------------------------------------------------------------------------
+
+/// The little-endian 64-bit word beginning at byte `offset` of `bytes`, with
+/// any byte past the end read as zero — which is exactly the zero padding
+/// BLAKE2b's final block and Argon2's address block both call for.
+///
+/// # Example
+/// ```tuo
+/// let w = argon2::word::le64_at(bytes, 8); // the second word
+/// ```
+pub fn le64_at(in bytes: Array[Int], take offset: Int) -> Int {
+    let n = std::array::len(bytes);
+    var value = 0;
+    var i = 7;
+    while i >= 0 {
+        var b = 0;
+        if offset + i < n && offset + i >= 0 {
+            b = std::array::get(bytes, offset + i) & 255;
+        }
+        value = (value << 8) | b;
+        i = i - 1;
+    }
+    value
+}
+
+/// Append `value` to `out` as eight little-endian bytes.
+///
+/// # Example
+/// ```tuo
+/// argon2::word::push_le64(out, 258); // appends 02 01 00 00 00 00 00 00
+/// ```
+pub fn push_le64(mut out: Array[Int], take value: Int) {
+    var i = 0;
+    while i < 8 {
+        std::array::push(out, shr64(value, i * 8) & 255);
+        i = i + 1;
+    }
+}
+
+/// Append the low 32 bits of `value` to `out` as four little-endian bytes —
+/// the `LE32` of RFC 9106's H_0 construction.
+///
+/// # Example
+/// ```tuo
+/// argon2::word::push_le32(out, 258); // appends 02 01 00 00
+/// ```
+pub fn push_le32(mut out: Array[Int], take value: Int) {
+    var i = 0;
+    while i < 4 {
+        std::array::push(out, shr64(value, i * 8) & 255);
+        i = i + 1;
+    }
+}
+
+/// Append every byte of `extra` to `out`.
+///
+/// # Example
+/// ```tuo
+/// argon2::word::push_bytes(out, salt);
+/// ```
+pub fn push_bytes(mut out: Array[Int], in extra: Array[Int]) {
+    let n = std::array::len(extra);
+    var i = 0;
+    while i < n {
+        std::array::push(out, std::array::get(extra, i));
+        i = i + 1;
+    }
+}
+
+/// The sixteen lowercase hex digits of `value` — the notation RFC 9106's
+/// interim block values are printed in, so a spec can compare against the
+/// document verbatim.
+///
+/// # Example
+/// ```tuo
+/// let s = argon2::word::hex(255); // "00000000000000ff"
+/// ```
+pub fn hex(take value: Int) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < 16 {
+        let nibble = shr64(value, 60 - i * 4) & 15;
+        if nibble < 10 {
+            std::string::push_byte(out, 48 + nibble);
+        } else {
+            std::string::push_byte(out, 87 + nibble);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+// ----------------------------------------------------------------------------
+
+fn top_bit() -> Int {
+    from_halves(0x80000000, 0)
+}
+
+fn all_ones() -> Int {
+    from_halves(0xFFFFFFFF, 0xFFFFFFFF)
+}
+
+fn le64_roundtrip(take value: Int) -> Int {
+    var out = std::array::empty();
+    push_le64(out, value);
+    le64_at(out, 0)
+}
+
+fn le32_byte(take value: Int, take i: Int) -> Int {
+    var out = std::array::empty();
+    push_le32(out, value);
+    std::array::get(out, i)
+}
+
+spec mask32 {
+    then mask32() == 4294967295;
+    then lo32(from_halves(7, 9)) == 9;
+    then hi32(from_halves(7, 9)) == 7;
+    // The high half of a top-bit word reads as an unsigned value.
+    then hi32(top_bit()) == 2147483648;
+    then hi32(all_ones()) == 4294967295;
+}
+
+spec from_halves {
+    then from_halves(1, 2) == 4294967298;
+    then from_halves(0x80000000, 0) < 0;
+    then all_ones() == 0 - 1;
+    then std::string::as_str(hex(from_halves(0xbb67ae85, 0x84caa73b))) == "bb67ae8584caa73b";
+}
+
+spec add64 {
+    then add64(1, 2) == 3;
+    // Wraps at 2^64 rather than trapping.
+    then add64(all_ones(), 1) == 0;
+    then add64(all_ones(), all_ones()) == 0 - 2;
+    then add64(top_bit(), top_bit()) == 0;
+    then std::string::as_str(hex(add64(from_halves(0xFFFFFFFF, 0), from_halves(1, 0xFFFFFFFF)))) == "00000000ffffffff";
+}
+
+spec shr64 {
+    then shr64(top_bit(), 63) == 1;
+    then shr64(all_ones(), 1) == 0x7FFFFFFFFFFFFFFF;
+    then shr64(all_ones(), 32) == 4294967295;
+    then shr64(8, 3) == 1;
+    then shr64(8, 0) == 8;
+    then shr64(all_ones(), 64) == 0;
+}
+
+spec rotr64 {
+    then rotr64(1, 1) == top_bit();
+    then rotr64(top_bit(), 63) == 1;
+    then rotr64(all_ones(), 24) == all_ones();
+    then std::string::as_str(hex(rotr64(from_halves(0x01234567, 0x89abcdef), 32))) == "89abcdef01234567";
+    then std::string::as_str(hex(rotr64(from_halves(0x01234567, 0x89abcdef), 16))) == "cdef0123456789ab";
+    then rotr64(5, 0) == 5;
+    then rotr64(5, 64) == 5;
+}
+
+spec mul_lo32 {
+    then mul_lo32(3, 4) == 12;
+    // (2^32 - 1)^2 = 0xFFFFFFFE00000001, a word with its top bit set.
+    then std::string::as_str(hex(mul_lo32(0xFFFFFFFF, 0xFFFFFFFF))) == "fffffffe00000001";
+    // Only the low 32 bits of each operand take part.
+    then mul_lo32(from_halves(9, 3), from_halves(9, 5)) == 15;
+    then std::string::as_str(hex(mul_lo32(0x89abcdef, 0x12345678))) == "09ca39e0e242d208";
+}
+
+spec mix_add {
+    then mix_add(3, 4) == 31;
+    then mix_add(0, 0) == 0;
+    then mix_add(all_ones(), 0) == all_ones();
+    // 2 * trunc(a) * trunc(b) drops its top bit at the 2^64 boundary.
+    then std::string::as_str(hex(mix_add(0xFFFFFFFF, 0xFFFFFFFF))) == "fffffffe00000000";
+}
+
+spec le64_at {
+    then le64_at(std::array::empty(), 0) == 0;
+    then le64_roundtrip(258) == 258;
+    then le64_roundtrip(all_ones()) == all_ones();
+    then le64_roundtrip(top_bit()) == top_bit();
+    then le64_roundtrip(from_halves(0x01234567, 0x89abcdef)) == from_halves(0x01234567, 0x89abcdef);
+}
+
+spec push_le32 {
+    then le32_byte(258, 0) == 2;
+    then le32_byte(258, 1) == 1;
+    then le32_byte(258, 3) == 0;
+    then le32_byte(all_ones(), 3) == 255;
+}
+
+spec hex {
+    then std::string::as_str(hex(0)) == "0000000000000000";
+    then std::string::as_str(hex(255)) == "00000000000000ff";
+    then std::string::as_str(hex(all_ones())) == "ffffffffffffffff";
+    then std::string::as_str(hex(top_bit())) == "8000000000000000";
+}
