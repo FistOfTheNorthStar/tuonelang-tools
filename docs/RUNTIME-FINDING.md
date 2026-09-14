@@ -1,8 +1,18 @@
 # Finding: `udp_bind` binds to loopback, which disables all outbound UDP
 
-**Status:** open — needs a decision in the `tuonelang` repo, not this one.
+**Status:** resolved — option 1 below was taken. ADR-0017 was amended on
+2026-09-08 and `tuo_rt_udp_bind` now binds `INADDR_ANY` (tuonelang commit
+`362ff37`, merged in PR #60); the runtime's own test suite pins the new bind
+address. `./run-tests.sh --live` resolves real names with a `tuo` built from
+that commit or later. A binary built before it — including one installed
+with `cargo install` and never refreshed — still fails every lookup with
+`send failed`, which is the symptom to check for first.
 **Found by:** writing `dns::resolver` against the ADR-0017 UDP primitives.
-**Severity:** blocks the entire stated purpose of the UDP increment.
+**Severity (when open):** blocked the entire stated purpose of the UDP
+increment.
+
+The rest of this document is the finding as filed, kept as the record of
+why the bind address is what it is.
 
 ## What happens
 
@@ -81,5 +91,9 @@ they are for. Option 2 is the most conservative.
 Everything in `src/dns/` is pure and proven by specs regardless — the parser,
 the compression-pointer defences, and the resolver's `classify` judgement all
 stand. Only `examples/resolve.tuo`, which puts a datagram on a real socket,
-cannot complete a lookup until this is resolved. It is committed and correct;
-it will work unchanged the moment the bind address does.
+could not complete a lookup while this was open. It was committed and
+correct, and it worked unchanged the moment the bind address did: the first
+`--live` run after the fix resolved `example.com`, `cloudflare.com`, and
+`github.com`, and reported `no A record` for a name that does not exist.
+`src/std_net.tuo` was re-vendored from the amended catalog at the same time;
+only its doc comments changed.
