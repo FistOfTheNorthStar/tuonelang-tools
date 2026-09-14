@@ -21,8 +21,9 @@ SHA-256/HMAC/PBKDF2, `std::bignum`, `std::json`, `std::fs`, `std::sync`,
 | [`tuolang-celery`](../tuolang-celery) | `celery` + `redis` broker | queue engine, routing, retries, beat; 57 specs |
 | this repo, `dns` | `socket.getaddrinfo` | stub resolver over UDP; 82 specs; resolves real names |
 | this repo, `argon2` | `passlib[argon2]` | Argon2id/i/d + BLAKE2b + PHC strings; 125 specs; verifies the backend's own hashes |
+| this repo, `redis` | `redis` | RESP2 client, the backend's commands, `redis://` URLs; 40 specs; 35 live checks against Redis 7 |
 
-All four prove the thesis: the *engine* of a Python library is pure logic, and pure
+All five prove the thesis: the *engine* of a Python library is pure logic, and pure
 logic is what tuonelang specs pin best.
 
 ---
@@ -96,7 +97,7 @@ Achievable on v0 as it stands, in rough order of value-per-effort.
 
 | Port | Replaces | Notes |
 |---|---|---|
-| **Redis client** | `redis` | RESP protocol is trivially simple over TCP; the natural next port after `tuolang-celery`, which currently models the broker rather than speaking to one. |
+| **Redis client** — ✅ done | `redis` | RESP2 over TCP, spec'd against bytes a real server sent; the transport `tuolang-celery` lacked, which still models the broker in memory until its message envelope is written over this client. |
 | **Structured logging + Sentry** | `sentry-sdk` | Needs only JSON + HTTP. Error capture, breadcrumbs, envelope format. |
 | **JWT / JOSE** | (part of your auth) | HMAC-SHA256 already exists — HS256 is nearly free today. RS256 waits on TLS-era RSA. |
 | **S3 client** | `boto3` | You only use Cloudflare R2. SigV4 signing is pure HMAC-SHA256 — already available. A tiny, targeted client beats all of boto3. |
@@ -129,8 +130,8 @@ Be honest about these rather than half-porting them.
 
 1. ✅ **DNS** — small, unblocks name resolution, proves the UDP primitives.
 2. ✅ **Argon2** — small, self-contained, RFC test vectors, real security value.
-3. **Redis client** — makes `tuolang-celery` talk to a real broker. **Next.**
-4. **HTTP/1.1** — the backbone of everything outbound and inbound.
+3. ✅ **Redis client** — the transport `tuolang-celery` needs to talk to a real broker.
+4. **HTTP/1.1** — the backbone of everything outbound and inbound. **Next.**
 5. **TLS 1.3** — the big one; unlocks every external integration at once.
 6. **Router + validation**, then **query layer** — the application framework.
 

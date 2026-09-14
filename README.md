@@ -5,16 +5,18 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Two ports so far:
+Three ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
 | **`dns`** — a stub resolver on the v0 UDP primitives | `socket.getaddrinfo` | 82 specs, and a live lookup against a public server |
 | **`argon2`** — Argon2id/i/d, BLAKE2b, and the PHC string format | `passlib[argon2]` | 125 specs, RFC 9106's vectors, and a hash the Python backend itself wrote |
+| **`redis`** — a RESP2 client, the commands Celery and slowapi use, `redis://` URLs | `redis` (under `celery[redis]` and `slowapi`) | 40 specs against bytes a Redis 7 server sent, and a 35-check live oracle |
 
 ```bash
-./run-tests.sh          # front end, 207 specs, formatting, the native Argon2 oracle
-./run-tests.sh --live   # also resolve real names over UDP
+./run-tests.sh          # front end, 247 specs, formatting, the native Argon2 oracle
+./run-tests.sh --live   # also resolve real names over UDP, and drive the Redis client
+                        # against shallowflaws's docker compose redis on 127.0.0.1:6380
 ```
 
 Both ports are pure tuonelang over the v0 core, with the catalog modules
@@ -116,6 +118,77 @@ identical either way. Drawing a salt is an effect, so
 and associated-data inputs are plumbed through `argon2::hash` (the RFC
 vectors use both) but not through `argon2::password`, because passlib does
 not use them.
+
+---
+
+## `redis` — the broker's wire protocol
+
+`shallowflaws` reaches Redis through two libraries. Celery's transport is
+lists — `LPUSH` to publish, `BRPOP` to consume — plus sets and hashes for
+bindings and unacknowledged deliveries, and `SET ... EX` / `GET` for task
+results. slowapi's rate limiter is `INCR` and `EXPIRE`. This port is a
+RESP2 client with exactly those commands as typed builders, a parser for
+the `redis://` URLs the backend is configured by, and an effect boundary
+that reads each reply one socket read at a time under the parser's
+direction. It is the piece [`tuolang-celery`](../tuolang-celery) said it
+lacked: its broker is modelled in memory because there was no RESP client.
+
+### Status
+
+| Layer | State |
+|---|---|
+| `redis::resp` — RESP2 framing, a flat reply arena, `needed` | ✅ proven against server bytes |
+| `redis::command` — the two dozen commands the backend uses | ✅ proven byte-for-byte |
+| `redis::url` — `redis://[user][:password@]host[:port][/db]` | ✅ proven on the repo's own `.env` shapes |
+| `redis::client` — open, send, read one reply, close, and typed round trips | ✅ 35 live checks against Redis 7.4 |
+
+### What the specs pin that a comment cannot
+
+**A bulk string is framed by its length, not by its line.** The fixture
+`$12\r\nline1\r\nline2\r\n` is a value with the protocol's own
+terminator inside it, and the spec asserts the parser returns all twelve
+bytes. Reading to the next `\r\n` — the tempting implementation — would
+return five and leave the connection desynchronised on the next reply.
+
+**The parser says how much to read.** `redis::resp::needed` is pure and
+returns `0` for a complete reply, `-1` for one that can never complete, and
+otherwise a lower bound on the bytes still missing — exact for a bulk
+payload (`$5\r\nhel` needs 4), one for a line whose length is not yet
+known. The effect layer loops on that number and contains no framing logic
+at all, so the only code that decides where a reply ends is code a spec can
+reach.
+
+**Nested replies are a flat arena.** `EXEC` answers with an array of
+replies, one of which may be an array. v0 refuses recursive types, so a
+reply is a preorder node list with parent links, as `std::json` does, and
+`child_at` is spec'd to skip a nested array's own elements when counting
+the root's.
+
+**Every fixture is what the server sent.** Each reply the `resp` specs
+parse — `+OK`, `$-1`, `*-1`, `-WRONGTYPE ...`, the `EXEC` array — is the
+literal byte string a Redis 7.4 server returned over a socket on
+2026-09-14. The parser is checked against Redis, not against itself.
+
+### The live oracle
+
+`examples/redis.tuo` drives `redis::client` against the docker compose
+Redis in database 15 under `tuo:oracle:` keys: a 5000-byte value framed
+across several reads, a value containing `\r\n`, the empty value
+distinguished from a fallback, a `BRPOP` that times out and one that
+returns, a `WRONGTYPE` error that leaves the connection usable, a
+`MULTI`/`EXEC` transaction, and `open_url` on the compose URL — and
+refusing `rediss://`, since v0 has no TLS.
+
+### What is deliberately not here
+
+No TLS: `rediss://` parses and is refused at `open_url`. No name
+resolution in the client: `std::net::connect` takes a numeric address, and
+joining `dns::resolver` to it is a small future change. No RESP3 or
+`HELLO`; Redis 7 speaks RESP2 by default and the backend's libraries use
+it. No pipelining helper — `call` is one round trip, though `end_of` on a
+parsed reply is what a pipeline reader would loop on. No pub/sub. And no
+kombu message format: this is the transport, and the Celery message
+envelope on top of it belongs with `tuolang-celery`.
 
 ---
 
@@ -227,6 +300,12 @@ src/argon2/hash.tuo      the Argon2 operation (§3.2) and its parameters
 src/argon2/phc.tuo       the $argon2id$… string: encode, decode, verify
 src/argon2/password.tuo  shallowflaws's hash_password / verify_password
 examples/argon2.tuo      the native oracle (no network)
+
+src/redis/resp.tuo       RESP2: encode a command, parse a reply, say what is missing
+src/redis/command.tuo    the commands Celery and slowapi send, as bytes
+src/redis/url.tuo        redis:// and rediss:// URLs
+src/redis/client.tuo     the effect boundary: open, send, read one reply, close
+examples/redis.tuo       the live oracle (needs the docker compose redis on 6380)
 
 docs/RUNTIME-FINDING.md  the udp_bind finding, and its resolution
 ```

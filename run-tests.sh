@@ -3,7 +3,9 @@
 #
 #   ./run-tests.sh          front end, specs, formatting, and the native
 #                           Argon2 oracle (no network)
-#   ./run-tests.sh --live   also resolve real names against a public DNS server
+#   ./run-tests.sh --live   also resolve real names against a public DNS
+#                           server, and drive the Redis client against the
+#                           docker compose redis on 127.0.0.1:6380
 #
 # TUO may be set to a `tuo` binary; otherwise the one on PATH is used.
 #
@@ -35,6 +37,8 @@ ARGON2_SRC=(src/argon2/word.tuo src/argon2/blake2b.tuo src/argon2/hprime.tuo
             src/argon2/block.tuo src/argon2/index.tuo src/argon2/hash.tuo
             src/argon2/phc.tuo src/argon2/password.tuo
             src/std_crypto.tuo src/std_ct.tuo src/std_bits.tuo src/std_str.tuo)
+REDIS_SRC=(src/redis/resp.tuo src/redis/command.tuo src/redis/url.tuo
+           src/redis/client.tuo src/std_str.tuo src/std_net.tuo)
 
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
@@ -52,11 +56,17 @@ step "Argon2: front end (check)"
 step "Argon2: specs (verify)"
 "$TUO" verify "${ARGON2_SRC[@]}"; check $? "argon2 verify"
 
+step "Redis: front end (check)"
+"$TUO" check "${REDIS_SRC[@]}" examples/redis.tuo; check $? "redis check"
+
+step "Redis: specs (verify)"
+"$TUO" verify "${REDIS_SRC[@]}"; check $? "redis verify"
+
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
 # to `crates/tuo-stdlib/src/std/`.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.
@@ -80,8 +90,19 @@ if [ "$live" -eq 1 ]; then
     echo "resolve exited $rc — see docs/RUNTIME-FINDING.md"
     check 1 "resolve"
   fi
+
+  # The Redis oracle needs shallowflaws's docker compose redis on 127.0.0.1:6380.
+  step "Redis: live — against 127.0.0.1:6380"
+  "$TUO" run examples/redis.tuo "${REDIS_SRC[@]}"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    check 0 "redis (all checks agreed)"
+  else
+    echo "redis oracle exited $rc — that many checks disagreed (is docker compose up?)"
+    check 1 "redis"
+  fi
 else
-  printf '\n(skipping live DNS checks; pass --live to resolve real names)\n'
+  printf '\n(skipping live DNS and Redis checks; pass --live to run them)\n'
 fi
 
 printf '\n'

@@ -1,0 +1,401 @@
+// redis::client — the effect boundary: a socket in, replies out.
+//
+// Everything below `redis::client` is pure and spec'd: `redis::resp` frames
+// and parses, `redis::command` spells, `redis::url` reads configuration.
+// This module is the one place bytes cross a socket, and it is kept to the
+// same shape `pg::conn` takes in `tuonelang-db`: open, send, read one
+// framed reply, close — plus the handful of typed round trips a caller
+// wants to write in one line.
+//
+// READING IS DRIVEN BY THE PARSER. A reply arrives in as many reads as the
+// kernel pleases, so `read_reply` asks `redis::resp::needed` how many more
+// bytes would help and fetches that many — one at a time for a line whose
+// length is not yet known, and exactly the remaining count for a bulk
+// payload — until the parser reports a complete reply. The framing decision
+// is therefore made by pure, spec'd code; this module only moves bytes.
+//
+// FAILURE IS AN EMPTY REPLY. A timeout, a closed socket, a host error, or a
+// reply the parser refuses all produce an empty `String` from `read_reply`,
+// and `call` passes that through. Every typed helper treats an empty reply
+// as its failure value. There is no error struct here because the RESP
+// error reply (`-ERR ...`) is a *successful* read of a message the server
+// chose to send, and callers who need to tell those apart read the raw
+// reply through `redis::resp`.
+//
+// Effectful, so no specs (`R0007`); pinned by `examples/redis.tuo` against
+// a live server.
+
+module redis::client;
+
+/// The timeout the typed helpers use when a caller has no better idea.
+///
+/// # Example
+/// ```tuo
+/// let ms = redis::client::default_timeout_ms(); // 5000
+/// ```
+pub fn default_timeout_ms() -> Int {
+    5000
+}
+
+/// The value the integer helpers return when the reply was not an integer:
+/// an error, a null, a timeout, or a closed socket. Below any integer Redis
+/// sends for a length, count, or TTL.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::client::no_int(); // a large negative sentinel
+/// ```
+pub fn no_int() -> Int {
+    0 - 4611686018427387904
+}
+
+/// Whether an `open` outcome is a usable descriptor.
+///
+/// # Example
+/// ```tuo
+/// let up = redis::client::is_open(fd);
+/// ```
+pub fn is_open(take fd: Int) -> Bool {
+    fd >= 0
+}
+
+// --- The four primitives -------------------------------------------------------
+
+/// EFFECT: connect to `host:port`, giving up after `timeout_ms`. Returns the
+/// descriptor (`>= 0`) or a negative value. `host` is numeric — resolve a
+/// name with `dns::resolver` first.
+///
+/// # Example
+/// ```tuo
+/// let fd = redis::client::open("127.0.0.1", 6380, 5000);
+/// ```
+pub fn open(in host: Str, take port: Int, take timeout_ms: Int) -> Int {
+    std::net::connect_timeout(host, port, timeout_ms)
+}
+
+/// EFFECT: write one encoded command. Returns the byte count, or a
+/// negative value when the socket is gone.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::client::send(fd, redis::command::ping());
+/// ```
+pub fn send(take fd: Int, in cmd: String) -> Int {
+    std::rt::write_string(fd, cmd)
+}
+
+/// EFFECT: read exactly one reply, however many bytes and reads it takes.
+/// Empty on timeout, end of input, host error, or a malformed reply.
+///
+/// # Example
+/// ```tuo
+/// let raw = redis::client::read_reply(fd, 5000); // e.g. "+PONG\r\n"
+/// ```
+pub fn read_reply(take fd: Int, take timeout_ms: Int) -> String {
+    var buf = std::string::empty();
+    var need = redis::resp::needed(std::string::as_str(buf));
+    while need != 0 {
+        if need < 0 {
+            return std::string::empty();
+        }
+        var i = 0;
+        while i < need {
+            let b = std::net::read_byte_timeout(fd, timeout_ms);
+            if b < 0 {
+                return std::string::empty();
+            }
+            std::string::push_byte(buf, b);
+            i = i + 1;
+        }
+        need = redis::resp::needed(std::string::as_str(buf));
+    }
+    buf
+}
+
+/// EFFECT: close the socket.
+///
+/// # Example
+/// ```tuo
+/// let _ = redis::client::close(fd);
+/// ```
+pub fn close(take fd: Int) -> Int {
+    std::net::close(fd)
+}
+
+// --- One round trip -------------------------------------------------------------
+
+/// EFFECT: send `cmd` and read its reply. Empty when either half fails.
+///
+/// # Example
+/// ```tuo
+/// let raw = redis::client::call(fd, redis::command::get("k"), 5000);
+/// ```
+pub fn call(take fd: Int, in cmd: String, take timeout_ms: Int) -> String {
+    if send(fd, cmd) < 0 {
+        return std::string::empty();
+    }
+    read_reply(fd, timeout_ms)
+}
+
+/// Whether a raw reply is the simple string `OK` — the answer to `SET`,
+/// `SELECT`, `AUTH`, `MULTI`, and `QUIT`.
+///
+/// # Example
+/// ```tuo
+/// let ok = redis::client::reply_is_ok(raw);
+/// ```
+pub fn reply_is_ok(in raw: String) -> Bool {
+    let view = std::string::as_str(raw);
+    redis::resp::is_ok(redis::resp::parse(view), view)
+}
+
+/// The integer a raw reply carries, or `no_int` when it is not an integer
+/// reply.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::client::reply_int(raw);
+/// ```
+pub fn reply_int(in raw: String) -> Int {
+    let view = std::string::as_str(raw);
+    let r = redis::resp::parse(view);
+    if !redis::resp::is_complete(r) {
+        return no_int();
+    }
+    if redis::resp::kind_of(r, redis::resp::root()) != redis::resp::kind_integer() {
+        return no_int();
+    }
+    redis::resp::int_of(r, redis::resp::root())
+}
+
+/// The text a raw bulk or simple reply carries, or `fallback` when it is
+/// null, an error, or not a reply at all.
+///
+/// # Example
+/// ```tuo
+/// let v = redis::client::reply_text(raw, "");
+/// ```
+pub fn reply_text(in raw: String, in fallback: Str) -> String {
+    let view = std::string::as_str(raw);
+    let r = redis::resp::parse(view);
+    if !redis::resp::is_complete(r) {
+        return std::string::from_str(fallback);
+    }
+    let kind = redis::resp::kind_of(r, redis::resp::root());
+    if kind != redis::resp::kind_bulk() && kind != redis::resp::kind_simple() {
+        return std::string::from_str(fallback);
+    }
+    redis::resp::text_of(r, view, redis::resp::root())
+}
+
+/// Whether a raw reply is a null bulk or null array.
+///
+/// # Example
+/// ```tuo
+/// let gone = redis::client::reply_is_null(raw);
+/// ```
+pub fn reply_is_null(in raw: String) -> Bool {
+    let view = std::string::as_str(raw);
+    let r = redis::resp::parse(view);
+    redis::resp::is_complete(r) && redis::resp::is_null(r, redis::resp::root())
+}
+
+/// Whether a raw reply is a server error (`-ERR`, `-WRONGTYPE`, ...).
+///
+/// # Example
+/// ```tuo
+/// let bad = redis::client::reply_is_error(raw);
+/// ```
+pub fn reply_is_error(in raw: String) -> Bool {
+    let view = std::string::as_str(raw);
+    let r = redis::resp::parse(view);
+    redis::resp::is_complete(r) && redis::resp::is_error(r, redis::resp::root())
+}
+
+/// The elements of a raw array reply that are text, in order — `LRANGE`,
+/// `SMEMBERS`, `BRPOP`. Empty for anything else.
+///
+/// # Example
+/// ```tuo
+/// let items = redis::client::reply_texts(raw);
+/// ```
+pub fn reply_texts(in raw: String) -> Array[String] {
+    var out = std::array::empty();
+    let view = std::string::as_str(raw);
+    let r = redis::resp::parse(view);
+    if !redis::resp::is_complete(r) {
+        return out;
+    }
+    if redis::resp::kind_of(r, redis::resp::root()) != redis::resp::kind_array() {
+        return out;
+    }
+    let n = redis::resp::int_of(r, redis::resp::root());
+    var i = 0;
+    while i < n {
+        std::array::push(out, redis::resp::element_text(r, view, i));
+        i = i + 1;
+    }
+    out
+}
+
+// --- Typed round trips ------------------------------------------------------------
+
+/// EFFECT: `PING`, true on `+PONG`.
+///
+/// # Example
+/// ```tuo
+/// let alive = redis::client::ping(fd, 5000);
+/// ```
+pub fn ping(take fd: Int, take timeout_ms: Int) -> Bool {
+    let raw = call(fd, redis::command::ping(), timeout_ms);
+    let text = reply_text(raw, "");
+    std::string::as_str(text) == "PONG"
+}
+
+/// EFFECT: `SELECT db`, true on `+OK`.
+///
+/// # Example
+/// ```tuo
+/// let ok = redis::client::select(fd, 15, 5000);
+/// ```
+pub fn select(take fd: Int, take db: Int, take timeout_ms: Int) -> Bool {
+    reply_is_ok(call(fd, redis::command::select(db), timeout_ms))
+}
+
+/// EFFECT: `SET key value`, true on `+OK`.
+///
+/// # Example
+/// ```tuo
+/// let ok = redis::client::set(fd, "k", "v", 5000);
+/// ```
+pub fn set(take fd: Int, in key: Str, in value: Str, take timeout_ms: Int) -> Bool {
+    reply_is_ok(call(fd, redis::command::set(key, value), timeout_ms))
+}
+
+/// EFFECT: `GET key`, or `fallback` when the key is absent or the call
+/// fails. Pass a fallback no real value can be when the difference matters,
+/// or check `exists` first.
+///
+/// # Example
+/// ```tuo
+/// let v = redis::client::get_or(fd, "k", "", 5000);
+/// ```
+pub fn get_or(take fd: Int, in key: Str, in fallback: Str, take timeout_ms: Int) -> String {
+    reply_text(call(fd, redis::command::get(key), timeout_ms), fallback)
+}
+
+/// EFFECT: `DEL key`, the count removed, or `no_int`.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::client::del(fd, "k", 5000);
+/// ```
+pub fn del(take fd: Int, in key: Str, take timeout_ms: Int) -> Int {
+    reply_int(call(fd, redis::command::del(key), timeout_ms))
+}
+
+/// EFFECT: `INCR key`, the new value, or `no_int`.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::client::incr(fd, "rate:1.2.3.4", 5000);
+/// ```
+pub fn incr(take fd: Int, in key: Str, take timeout_ms: Int) -> Int {
+    reply_int(call(fd, redis::command::incr(key), timeout_ms))
+}
+
+/// EFFECT: `LPUSH key value`, the list's new length, or `no_int`.
+///
+/// # Example
+/// ```tuo
+/// let depth = redis::client::lpush(fd, "celery", message, 5000);
+/// ```
+pub fn lpush(take fd: Int, in key: Str, in value: Str, take timeout_ms: Int) -> Int {
+    reply_int(call(fd, redis::command::lpush(key, value), timeout_ms))
+}
+
+/// EFFECT: `RPOP key`, or `fallback` when the list is empty.
+///
+/// # Example
+/// ```tuo
+/// let m = redis::client::rpop_or(fd, "celery", "", 5000);
+/// ```
+pub fn rpop_or(take fd: Int, in key: Str, in fallback: Str, take timeout_ms: Int) -> String {
+    reply_text(call(fd, redis::command::rpop(key), timeout_ms), fallback)
+}
+
+/// EFFECT: `BRPOP key seconds`: the popped value, or `fallback` on timeout.
+/// The read waits `seconds` plus `timeout_ms`, since the server holds the
+/// reply for the whole wait.
+///
+/// # Example
+/// ```tuo
+/// let m = redis::client::brpop_or(fd, "celery", 1, "", 5000);
+/// ```
+pub fn brpop_or(take fd: Int, in key: Str, take seconds: Int, in fallback: Str, take timeout_ms: Int) -> String {
+    let raw = call(fd, redis::command::brpop(key, seconds), seconds * 1000 + timeout_ms);
+    let items = reply_texts(raw);
+    if std::array::len(items) != 2 {
+        return std::string::from_str(fallback);
+    }
+    std::array::get(items, 1)
+}
+
+/// EFFECT: `LLEN key`, or `no_int`.
+///
+/// # Example
+/// ```tuo
+/// let depth = redis::client::llen(fd, "celery", 5000);
+/// ```
+pub fn llen(take fd: Int, in key: Str, take timeout_ms: Int) -> Int {
+    reply_int(call(fd, redis::command::llen(key), timeout_ms))
+}
+
+/// EFFECT: `LRANGE key 0 -1`, every element.
+///
+/// # Example
+/// ```tuo
+/// let all = redis::client::lrange_all(fd, "celery", 5000);
+/// ```
+pub fn lrange_all(take fd: Int, in key: Str, take timeout_ms: Int) -> Array[String] {
+    reply_texts(call(fd, redis::command::lrange(key, 0, 0 - 1), timeout_ms))
+}
+
+/// EFFECT: open, authenticate, and select as a `redis://` URL directs.
+/// Returns the descriptor, or a negative value when the URL is malformed,
+/// is `rediss://` (no TLS in v0), names a non-numeric host, cannot be
+/// connected, or is refused by `AUTH` or `SELECT`.
+///
+/// # Example
+/// ```tuo
+/// let fd = redis::client::open_url("redis://127.0.0.1:6380/0", 5000);
+/// ```
+pub fn open_url(in url: Str, take timeout_ms: Int) -> Int {
+    let u = redis::url::parse(url);
+    if !u.ok || u.tls {
+        return 0 - 1;
+    }
+    let fd = open(std::string::as_str(u.host), u.port, timeout_ms);
+    if fd < 0 {
+        return fd;
+    }
+    if std::str::len(std::string::as_str(u.password)) > 0 {
+        var auth = std::string::empty();
+        if std::str::len(std::string::as_str(u.user)) > 0 {
+            auth = redis::command::auth_user(std::string::as_str(u.user), std::string::as_str(u.password));
+        } else {
+            auth = redis::command::auth(std::string::as_str(u.password));
+        }
+        if !reply_is_ok(call(fd, auth, timeout_ms)) {
+            let _ = close(fd);
+            return 0 - 1;
+        }
+    }
+    if u.db != 0 {
+        if !select(fd, u.db, timeout_ms) {
+            let _ = close(fd);
+            return 0 - 1;
+        }
+    }
+    fd
+}
