@@ -1,0 +1,461 @@
+// redis::command — the commands the backend actually sends, as bytes.
+//
+// Redis has hundreds of commands; `shallowflaws` reaches it through two
+// libraries that between them use a couple of dozen. Celery's Redis
+// transport (kombu) is lists: `LPUSH` to publish, `BRPOP` to consume, plus
+// sets and hashes for bindings and unacknowledged deliveries. The result
+// backend is `SET` with an expiry and `GET`. slowapi's rate limiter is
+// `INCR` and `EXPIRE`. This module is those commands, each a function from
+// typed arguments to the exact bytes on the wire, so a caller can neither
+// misspell a command nor mis-frame an argument.
+//
+// EVERYTHING GOES THROUGH `redis::resp::encode`. A command is an array of
+// bulk strings, and a value is sent with its byte length, so a key or a
+// payload may hold spaces, `\r\n`, or any byte. There is no inline command
+// form here — it exists in the protocol for telnet users, and it is exactly
+// the form that cannot carry a binary value.
+//
+// `custom` is the escape hatch for anything not named below; it takes the
+// argument list and encodes it the same way.
+
+module redis::command;
+
+/// Encode an arbitrary argument list as a command. Every named builder
+/// below is this over a fixed list.
+///
+/// # Example
+/// ```tuo
+/// var args = std::array::empty();
+/// redis::resp::push_arg(args, "CLIENT");
+/// redis::resp::push_arg(args, "ID");
+/// let cmd = redis::command::custom(args);
+/// ```
+pub fn custom(in args: Array[String]) -> String {
+    redis::resp::encode(args)
+}
+
+fn one(in a: Str) -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, a);
+    redis::resp::encode(args)
+}
+
+fn two(in a: Str, in b: Str) -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, a);
+    redis::resp::push_arg(args, b);
+    redis::resp::encode(args)
+}
+
+fn three(in a: Str, in b: Str, in c: Str) -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, a);
+    redis::resp::push_arg(args, b);
+    redis::resp::push_arg(args, c);
+    redis::resp::encode(args)
+}
+
+fn two_int(in a: Str, in b: Str, take n: Int) -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, a);
+    redis::resp::push_arg(args, b);
+    redis::resp::push_int_arg(args, n);
+    redis::resp::encode(args)
+}
+
+// --- Connection ---------------------------------------------------------------
+
+/// `PING`: the server answers `+PONG`.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::ping();
+/// ```
+pub fn ping() -> String {
+    one("PING")
+}
+
+/// `AUTH <password>`: the pre-ACL form `redis://:password@host` implies.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::auth("secret");
+/// ```
+pub fn auth(in password: Str) -> String {
+    two("AUTH", password)
+}
+
+/// `AUTH <user> <password>`: the ACL form `redis://user:password@host`
+/// implies (Redis 6 and later).
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::auth_user("rekryon", "secret");
+/// ```
+pub fn auth_user(in user: Str, in password: Str) -> String {
+    three("AUTH", user, password)
+}
+
+/// `SELECT <db>`: the `/0` at the end of a `redis://` URL.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::select(0);
+/// ```
+pub fn select(take db: Int) -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, "SELECT");
+    redis::resp::push_int_arg(args, db);
+    redis::resp::encode(args)
+}
+
+/// `QUIT`: ask the server to close the connection after replying `+OK`.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::quit();
+/// ```
+pub fn quit() -> String {
+    one("QUIT")
+}
+
+// --- Strings ------------------------------------------------------------------
+
+/// `GET <key>`: a bulk string, or null when the key is absent.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::get("celery-task-meta-42");
+/// ```
+pub fn get(in key: Str) -> String {
+    two("GET", key)
+}
+
+/// `SET <key> <value>`.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::set("k", "v");
+/// ```
+pub fn set(in key: Str, in value: Str) -> String {
+    three("SET", key, value)
+}
+
+/// `SET <key> <value> EX <seconds>`: set with an expiry, in one command —
+/// how Celery's result backend stores a task's outcome for
+/// `result_expires` seconds.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::set_ex("celery-task-meta-42", body, 86400);
+/// ```
+pub fn set_ex(in key: Str, in value: Str, take seconds: Int) -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, "SET");
+    redis::resp::push_arg(args, key);
+    redis::resp::push_arg(args, value);
+    redis::resp::push_arg(args, "EX");
+    redis::resp::push_int_arg(args, seconds);
+    redis::resp::encode(args)
+}
+
+/// `DEL <key>`: the number of keys removed, 0 or 1.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::del("k");
+/// ```
+pub fn del(in key: Str) -> String {
+    two("DEL", key)
+}
+
+/// `EXISTS <key>`: 1 or 0.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::exists("k");
+/// ```
+pub fn exists(in key: Str) -> String {
+    two("EXISTS", key)
+}
+
+/// `EXPIRE <key> <seconds>`: 1 if the key exists and now expires, else 0.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::expire("rate:1.2.3.4", 60);
+/// ```
+pub fn expire(in key: Str, take seconds: Int) -> String {
+    two_int("EXPIRE", key, seconds)
+}
+
+/// `TTL <key>`: seconds to live, `-1` for no expiry, `-2` for no key.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::ttl("k");
+/// ```
+pub fn ttl(in key: Str) -> String {
+    two("TTL", key)
+}
+
+/// `INCR <key>`: the value after adding one — a missing key counts as 0,
+/// which is what makes it a rate-limit counter in one round trip.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::incr("rate:1.2.3.4");
+/// ```
+pub fn incr(in key: Str) -> String {
+    two("INCR", key)
+}
+
+/// `INCRBY <key> <n>`.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::incrby("k", 41);
+/// ```
+pub fn incrby(in key: Str, take n: Int) -> String {
+    two_int("INCRBY", key, n)
+}
+
+/// `DECR <key>`.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::decr("k");
+/// ```
+pub fn decr(in key: Str) -> String {
+    two("DECR", key)
+}
+
+// --- Lists: the Celery queues -------------------------------------------------
+
+/// `LPUSH <key> <value>`: publish to a queue. Replies with the list's new
+/// length.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::lpush("celery", message);
+/// ```
+pub fn lpush(in key: Str, in value: Str) -> String {
+    three("LPUSH", key, value)
+}
+
+/// `RPUSH <key> <value>`.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::rpush("k", "v");
+/// ```
+pub fn rpush(in key: Str, in value: Str) -> String {
+    three("RPUSH", key, value)
+}
+
+/// `LPOP <key>`: the head element, or null when the list is empty.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::lpop("k");
+/// ```
+pub fn lpop(in key: Str) -> String {
+    two("LPOP", key)
+}
+
+/// `RPOP <key>`: the tail element, or null when the list is empty. With
+/// `LPUSH` this is the FIFO a Celery queue is.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::rpop("celery");
+/// ```
+pub fn rpop(in key: Str) -> String {
+    two("RPOP", key)
+}
+
+/// `BRPOP <key> <seconds>`: wait up to `seconds` for a tail element (0 waits
+/// forever). Replies with a two-element array — the key, then the value —
+/// or a null array on timeout. This is how a Celery worker blocks on its
+/// queues.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::brpop("celery", 1);
+/// ```
+pub fn brpop(in key: Str, take seconds: Int) -> String {
+    two_int("BRPOP", key, seconds)
+}
+
+/// `LLEN <key>`: the queue's depth.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::llen("celery");
+/// ```
+pub fn llen(in key: Str) -> String {
+    two("LLEN", key)
+}
+
+/// `LRANGE <key> <start> <stop>`, with `-1` as `stop` meaning the end.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::lrange("celery", 0, 0 - 1); // every element
+/// ```
+pub fn lrange(in key: Str, take start: Int, take stop: Int) -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, "LRANGE");
+    redis::resp::push_arg(args, key);
+    redis::resp::push_int_arg(args, start);
+    redis::resp::push_int_arg(args, stop);
+    redis::resp::encode(args)
+}
+
+// --- Sets and hashes: kombu's bindings and unacked deliveries -----------------
+
+/// `SADD <key> <member>`: 1 if added, 0 if already present.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::sadd("_kombu.binding.celery", binding);
+/// ```
+pub fn sadd(in key: Str, in member: Str) -> String {
+    three("SADD", key, member)
+}
+
+/// `SMEMBERS <key>`: every member, as an array of bulk strings.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::smembers("_kombu.binding.celery");
+/// ```
+pub fn smembers(in key: Str) -> String {
+    two("SMEMBERS", key)
+}
+
+/// `SREM <key> <member>`.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::srem("k", "m");
+/// ```
+pub fn srem(in key: Str, in member: Str) -> String {
+    three("SREM", key, member)
+}
+
+/// `HSET <key> <field> <value>`: 1 if the field is new, 0 if overwritten.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::hset("unacked", delivery_tag, message);
+/// ```
+pub fn hset(in key: Str, in field: Str, in value: Str) -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, "HSET");
+    redis::resp::push_arg(args, key);
+    redis::resp::push_arg(args, field);
+    redis::resp::push_arg(args, value);
+    redis::resp::encode(args)
+}
+
+/// `HGET <key> <field>`: the value, or null.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::hget("unacked", delivery_tag);
+/// ```
+pub fn hget(in key: Str, in field: Str) -> String {
+    three("HGET", key, field)
+}
+
+/// `HDEL <key> <field>`.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::hdel("unacked", delivery_tag);
+/// ```
+pub fn hdel(in key: Str, in field: Str) -> String {
+    three("HDEL", key, field)
+}
+
+// --- Transactions -------------------------------------------------------------
+
+/// `MULTI`: begin queueing. Each command until `EXEC` replies `+QUEUED`.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::multi();
+/// ```
+pub fn multi() -> String {
+    one("MULTI")
+}
+
+/// `EXEC`: run the queued commands; the reply is an array of their replies.
+///
+/// # Example
+/// ```tuo
+/// let cmd = redis::command::exec();
+/// ```
+pub fn exec() -> String {
+    one("EXEC")
+}
+
+spec ping {
+    then std::string::as_str(ping()) == "*1\r\n$4\r\nPING\r\n";
+    then std::string::as_str(quit()) == "*1\r\n$4\r\nQUIT\r\n";
+    then std::string::as_str(multi()) == "*1\r\n$5\r\nMULTI\r\n";
+    then std::string::as_str(exec()) == "*1\r\n$4\r\nEXEC\r\n";
+}
+
+spec auth {
+    then std::string::as_str(auth("secret")) == "*2\r\n$4\r\nAUTH\r\n$6\r\nsecret\r\n";
+    then std::string::as_str(auth_user("rekryon", "s")) == "*3\r\n$4\r\nAUTH\r\n$7\r\nrekryon\r\n$1\r\ns\r\n";
+    then std::string::as_str(select(15)) == "*2\r\n$6\r\nSELECT\r\n$2\r\n15\r\n";
+    then std::string::as_str(select(0)) == "*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n";
+}
+
+spec get {
+    then std::string::as_str(get("k")) == "*2\r\n$3\r\nGET\r\n$1\r\nk\r\n";
+    then std::string::as_str(set("k", "v")) == "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    then std::string::as_str(set_ex("k", "v", 86400)) == "*5\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n$2\r\nEX\r\n$5\r\n86400\r\n";
+    then std::string::as_str(del("k")) == "*2\r\n$3\r\nDEL\r\n$1\r\nk\r\n";
+    then std::string::as_str(exists("k")) == "*2\r\n$6\r\nEXISTS\r\n$1\r\nk\r\n";
+    then std::string::as_str(expire("k", 60)) == "*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$2\r\n60\r\n";
+    then std::string::as_str(ttl("k")) == "*2\r\n$3\r\nTTL\r\n$1\r\nk\r\n";
+    then std::string::as_str(incr("k")) == "*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n";
+    then std::string::as_str(incrby("k", 41)) == "*3\r\n$6\r\nINCRBY\r\n$1\r\nk\r\n$2\r\n41\r\n";
+    then std::string::as_str(decr("k")) == "*2\r\n$4\r\nDECR\r\n$1\r\nk\r\n";
+    // A binary value goes by length: the `\r\n` inside is payload.
+    then std::string::as_str(set("k", "a\r\nb")) == "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4\r\na\r\nb\r\n";
+}
+
+spec lpush {
+    then std::string::as_str(lpush("celery", "m")) == "*3\r\n$5\r\nLPUSH\r\n$6\r\ncelery\r\n$1\r\nm\r\n";
+    then std::string::as_str(rpush("k", "v")) == "*3\r\n$5\r\nRPUSH\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    then std::string::as_str(lpop("k")) == "*2\r\n$4\r\nLPOP\r\n$1\r\nk\r\n";
+    then std::string::as_str(rpop("k")) == "*2\r\n$4\r\nRPOP\r\n$1\r\nk\r\n";
+    then std::string::as_str(brpop("celery", 1)) == "*3\r\n$5\r\nBRPOP\r\n$6\r\ncelery\r\n$1\r\n1\r\n";
+    then std::string::as_str(llen("k")) == "*2\r\n$4\r\nLLEN\r\n$1\r\nk\r\n";
+    then std::string::as_str(lrange("k", 0, 0 - 1)) == "*4\r\n$6\r\nLRANGE\r\n$1\r\nk\r\n$1\r\n0\r\n$2\r\n-1\r\n";
+}
+
+spec sadd {
+    then std::string::as_str(sadd("s", "m")) == "*3\r\n$4\r\nSADD\r\n$1\r\ns\r\n$1\r\nm\r\n";
+    then std::string::as_str(smembers("s")) == "*2\r\n$8\r\nSMEMBERS\r\n$1\r\ns\r\n";
+    then std::string::as_str(srem("s", "m")) == "*3\r\n$4\r\nSREM\r\n$1\r\ns\r\n$1\r\nm\r\n";
+    then std::string::as_str(hset("h", "f", "v")) == "*4\r\n$4\r\nHSET\r\n$1\r\nh\r\n$1\r\nf\r\n$1\r\nv\r\n";
+    then std::string::as_str(hget("h", "f")) == "*3\r\n$4\r\nHGET\r\n$1\r\nh\r\n$1\r\nf\r\n";
+    then std::string::as_str(hdel("h", "f")) == "*3\r\n$4\r\nHDEL\r\n$1\r\nh\r\n$1\r\nf\r\n";
+}
+
+fn custom_client_id() -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, "CLIENT");
+    redis::resp::push_arg(args, "ID");
+    custom(args)
+}
+
+spec custom {
+    then std::string::as_str(custom_client_id()) == "*2\r\n$6\r\nCLIENT\r\n$2\r\nID\r\n";
+}
