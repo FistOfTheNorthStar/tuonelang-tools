@@ -1,0 +1,373 @@
+// argon2::phc — the `$argon2id$v=19$m=65536,t=3,p=4$<salt>$<tag>` string.
+//
+// A password hash is stored, not just computed, and the PHC string format
+// is how Argon2 hashes are stored: one text field carrying the variant, the
+// version, every cost parameter, the salt, and the tag, so that verifying a
+// password needs nothing but the string and the password. It is what
+// `passlib` writes into `shallowflaws`'s `password_hash` column and what
+// `argon2-cffi`'s `hash_secret` returns, so a hash made here verifies there
+// and the reverse.
+//
+// THE BASE64 IS UNPADDED. PHC strings use the standard alphabet without
+// trailing `=`, and `$` separates the fields. `std::crypto::base64_encode`
+// pads, so `b64` strips; `std::crypto::base64_decode` already ignores
+// characters outside the alphabet, so `unb64` is it unchanged.
+//
+// DECODING IS STRICT. Six `$`-separated pieces, a known variant name,
+// exactly `v=19`, and `m=`, `t=`, `p=` in that order with decimal values.
+// Anything else decodes as not-ok, and `verify` of a not-ok string is
+// false — the answer `passlib` gives for a malformed hash rather than an
+// exception, and the one `auth_utils.verify_password` catches into.
+
+module argon2::phc;
+
+/// A decoded PHC string. `ok` is false when the text was not one, and the
+/// other fields are then unspecified.
+struct Decoded {
+    ok: Bool,
+    kind: Int,
+    memory_kib: Int,
+    passes: Int,
+    lanes: Int,
+    salt: Array[Int],
+    tag: Array[Int],
+}
+
+/// The variant name PHC uses for type `kind`: `argon2d`, `argon2i`, or
+/// `argon2id`; empty for any other value.
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::phc::kind_name(2); // "argon2id"
+/// ```
+pub fn kind_name(take kind: Int) -> String {
+    if kind == argon2::hash::kind_d() {
+        return std::string::from_str("argon2d");
+    }
+    if kind == argon2::hash::kind_i() {
+        return std::string::from_str("argon2i");
+    }
+    if kind == argon2::hash::kind_id() {
+        return std::string::from_str("argon2id");
+    }
+    std::string::empty()
+}
+
+/// The type number for a PHC variant name, or `-1` for an unknown one.
+///
+/// # Example
+/// ```tuo
+/// let k = argon2::phc::kind_of_name("argon2i"); // 1
+/// ```
+pub fn kind_of_name(in name: Str) -> Int {
+    if name == "argon2d" {
+        return argon2::hash::kind_d();
+    }
+    if name == "argon2i" {
+        return argon2::hash::kind_i();
+    }
+    if name == "argon2id" {
+        return argon2::hash::kind_id();
+    }
+    0 - 1
+}
+
+/// `bytes` as unpadded standard Base64.
+///
+/// # Example
+/// ```tuo
+/// let s = argon2::phc::b64(std::crypto::bytes_of_str("somesalt")); // "c29tZXNhbHQ"
+/// ```
+pub fn b64(in bytes: Array[Int]) -> String {
+    let padded = std::crypto::base64_encode(bytes);
+    let view = std::string::as_str(padded);
+    var out = std::string::empty();
+    let n = std::str::len(view);
+    var i = 0;
+    while i < n {
+        let c = std::str::byte_at(view, i);
+        if c != 61 {
+            std::string::push_byte(out, c);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// The bytes of unpadded (or padded) standard Base64 `text`.
+///
+/// # Example
+/// ```tuo
+/// let salt = argon2::phc::unb64("c29tZXNhbHQ"); // "somesalt"
+/// ```
+pub fn unb64(in text: Str) -> Array[Int] {
+    std::crypto::base64_decode(text)
+}
+
+/// The PHC string for a tag computed with these parameters and this salt.
+///
+/// # Example
+/// ```tuo
+/// let s = argon2::phc::encode(2, 65536, 3, 4, salt, tag); // "$argon2id$v=19$m=65536,t=3,p=4$...$..."
+/// ```
+pub fn encode(take kind: Int, take memory_kib: Int, take passes: Int, take lanes: Int, in salt: Array[Int], in tag: Array[Int]) -> String {
+    var out = std::string::empty();
+    std::str::push(out, "$");
+    let name = kind_name(kind);
+    std::str::push(out, std::string::as_str(name));
+    std::str::push(out, "$v=");
+    std::str::push_int(out, argon2::hash::version());
+    std::str::push(out, "$m=");
+    std::str::push_int(out, memory_kib);
+    std::str::push(out, ",t=");
+    std::str::push_int(out, passes);
+    std::str::push(out, ",p=");
+    std::str::push_int(out, lanes);
+    std::str::push(out, "$");
+    let salt_text = b64(salt);
+    std::str::push(out, std::string::as_str(salt_text));
+    std::str::push(out, "$");
+    let tag_text = b64(tag);
+    std::str::push(out, std::string::as_str(tag_text));
+    out
+}
+
+/// A `Decoded` with `ok` false.
+///
+/// # Example
+/// ```tuo
+/// let d = argon2::phc::malformed();
+/// ```
+pub fn malformed() -> Decoded {
+    Decoded { ok: false, kind: 0 - 1, memory_kib: 0, passes: 0, lanes: 0, salt: std::array::empty(), tag: std::array::empty() }
+}
+
+/// The value of a `key=value` piece when its key is `key` and its value is
+/// a decimal integer; `-1` otherwise.
+///
+/// # Example
+/// ```tuo
+/// let m = argon2::phc::param_value("m=65536", "m"); // 65536
+/// let x = argon2::phc::param_value("t=3", "m"); // -1
+/// ```
+pub fn param_value(in piece: Str, in key: Str) -> Int {
+    let kv = std::str::split(piece, "=");
+    if std::array::len(kv) != 2 {
+        return 0 - 1;
+    }
+    let k = std::array::get(kv, 0);
+    if std::string::as_str(k) != key {
+        return 0 - 1;
+    }
+    let v = std::array::get(kv, 1);
+    match std::str::parse_int(std::string::as_str(v)) {
+        Ok { value } => value,
+        Err { error } => 0 - 1,
+    }
+}
+
+/// Parse a PHC string. `ok` is false unless every field is present and
+/// well-formed; the parameters are not range-checked here, since
+/// `argon2::hash::valid` does that when the hash is computed.
+///
+/// # Example
+/// ```tuo
+/// let d = argon2::phc::decode("$argon2id$v=19$m=8,t=1,p=1$c29tZXNhbHQ$8Tf44YakA6Z5zNBgblq13Nr+Q8FkCFWsjG4z6b1j7rM");
+/// ```
+pub fn decode(in text: Str) -> Decoded {
+    let parts = std::str::split(text, "$");
+    if std::array::len(parts) != 6 {
+        return malformed();
+    }
+    let p0 = std::array::get(parts, 0);
+    if std::string::as_str(p0) != "" {
+        return malformed();
+    }
+    let p1 = std::array::get(parts, 1);
+    let kind = kind_of_name(std::string::as_str(p1));
+    if kind < 0 {
+        return malformed();
+    }
+    let p2 = std::array::get(parts, 2);
+    if std::string::as_str(p2) != "v=19" {
+        return malformed();
+    }
+    let p3 = std::array::get(parts, 3);
+    let costs = std::str::split(std::string::as_str(p3), ",");
+    if std::array::len(costs) != 3 {
+        return malformed();
+    }
+    let c0 = std::array::get(costs, 0);
+    let c1 = std::array::get(costs, 1);
+    let c2 = std::array::get(costs, 2);
+    let memory_kib = param_value(std::string::as_str(c0), "m");
+    let passes = param_value(std::string::as_str(c1), "t");
+    let lanes = param_value(std::string::as_str(c2), "p");
+    if memory_kib < 0 || passes < 0 || lanes < 0 {
+        return malformed();
+    }
+    let p4 = std::array::get(parts, 4);
+    let p5 = std::array::get(parts, 5);
+    let salt = unb64(std::string::as_str(p4));
+    let tag = unb64(std::string::as_str(p5));
+    if std::array::len(tag) < argon2::hash::min_tag_len() {
+        return malformed();
+    }
+    Decoded { ok: true, kind: kind, memory_kib: memory_kib, passes: passes, lanes: lanes, salt: salt, tag: tag }
+}
+
+/// Whether `password` is the password `encoded` was made from: recompute
+/// the tag under the string's own parameters and salt, and compare in
+/// constant time. False for a malformed string or invalid parameters.
+///
+/// # Example
+/// ```tuo
+/// let ok = argon2::phc::verify(std::crypto::bytes_of_str("password"), "$argon2id$v=19$m=8,t=1,p=1$c29tZXNhbHQ$8Tf44YakA6Z5zNBgblq13Nr+Q8FkCFWsjG4z6b1j7rM"); // true
+/// ```
+pub fn verify(in password: Array[Int], in encoded: Str) -> Bool {
+    let d = decode(encoded);
+    if !d.ok {
+        return false;
+    }
+    let p = argon2::hash::params(d.lanes, d.memory_kib, d.passes, d.kind, std::array::len(d.tag));
+    let tag = argon2::hash::hash(password, d.salt, std::array::empty(), std::array::empty(), p);
+    if std::array::len(tag) == 0 {
+        return false;
+    }
+    std::crypto::verify(tag, d.tag)
+}
+
+// ----------------------------------------------------------------------------
+// Spec fixtures: argon2-cffi 25.1.0's `hash_secret` for "password" under
+// "somesalt".
+// ----------------------------------------------------------------------------
+
+/// argon2-cffi's PHC string for "password" under "somesalt" at m=8, t=1, p=1,
+/// Argon2id.
+///
+/// # Example
+/// ```tuo
+/// let s = argon2::phc::cffi_id();
+/// ```
+pub fn cffi_id() -> Str {
+    "$argon2id$v=19$m=8,t=1,p=1$c29tZXNhbHQ$8Tf44YakA6Z5zNBgblq13Nr+Q8FkCFWsjG4z6b1j7rM"
+}
+
+/// The same for Argon2i.
+///
+/// # Example
+/// ```tuo
+/// let s = argon2::phc::cffi_i();
+/// ```
+pub fn cffi_i() -> Str {
+    "$argon2i$v=19$m=8,t=1,p=1$c29tZXNhbHQ$y/K85H5tI5mWJhQ/q8XbaRZHQ+4ADd0/iJWm+Cz7mm4"
+}
+
+fn encoded_small(take kind: Int) -> String {
+    let tag = argon2::hash::hash(std::crypto::bytes_of_str("password"), std::crypto::bytes_of_str("somesalt"), std::array::empty(), std::array::empty(), argon2::hash::params(1, 8, 1, kind, 32));
+    encode(kind, 8, 1, 1, std::crypto::bytes_of_str("somesalt"), tag)
+}
+
+fn decoded_field(in text: Str, take which: Int) -> Int {
+    let d = decode(text);
+    if which == 0 {
+        return if d.ok {
+            1
+        } else {
+            0
+        };
+    }
+    if which == 1 {
+        return d.kind;
+    }
+    if which == 2 {
+        return d.memory_kib;
+    }
+    if which == 3 {
+        return d.passes;
+    }
+    if which == 4 {
+        return d.lanes;
+    }
+    if which == 5 {
+        return std::array::len(d.salt);
+    }
+    std::array::len(d.tag)
+}
+
+fn decoded_salt_text(in text: Str) -> String {
+    let d = decode(text);
+    std::crypto::str_of_bytes(d.salt)
+}
+
+fn decoded_tag_hex(in text: Str) -> String {
+    let d = decode(text);
+    std::crypto::to_hex(d.tag)
+}
+
+spec kind_name {
+    then std::string::as_str(kind_name(0)) == "argon2d";
+    then std::string::as_str(kind_name(1)) == "argon2i";
+    then std::string::as_str(kind_name(2)) == "argon2id";
+    then std::string::as_str(kind_name(3)) == "";
+    then kind_of_name("argon2id") == 2;
+    then kind_of_name("argon2") == 0 - 1;
+}
+
+spec b64 {
+    then std::string::as_str(b64(std::crypto::bytes_of_str("somesalt"))) == "c29tZXNhbHQ";
+    then std::string::as_str(b64(std::crypto::bytes_of_str("f"))) == "Zg";
+    then std::string::as_str(b64(std::crypto::bytes_of_str("foo"))) == "Zm9v";
+    then std::string::as_str(b64(std::array::empty())) == "";
+    then std::string::as_str(std::crypto::str_of_bytes(unb64("c29tZXNhbHQ"))) == "somesalt";
+    then std::string::as_str(std::crypto::str_of_bytes(unb64("Zg"))) == "f";
+}
+
+spec param_value {
+    then param_value("m=65536", "m") == 65536;
+    then param_value("t=3", "t") == 3;
+    then param_value("t=3", "m") == 0 - 1;
+    then param_value("m=x", "m") == 0 - 1;
+    then param_value("m", "m") == 0 - 1;
+    then param_value("m=1=2", "m") == 0 - 1;
+}
+
+spec encode {
+    // Byte-for-byte what argon2-cffi writes for the same inputs.
+    then std::string::as_str(encoded_small(argon2::hash::kind_id())) == cffi_id();
+    then std::string::as_str(encoded_small(argon2::hash::kind_i())) == cffi_i();
+}
+
+spec decode {
+    then decoded_field(cffi_id(), 0) == 1;
+    then decoded_field(cffi_id(), 1) == 2;
+    then decoded_field(cffi_id(), 2) == 8;
+    then decoded_field(cffi_id(), 3) == 1;
+    then decoded_field(cffi_id(), 4) == 1;
+    then decoded_field(cffi_id(), 5) == 8;
+    then decoded_field(cffi_id(), 6) == 32;
+    then std::string::as_str(decoded_salt_text(cffi_id())) == "somesalt";
+    then std::string::as_str(decoded_tag_hex(cffi_id())) == "f137f8e186a403a679ccd0606e5ab5dcdafe43c1640855ac8c6e33e9bd63eeb3";
+    then decoded_field(cffi_i(), 1) == 1;
+    // The backend's production shape parses, whatever its salt and tag say.
+    then decoded_field("$argon2id$v=19$m=65536,t=3,p=4$LSVEyHlPKeX8H6MUAqAUgg$Oi3eSjP4fdW0xxgFUTTwmAy9JeDc6J2v6DnyGRazITI", 2) == 65536;
+    then decoded_field("$argon2id$v=19$m=65536,t=3,p=4$LSVEyHlPKeX8H6MUAqAUgg$Oi3eSjP4fdW0xxgFUTTwmAy9JeDc6J2v6DnyGRazITI", 5) == 16;
+    // Malformed strings, including the test fixture `shallowflaws` uses.
+    then decoded_field("$argon2id$v=19$m=65536,t=3,p=4$fakehash", 0) == 0;
+    then decoded_field("", 0) == 0;
+    then decoded_field("argon2id$v=19$m=8,t=1,p=1$c29tZXNhbHQ$8Tf44YakA6Z5zNBgblq13Nr+Q8FkCFWsjG4z6b1j7rM", 0) == 0;
+    then decoded_field("$argon2x$v=19$m=8,t=1,p=1$c29tZXNhbHQ$8Tf44YakA6Z5zNBgblq13Nr+Q8FkCFWsjG4z6b1j7rM", 0) == 0;
+    then decoded_field("$argon2id$v=16$m=8,t=1,p=1$c29tZXNhbHQ$8Tf44YakA6Z5zNBgblq13Nr+Q8FkCFWsjG4z6b1j7rM", 0) == 0;
+    then decoded_field("$argon2id$v=19$t=1,m=8,p=1$c29tZXNhbHQ$8Tf44YakA6Z5zNBgblq13Nr+Q8FkCFWsjG4z6b1j7rM", 0) == 0;
+    then decoded_field("$argon2id$v=19$m=8,t=1,p=1$c29tZXNhbHQ$", 0) == 0;
+}
+
+spec verify {
+    then verify(std::crypto::bytes_of_str("password"), cffi_id()) == true;
+    then verify(std::crypto::bytes_of_str("password"), cffi_i()) == true;
+    then verify(std::crypto::bytes_of_str("Password"), cffi_id()) == false;
+    then verify(std::crypto::bytes_of_str(""), cffi_id()) == false;
+    then verify(std::crypto::bytes_of_str("password"), "$argon2id$v=19$m=65536,t=3,p=4$fakehash") == false;
+    // Parameters outside the RFC's bounds are refused, not computed.
+    then verify(std::crypto::bytes_of_str("password"), "$argon2id$v=19$m=4,t=1,p=1$c29tZXNhbHQ$8Tf44YakA6Z5zNBgblq13Nr+Q8FkCFWsjG4z6b1j7rM") == false;
+}

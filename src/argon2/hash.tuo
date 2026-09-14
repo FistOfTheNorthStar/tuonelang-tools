@@ -1,0 +1,456 @@
+// argon2::hash — the Argon2 operation (RFC 9106 §3.2).
+//
+// This is the port's top: every input parameter goes in, a tag comes out,
+// and everything between is the four modules below it. The shape is the
+// RFC's eight steps in order — pre-hash the parameters into H_0, expand it
+// into the first two blocks of each lane, fill the rest slice by slice, xor
+// the last column, and squeeze the result to the requested length.
+//
+// WHAT MAKES IT A PASSWORD HASH. The memory is `m` KiB, every block of it is
+// written and then read again by a data-dependent address, and the passes
+// go over all of it `t` times. A CPU does this at memory bandwidth; a
+// dedicated circuit cannot do it materially faster without the same memory,
+// which is what "memory-hard" means and why bcrypt and PBKDF2 are no longer
+// the recommendation.
+//
+// CORRECTNESS IS EXTERNALLY DEFINED. RFC 9106 §5 publishes tags and interim
+// blocks for all three variants at m=32, t=3, p=4, with a secret and
+// associated data; argon2-cffi — the reference C implementation behind
+// `passlib`, and so behind `shallowflaws` — gives every other vector below.
+// The specs assert those, byte for byte.
+//
+// THE MEMORY IS FILLED SEQUENTIALLY. The RFC allows the `p` segments of a
+// slice to be computed in parallel, and the reference implementation does;
+// the tag is the same either way, because segments of one slice never
+// reference each other. `std::sync::par_map` could fork the segments, but
+// it cannot share the memory array between workers without an effect, so
+// this port takes the sequential order and gets the same answer.
+
+module argon2::hash;
+
+/// The parameters of one Argon2 invocation (RFC 9106 §3.1).
+///
+/// `kind` is the type `y`: 0 for Argon2d, 1 for Argon2i, 2 for Argon2id.
+/// `memory_kib` is `m`, in kibibytes; `passes` is `t`; `lanes` is `p`;
+/// `tag_len` is `T`, in bytes.
+struct Params {
+    lanes: Int,
+    memory_kib: Int,
+    passes: Int,
+    kind: Int,
+    tag_len: Int,
+}
+
+/// The type number of Argon2d, the data-dependent variant.
+///
+/// # Example
+/// ```tuo
+/// let y = argon2::hash::kind_d(); // 0
+/// ```
+pub fn kind_d() -> Int {
+    0
+}
+
+/// The type number of Argon2i, the data-independent variant.
+///
+/// # Example
+/// ```tuo
+/// let y = argon2::hash::kind_i(); // 1
+/// ```
+pub fn kind_i() -> Int {
+    1
+}
+
+/// The type number of Argon2id, the hybrid and RFC 9106's recommendation.
+///
+/// # Example
+/// ```tuo
+/// let y = argon2::hash::kind_id(); // 2
+/// ```
+pub fn kind_id() -> Int {
+    2
+}
+
+/// The version number `v`, `0x13`, the only one this port speaks.
+///
+/// # Example
+/// ```tuo
+/// let v = argon2::hash::version(); // 19
+/// ```
+pub fn version() -> Int {
+    19
+}
+
+/// The smallest tag the RFC allows, in bytes.
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::hash::min_tag_len(); // 4
+/// ```
+pub fn min_tag_len() -> Int {
+    4
+}
+
+/// Build a `Params`.
+///
+/// # Example
+/// ```tuo
+/// let p = argon2::hash::params(4, 65536, 3, argon2::hash::kind_id(), 32);
+/// ```
+pub fn params(take lanes: Int, take memory_kib: Int, take passes: Int, take kind: Int, take tag_len: Int) -> Params {
+    Params { lanes: lanes, memory_kib: memory_kib, passes: passes, kind: kind, tag_len: tag_len }
+}
+
+/// Whether `p` satisfies RFC 9106 §3.1's bounds: at least one lane and one
+/// pass, a known type, a tag of at least four bytes, and at least eight
+/// blocks per lane.
+///
+/// `hash` returns an empty tag for parameters that fail this, rather than
+/// trapping partway through the fill.
+///
+/// # Example
+/// ```tuo
+/// let ok = argon2::hash::valid(argon2::hash::params(1, 8, 1, 2, 32)); // true
+/// let no = argon2::hash::valid(argon2::hash::params(2, 8, 1, 2, 32)); // false: 8 KiB < 8 * 2
+/// ```
+pub fn valid(in p: Params) -> Bool {
+    if p.lanes < 1 || p.passes < 1 {
+        return false;
+    }
+    if p.kind < 0 || p.kind > 2 {
+        return false;
+    }
+    if p.tag_len < min_tag_len() {
+        return false;
+    }
+    p.memory_kib >= 8 * p.lanes
+}
+
+/// `m'`, the number of blocks actually used: `m` rounded down to a multiple
+/// of `4 * p` (§3.2, Figure 2).
+///
+/// # Example
+/// ```tuo
+/// let n = argon2::hash::block_count(65536, 4); // 65536
+/// let r = argon2::hash::block_count(35, 4); // 32
+/// ```
+pub fn block_count(take memory_kib: Int, take lanes: Int) -> Int {
+    let unit = 4 * lanes;
+    unit * (memory_kib / unit)
+}
+
+/// `H_0`, the 64-byte pre-hash of every input (§3.2, Figure 1): each
+/// parameter as `LE32`, then each byte string preceded by its `LE32` length.
+/// An absent secret or associated data is a zero-length string whose length
+/// field is still present.
+///
+/// # Example
+/// ```tuo
+/// let h0 = argon2::hash::initial_hash(password, salt, secret, data, p);
+/// ```
+pub fn initial_hash(in password: Array[Int], in salt: Array[Int], in secret: Array[Int], in data: Array[Int], in p: Params) -> Array[Int] {
+    var input = std::array::empty();
+    argon2::word::push_le32(input, p.lanes);
+    argon2::word::push_le32(input, p.tag_len);
+    argon2::word::push_le32(input, p.memory_kib);
+    argon2::word::push_le32(input, p.passes);
+    argon2::word::push_le32(input, version());
+    argon2::word::push_le32(input, p.kind);
+    argon2::word::push_le32(input, std::array::len(password));
+    argon2::word::push_bytes(input, password);
+    argon2::word::push_le32(input, std::array::len(salt));
+    argon2::word::push_bytes(input, salt);
+    argon2::word::push_le32(input, std::array::len(secret));
+    argon2::word::push_bytes(input, secret);
+    argon2::word::push_le32(input, std::array::len(data));
+    argon2::word::push_bytes(input, data);
+    argon2::blake2b::hash(input, argon2::blake2b::max_out())
+}
+
+/// Block `column` (0 or 1) of lane `lane`: `H'^1024(H_0 || LE32(column) ||
+/// LE32(lane))` (§3.2, Figures 3 and 4).
+///
+/// # Example
+/// ```tuo
+/// let b = argon2::hash::lane_start(h0, 1, 0); // B[0][1]
+/// ```
+pub fn lane_start(in h0: Array[Int], take column: Int, take lane: Int) -> Array[Int] {
+    var input = std::array::empty();
+    argon2::word::push_bytes(input, h0);
+    argon2::word::push_le32(input, column);
+    argon2::word::push_le32(input, lane);
+    argon2::block::of_bytes(argon2::hprime::hash(input, argon2::block::bytes()))
+}
+
+/// Fill one segment — the blocks of `lane` in `slice` — for `pass`
+/// (§3.2 steps 5 and 6, with §3.4's addressing).
+///
+/// The walk is the reference implementation's: `offset` is the block being
+/// written, `prev` the one before it in the lane (wrapping to the lane's
+/// last block at column 0), and the first two blocks of the first pass are
+/// skipped because `lane_start` wrote them. For data-independent positions
+/// an address block is generated on entry and again every 128 blocks; for
+/// data-dependent ones `J_1 || J_2` is the first word of the previous block.
+///
+/// # Example
+/// ```tuo
+/// argon2::hash::fill_segment(memory, p, 32, 0, 0, 0);
+/// ```
+pub fn fill_segment(mut memory: Array[Int], in p: Params, take blocks: Int, take pass: Int, take lane: Int, take slice: Int) {
+    let lane_length = blocks / p.lanes;
+    let segment_length = lane_length / argon2::index::slices();
+    let independent = argon2::index::independent(p.kind, pass, slice);
+    var input = argon2::index::address_input(pass, lane, slice, blocks, p.passes, p.kind);
+    var addresses = argon2::block::zero();
+    var start = 0;
+    if pass == 0 && slice == 0 {
+        start = 2;
+        if independent {
+            addresses = argon2::index::next_addresses(input);
+        }
+    }
+    var offset = lane * lane_length + slice * segment_length + start;
+    var prev = offset - 1;
+    if offset % lane_length == 0 {
+        prev = offset + lane_length - 1;
+    }
+    var i = start;
+    while i < segment_length {
+        if offset % lane_length == 1 {
+            prev = offset - 1;
+        }
+        var pair = 0;
+        if independent {
+            if i % argon2::index::addresses_per_block() == 0 {
+                addresses = argon2::index::next_addresses(input);
+            }
+            pair = std::array::get(addresses, i % argon2::index::addresses_per_block());
+        } else {
+            pair = std::array::get(memory, prev * argon2::block::words());
+        }
+        let j1 = argon2::word::lo32(pair);
+        let j2 = argon2::word::hi32(pair);
+        let ref_lane = argon2::index::reference_lane(pass, slice, lane, j2, p.lanes);
+        let ref_column = argon2::index::reference_column(pass, slice, i, j1, segment_length, lane_length, ref_lane == lane);
+        argon2::block::fill(memory, offset, prev, ref_lane * lane_length + ref_column, pass > 0);
+        i = i + 1;
+        offset = offset + 1;
+        prev = prev + 1;
+    }
+}
+
+/// Run `passes` passes over the whole memory, slice by slice and lane by
+/// lane within each slice — the order §3.2 step 5 requires.
+///
+/// `passes` is a parameter rather than read from `p` so that a spec can stop
+/// after the first pass and compare the RFC's interim block values; `hash`
+/// passes `p.passes`.
+///
+/// # Example
+/// ```tuo
+/// argon2::hash::fill_memory(memory, p, 32, p.passes);
+/// ```
+pub fn fill_memory(mut memory: Array[Int], in p: Params, take blocks: Int, take passes: Int) {
+    var pass = 0;
+    while pass < passes {
+        var slice = 0;
+        while slice < argon2::index::slices() {
+            var lane = 0;
+            while lane < p.lanes {
+                fill_segment(memory, p, blocks, pass, lane, slice);
+                lane = lane + 1;
+            }
+            slice = slice + 1;
+        }
+        pass = pass + 1;
+    }
+}
+
+/// The memory after `passes` passes: allocated, seeded from `H_0`, and
+/// filled. `hash` is this followed by the final xor and squeeze; it is
+/// exposed so the RFC's interim block values can be checked.
+///
+/// # Example
+/// ```tuo
+/// let memory = argon2::hash::filled(password, salt, secret, data, p, 1);
+/// ```
+pub fn filled(in password: Array[Int], in salt: Array[Int], in secret: Array[Int], in data: Array[Int], in p: Params, take passes: Int) -> Array[Int] {
+    let blocks = block_count(p.memory_kib, p.lanes);
+    let lane_length = blocks / p.lanes;
+    let h0 = initial_hash(password, salt, secret, data, p);
+    var memory = argon2::block::memory(blocks);
+    var lane = 0;
+    while lane < p.lanes {
+        argon2::block::store(memory, lane * lane_length, lane_start(h0, 0, lane));
+        argon2::block::store(memory, lane * lane_length + 1, lane_start(h0, 1, lane));
+        lane = lane + 1;
+    }
+    fill_memory(memory, p, blocks, passes);
+    memory
+}
+
+/// The Argon2 tag of `password` under `salt`, with optional `secret` (the
+/// RFC's `K`, a pepper) and `data` (`X`, associated data), each empty when
+/// unused — `p.tag_len` bytes, or an empty array if `p` is not `valid`.
+///
+/// # Example
+/// ```tuo
+/// let p = argon2::hash::params(1, 8, 1, argon2::hash::kind_id(), 32);
+/// let tag = argon2::hash::hash(password, salt, std::array::empty(), std::array::empty(), p);
+/// ```
+pub fn hash(in password: Array[Int], in salt: Array[Int], in secret: Array[Int], in data: Array[Int], in p: Params) -> Array[Int] {
+    if !valid(p) {
+        return std::array::empty();
+    }
+    let passes = p.passes;
+    let memory = filled(password, salt, secret, data, p, passes);
+    let blocks = block_count(p.memory_kib, p.lanes);
+    let lane_length = blocks / p.lanes;
+    // C, the xor of every lane's last block (§3.2, Figure 7).
+    var final = argon2::block::at(memory, lane_length - 1);
+    var lane = 1;
+    while lane < p.lanes {
+        let last = argon2::block::at(memory, lane * lane_length + lane_length - 1);
+        var i = 0;
+        while i < argon2::block::words() {
+            std::array::set(final, i, std::array::get(final, i) ^ std::array::get(last, i));
+            i = i + 1;
+        }
+        lane = lane + 1;
+    }
+    argon2::hprime::hash(argon2::block::to_bytes(final), p.tag_len)
+}
+
+// ----------------------------------------------------------------------------
+// Spec fixtures.
+//
+// RFC 9106 §5: password 32 x 0x01, salt 16 x 0x02, secret 8 x 0x03,
+// associated data 12 x 0x04; m = 32 KiB, t = 3, p = 4, 32-byte tag.
+// argon2-cffi 25.1.0: password "password", salt "somesalt", no secret or
+// associated data, at the smallest legal geometries.
+// ----------------------------------------------------------------------------
+
+/// The RFC 9106 §5 parameters for type `kind`.
+///
+/// # Example
+/// ```tuo
+/// let p = argon2::hash::rfc_params(argon2::hash::kind_id());
+/// ```
+pub fn rfc_params(take kind: Int) -> Params {
+    params(4, 32, 3, kind, 32)
+}
+
+/// The RFC 9106 §5 tag for type `kind`, as lowercase hex.
+///
+/// Too much work for the spec sandbox's instruction fuel — 32 blocks, three
+/// passes, four lanes — so it is asserted natively by `examples/argon2.tuo`
+/// rather than by a spec here, exactly as ADR-0020 does for a full PBKDF2
+/// iteration count.
+///
+/// # Example
+/// ```tuo
+/// let t = argon2::hash::rfc_tag_hex(argon2::hash::kind_id()); // "0d640df5..."
+/// ```
+pub fn rfc_tag_hex(take kind: Int) -> String {
+    std::crypto::to_hex(hash(std::crypto::repeated_byte(1, 32), std::crypto::repeated_byte(2, 16), std::crypto::repeated_byte(3, 8), std::crypto::repeated_byte(4, 12), rfc_params(kind)))
+}
+
+/// `H_0` for the RFC 9106 §5 inputs and type `kind`, as lowercase hex.
+///
+/// # Example
+/// ```tuo
+/// let h = argon2::hash::rfc_h0_hex(argon2::hash::kind_d()); // "b8819791..."
+/// ```
+pub fn rfc_h0_hex(take kind: Int) -> String {
+    std::crypto::to_hex(initial_hash(std::crypto::repeated_byte(1, 32), std::crypto::repeated_byte(2, 16), std::crypto::repeated_byte(3, 8), std::crypto::repeated_byte(4, 12), rfc_params(kind)))
+}
+
+/// Word `word` of block `block` after the first pass over the RFC 9106 §5
+/// inputs for type `kind`, as sixteen hex digits — the document's "After
+/// pass 0" values. Asserted natively by `examples/argon2.tuo`.
+///
+/// # Example
+/// ```tuo
+/// let w = argon2::hash::rfc_after_pass0(argon2::hash::kind_d(), 0, 0); // "db2fea6b2c6f5c8a"
+/// ```
+pub fn rfc_after_pass0(take kind: Int, take block: Int, take word: Int) -> String {
+    let memory = filled(std::crypto::repeated_byte(1, 32), std::crypto::repeated_byte(2, 16), std::crypto::repeated_byte(3, 8), std::crypto::repeated_byte(4, 12), rfc_params(kind), 1);
+    argon2::word::hex(std::array::get(memory, block * argon2::block::words() + word))
+}
+
+/// The tag of password "password" under salt "somesalt", with no secret or
+/// associated data, as lowercase hex — the inputs the argon2-cffi vectors
+/// below were generated from.
+///
+/// # Example
+/// ```tuo
+/// let t = argon2::hash::cffi_hex(1, 8, 1, argon2::hash::kind_id(), 32); // "f137f8e1..."
+/// ```
+pub fn cffi_hex(take lanes: Int, take memory_kib: Int, take passes: Int, take kind: Int, take tag_len: Int) -> String {
+    std::crypto::to_hex(hash(std::crypto::bytes_of_str("password"), std::crypto::bytes_of_str("somesalt"), std::array::empty(), std::array::empty(), params(lanes, memory_kib, passes, kind, tag_len)))
+}
+
+fn cffi_empty_password_hex() -> String {
+    std::crypto::to_hex(hash(std::array::empty(), std::crypto::bytes_of_str("somesalt"), std::array::empty(), std::array::empty(), params(1, 8, 1, kind_id(), 32)))
+}
+
+fn small_filled_len() -> Int {
+    std::array::len(filled(std::crypto::bytes_of_str("password"), std::crypto::bytes_of_str("somesalt"), std::array::empty(), std::array::empty(), params(1, 8, 1, kind_id(), 32), 1))
+}
+
+fn small_filled_word(take block: Int, take word: Int) -> Int {
+    std::array::get(filled(std::crypto::bytes_of_str("password"), std::crypto::bytes_of_str("somesalt"), std::array::empty(), std::array::empty(), params(1, 8, 1, kind_id(), 32), 1), block * argon2::block::words() + word)
+}
+
+spec valid {
+    then valid(params(1, 8, 1, 2, 32)) == true;
+    then valid(params(4, 32, 3, 0, 32)) == true;
+    then valid(params(2, 8, 1, 2, 32)) == false;
+    then valid(params(0, 8, 1, 2, 32)) == false;
+    then valid(params(1, 8, 0, 2, 32)) == false;
+    then valid(params(1, 8, 1, 3, 32)) == false;
+    then valid(params(1, 8, 1, 2, 3)) == false;
+    then std::array::len(hash(std::array::empty(), std::array::empty(), std::array::empty(), std::array::empty(), params(2, 8, 1, 2, 32))) == 0;
+}
+
+spec block_count {
+    then block_count(32, 4) == 32;
+    then block_count(35, 4) == 32;
+    then block_count(65536, 4) == 65536;
+    then block_count(8, 1) == 8;
+    then block_count(24, 3) == 24;
+}
+
+spec initial_hash {
+    // RFC 9106 §5.1–5.3, "Pre-hashing digest".
+    then std::string::as_str(rfc_h0_hex(kind_d())) == "b8819791a0359660bb7709c85fa48f04d5d82c05c5f215ccdb885491717cf757082c28b951be381410b5fc2eb7274033b9fdc7ae672bcaac5d179097a4af3109";
+    then std::string::as_str(rfc_h0_hex(kind_i())) == "c46065815276a0b3e731731c902f1fd80cf776907fbb7b6a5ca72e7b56011feeca446c86dd75b9469a5e6879dec4b72d0863fb939b982e5f397cc7d164fddaa9";
+    then std::string::as_str(rfc_h0_hex(kind_id())) == "2889de487eb42ae500c0007ed9252f1069eadec40d5765b485de6dc2437a67b8546a2f0acc1a0882db8fcf74714b472e94df421a5da1112ffa11434370a1e997";
+    then std::array::len(initial_hash(std::array::empty(), std::array::empty(), std::array::empty(), std::array::empty(), params(1, 8, 1, 2, 32))) == 64;
+}
+
+spec filled {
+    // The smallest geometry: one lane of eight blocks, all of them written.
+    // The RFC's interim block values need more fuel than the sandbox grants
+    // and are asserted natively by `examples/argon2.tuo`.
+    then small_filled_len() == 1024;
+    then small_filled_word(0, 0) != 0;
+    then small_filled_word(2, 0) != 0;
+    then small_filled_word(7, 127) != 0;
+    then small_filled_word(7, 127) != small_filled_word(6, 127);
+}
+
+spec hash {
+    // argon2-cffi at the smallest geometry: one lane, eight blocks, one pass.
+    // The RFC 9106 §5 tags and the multi-lane vectors exceed the sandbox's
+    // instruction fuel and are asserted natively by `examples/argon2.tuo`.
+    then std::string::as_str(cffi_hex(1, 8, 1, kind_id(), 32)) == "f137f8e186a403a679ccd0606e5ab5dcdafe43c1640855ac8c6e33e9bd63eeb3";
+    then std::string::as_str(cffi_hex(1, 8, 1, kind_i(), 32)) == "cbf2bce47e6d23999626143fabc5db69164743ee000ddd3f8895a6f82cfb9a6e";
+    then std::string::as_str(cffi_hex(1, 8, 1, kind_d(), 32)) == "c519e603ac603ec1aeb5b71ec44a6179e3f3975b14c0c97e3914c79e6363e178";
+    // Tag lengths off the 32-byte default: the shortest legal, and one that
+    // takes H' down its chained path.
+    then std::string::as_str(cffi_hex(1, 8, 1, kind_id(), 4)) == "6b7a947d";
+    then std::string::as_str(cffi_hex(1, 8, 1, kind_id(), 100)) == "07d014f1a22bbd1076662397a7eec67ede8cc0d5571f1038a8b9fab96fce54c8ba6542a7173ed47012c69d2e533113554c44af8cc28ea1f60ab01eee4f7c33de515c8048333e3c129328d83ab265abea55771c1991a1cafdb7b71e5ce47d1415ee4915a0";
+    // An empty password is legal and hashes.
+    then std::string::as_str(cffi_empty_password_hex()) == "65eeedf51f4006be43eb26d1214182a97d5087767e3487bfbc849dd328145651";
+}
