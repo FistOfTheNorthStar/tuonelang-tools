@@ -1,0 +1,527 @@
+// http::client — the effect boundary for outbound requests.
+//
+// Everything below this module is pure and spec'd: `http::url` says where
+// to connect and what to ask for, `http::message` frames what is sent and
+// decides where what comes back ends. This module moves the bytes: resolve
+// the host (through this crate's own `dns::resolver`, or not at all for a
+// literal address), connect, write one request, read one response under
+// `http::message::needed`'s direction, close. Then, if the response was a
+// redirect, do it again — a bounded number of times, with the method
+// changes RFC 9110 §15.4 prescribes.
+//
+// `https://` IS SERVED BY `tls::client`, WITH A PINNED KEY. There is no
+// certificate-chain validation in this crate, so a TLS request needs the
+// server's Ed25519 public key from the caller (`fetch_pinned`,
+// `get_pinned`); `get` and `post` refuse `https://` outright rather than
+// connect unverified. The bytes then cross the session instead of the
+// socket, and the same `http::message::needed` loop frames them.
+//
+// ONE REQUEST PER CONNECTION. Every request is sent with `Connection:
+// close`, so the response either has a length, is chunked, or runs to the
+// close the server has promised — and a pooled connection can never be
+// left holding half a body. Keep-alive reuse on the client side is a
+// deliberate omission; `http::message::message_end` is what a pool would
+// loop on, and the server side does keep connections alive.
+//
+// FAILURE IS A RESPONSE WITH `ok` FALSE and status 0. A malformed URL, an
+// `https://` one (no TLS in v0), a name that does not resolve, a refused
+// connection, a timeout, or a response the parser rejects all produce it.
+// A `404` is a successful exchange and has `ok` true.
+//
+// Effectful, so no specs on the socket paths (`R0007`); pinned by
+// `examples/http.tuo` against a server in the same process and
+// `examples/http_live.tuo` against public ones. The redirect arithmetic is
+// pure and spec'd here.
+
+module http::client;
+
+/// The timeout `get` and `post` use for connecting and for each read.
+///
+/// # Example
+/// ```tuo
+/// let ms = http::client::default_timeout_ms(); // 10000
+/// ```
+pub fn default_timeout_ms() -> Int {
+    10000
+}
+
+/// The DNS server names are resolved through: Cloudflare's public resolver.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::default_resolver(); // "1.1.1.1"
+/// ```
+pub fn default_resolver() -> Str {
+    "1.1.1.1"
+}
+
+/// How many redirects `fetch` follows before returning the last one.
+///
+/// # Example
+/// ```tuo
+/// let n = http::client::max_redirects(); // 5
+/// ```
+pub fn max_redirects() -> Int {
+    5
+}
+
+/// The `User-Agent` every request carries.
+///
+/// # Example
+/// ```tuo
+/// let ua = http::client::user_agent(); // "tuonelang-http/0.1"
+/// ```
+pub fn user_agent() -> Str {
+    "tuonelang-http/0.1"
+}
+
+/// A response. `ok` is false — and `status` 0 — when no response was
+/// obtained at all; a server's error status is a response with `ok` true.
+struct Response {
+    ok: Bool,
+    status: Int,
+    reason: String,
+    names: Array[String],
+    values: Array[String],
+    body: String,
+}
+
+/// The response that means "no response".
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::failed();
+/// ```
+pub fn failed() -> Response {
+    Response { ok: false, status: 0, reason: std::string::empty(), names: std::array::empty(), values: std::array::empty(), body: std::string::empty() }
+}
+
+/// The first header named `name`, case-insensitively, or empty.
+///
+/// # Example
+/// ```tuo
+/// let ct = http::client::header(r, "Content-Type");
+/// ```
+pub fn header(in r: Response, in name: Str) -> String {
+    let n = std::array::len(r.names);
+    var i = 0;
+    while i < n {
+        let candidate = std::array::get(r.names, i);
+        if http::message::eq_ignore_case(std::string::as_str(candidate), name) {
+            return std::array::get(r.values, i);
+        }
+        i = i + 1;
+    }
+    std::string::empty()
+}
+
+/// Whether `status` is one `fetch` follows.
+///
+/// # Example
+/// ```tuo
+/// let yes = http::client::is_redirect(302); // true
+/// ```
+pub fn is_redirect(take status: Int) -> Bool {
+    status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+}
+
+/// Whether following a redirect of `status` turns `method` into `GET`
+/// (RFC 9110 §15.4): always for 303; for 301 and 302 when the method was
+/// `POST`; never for 307 and 308.
+///
+/// # Example
+/// ```tuo
+/// let g = http::client::redirect_becomes_get(303, "POST"); // true
+/// let k = http::client::redirect_becomes_get(307, "POST"); // false
+/// ```
+pub fn redirect_becomes_get(take status: Int, in method: Str) -> Bool {
+    if status == 303 {
+        return true;
+    }
+    if status == 301 || status == 302 {
+        return method == "POST";
+    }
+    false
+}
+
+/// The URL a `Location` of `location` means when the request was to
+/// `from_url`: an absolute `http`/`https` URL as is, a path (`/get`)
+/// against the origin of `from_url`, and empty for anything else — a
+/// relative path, or a scheme this crate does not speak.
+///
+/// # Example
+/// ```tuo
+/// let next = http::client::redirect_target("/get", "http://httpbin.org/redirect-to?url=/get"); // "http://httpbin.org/get"
+/// ```
+pub fn redirect_target(in location: Str, in from_url: Str) -> String {
+    if std::str::starts_with(location, "http://") || std::str::starts_with(location, "https://") {
+        return std::string::from_str(location);
+    }
+    if !std::str::starts_with(location, "/") {
+        return std::string::empty();
+    }
+    let u = http::url::parse(from_url);
+    if !u.ok {
+        return std::string::empty();
+    }
+    var out = std::string::empty();
+    if u.https {
+        std::str::push(out, "https://");
+    } else {
+        std::str::push(out, "http://");
+    }
+    let hh = http::url::host_header(u);
+    std::str::push(out, std::string::as_str(hh));
+    std::str::push(out, location);
+    out
+}
+
+// --- The socket path ----------------------------------------------------------
+
+/// EFFECT: read exactly one response from `fd` — as many bytes and reads
+/// as `http::message::needed` asks for — or empty on timeout, a host
+/// error, or a malformed response. A response that runs until close is
+/// read to end of input.
+///
+/// # Example
+/// ```tuo
+/// let raw = http::client::read_response(fd, false, 10000);
+/// ```
+pub fn read_response(take fd: Int, take head_request: Bool, take timeout_ms: Int) -> String {
+    var buf = std::string::empty();
+    var need = http::message::needed(std::string::as_str(buf), true, head_request);
+    while need != 0 {
+        if need == 0 - 1 {
+            return std::string::empty();
+        }
+        if need == http::message::until_close() {
+            var reading = true;
+            while reading {
+                let b = std::net::read_byte_timeout(fd, timeout_ms);
+                if b == 0 - 1 {
+                    reading = false;
+                } else {
+                    if b < 0 {
+                        return std::string::empty();
+                    }
+                    std::string::push_byte(buf, b);
+                }
+            }
+            return buf;
+        }
+        var i = 0;
+        while i < need {
+            let b = std::net::read_byte_timeout(fd, timeout_ms);
+            if b < 0 {
+                return std::string::empty();
+            }
+            std::string::push_byte(buf, b);
+            i = i + 1;
+        }
+        need = http::message::needed(std::string::as_str(buf), true, head_request);
+    }
+    buf
+}
+
+/// The `Response` a raw response holds, or `failed` when it does not parse.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::parse_response(raw, false);
+/// ```
+pub fn parse_response(in raw: String, take head_request: Bool) -> Response {
+    let view = std::string::as_str(raw);
+    let h = http::message::parse_head(view, true);
+    if !h.ok {
+        return failed();
+    }
+    let body = http::message::body(view, true, head_request);
+    Response { ok: true, status: h.status, reason: h.reason, names: h.names, values: h.values, body: body }
+}
+
+/// EFFECT: write `request` to `fd` and read its response.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::exchange(fd, req, false, 10000);
+/// ```
+pub fn exchange(take fd: Int, in request: String, take head_request: Bool, take timeout_ms: Int) -> Response {
+    if std::rt::write_string(fd, request) < 0 {
+        return failed();
+    }
+    let raw = read_response(fd, head_request, timeout_ms);
+    if std::string::len(raw) == 0 {
+        return failed();
+    }
+    parse_response(raw, head_request)
+}
+
+/// EFFECT: `read_response`, but the bytes come from a TLS session. The
+/// session's end — close_notify, or a record that fails to authenticate —
+/// is the close that an until-close response runs to.
+///
+/// # Example
+/// ```tuo
+/// let raw = http::client::read_response_tls(session, false, 10000);
+/// ```
+pub fn read_response_tls(mut session: tls::client::Session, take head_request: Bool, take timeout_ms: Int) -> String {
+    var buf = std::string::empty();
+    var need = http::message::needed(std::string::as_str(buf), true, head_request);
+    while need != 0 {
+        if need == 0 - 1 {
+            return std::string::empty();
+        }
+        if need == http::message::until_close() {
+            var reading = true;
+            while reading {
+                let b = tls::client::read_byte(session, timeout_ms);
+                if b < 0 {
+                    reading = false;
+                } else {
+                    std::string::push_byte(buf, b);
+                }
+            }
+            return buf;
+        }
+        var i = 0;
+        while i < need {
+            let b = tls::client::read_byte(session, timeout_ms);
+            if b < 0 {
+                return std::string::empty();
+            }
+            std::string::push_byte(buf, b);
+            i = i + 1;
+        }
+        need = http::message::needed(std::string::as_str(buf), true, head_request);
+    }
+    buf
+}
+
+/// EFFECT: the address to connect to for `host`: the literal, `127.0.0.1`
+/// for `localhost`, or what `resolver` answers — empty when it answers
+/// nothing.
+///
+/// # Example
+/// ```tuo
+/// let a = http::client::resolve_host("example.com", "1.1.1.1", 3000);
+/// ```
+pub fn resolve_host(in host: Str, in resolver: Str, take timeout_ms: Int) -> String {
+    let hint = http::url::address_hint(host);
+    if std::string::len(hint) > 0 {
+        return hint;
+    }
+    dns::resolver::lookup(resolver, host, timeout_ms)
+}
+
+/// EFFECT: one request to `url_text`, no redirects followed. `extra` is
+/// pre-rendered header lines (see `http::message::header_line`); `Host`,
+/// `User-Agent`, `Connection: close`, and `Content-Length` are added.
+/// `https://` is refused: see `fetch_once_pinned`.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::fetch_once("GET", "http://example.com/", "", "", 10000, "1.1.1.1");
+/// ```
+pub fn fetch_once(in method: Str, in url_text: Str, in extra: Str, in body: Str, take timeout_ms: Int, in resolver: Str) -> Response {
+    fetch_once_pinned(method, url_text, extra, body, timeout_ms, resolver, std::array::empty())
+}
+
+/// EFFECT: `fetch_once` for either scheme. An `https://` URL is served by
+/// a TLS 1.3 session that trusts only a certificate whose Ed25519 key is
+/// `pinned`; with no pin an `https://` request is refused before
+/// connecting. SNI names the host unless it is an address.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::fetch_once_pinned("GET", "https://localhost:4433/", "", "", 10000, "1.1.1.1", pin);
+/// ```
+pub fn fetch_once_pinned(in method: Str, in url_text: Str, in extra: Str, in body: Str, take timeout_ms: Int, in resolver: Str, in pinned: Array[Int]) -> Response {
+    let u = http::url::parse(url_text);
+    if !u.ok {
+        return failed();
+    }
+    if u.https && std::array::len(pinned) != 32 {
+        return failed();
+    }
+    let address = resolve_host(std::string::as_str(u.host), resolver, timeout_ms);
+    if std::string::len(address) == 0 {
+        return failed();
+    }
+    let fd = std::net::connect_timeout(std::string::as_str(address), u.port, timeout_ms);
+    if fd < 0 {
+        return failed();
+    }
+    var headers = std::string::from_str(extra);
+    http::message::header_line(headers, "User-Agent", user_agent());
+    http::message::header_line(headers, "Connection", "close");
+    let hh = http::url::host_header(u);
+    let request = http::message::request(method, std::string::as_str(u.target), std::string::as_str(hh), std::string::as_str(headers), body);
+    if !u.https {
+        let r = exchange(fd, request, method == "HEAD", timeout_ms);
+        let _ = std::net::close(fd);
+        return r;
+    }
+    let sni = if http::url::is_ipv4_literal(std::string::as_str(u.host)) {
+        std::string::empty()
+    } else {
+        std::string::from_str(std::string::as_str(u.host))
+    };
+    var session = tls::client::handshake(fd, std::string::as_str(sni), pinned, timeout_ms);
+    if !session.ok {
+        let _ = std::net::close(fd);
+        return failed();
+    }
+    if tls::client::write_all(session, std::string::as_str(request)) < 0 {
+        let _ = std::net::close(fd);
+        return failed();
+    }
+    let raw = read_response_tls(session, method == "HEAD", timeout_ms);
+    let _ = tls::client::close(session);
+    let _ = std::net::close(fd);
+    if std::string::len(raw) == 0 {
+        return failed();
+    }
+    parse_response(raw, method == "HEAD")
+}
+
+/// EFFECT: `fetch_once`, following up to `max_redirects` redirects. The
+/// last response is returned when the chain is longer, when a `Location`
+/// cannot be followed (relative, or `https://` without a pin), or when it
+/// is not a redirect at all.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::fetch("GET", "http://httpbin.org/redirect-to?url=/get", "", "", 10000, "1.1.1.1");
+/// ```
+pub fn fetch(in method: Str, in url_text: Str, in extra: Str, in body: Str, take timeout_ms: Int, in resolver: Str) -> Response {
+    fetch_pinned(method, url_text, extra, body, timeout_ms, resolver, std::array::empty())
+}
+
+/// EFFECT: `fetch_once_pinned`, following redirects, with `pinned`
+/// trusted for every `https://` hop.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::fetch_pinned("GET", "https://localhost:4433/", "", "", 10000, "1.1.1.1", pin);
+/// ```
+pub fn fetch_pinned(in method: Str, in url_text: Str, in extra: Str, in body: Str, take timeout_ms: Int, in resolver: Str, in pinned: Array[Int]) -> Response {
+    var current_method = std::string::from_str(method);
+    var current_url = std::string::from_str(url_text);
+    var current_body = std::string::from_str(body);
+    var hops = 0;
+    while hops <= max_redirects() {
+        let r = fetch_once_pinned(std::string::as_str(current_method), std::string::as_str(current_url), extra, std::string::as_str(current_body), timeout_ms, resolver, pinned);
+        if !r.ok || !is_redirect(r.status) || hops == max_redirects() {
+            return r;
+        }
+        let location = header(r, "Location");
+        let next = redirect_target(std::string::as_str(location), std::string::as_str(current_url));
+        if std::string::len(next) == 0 {
+            return r;
+        }
+        if redirect_becomes_get(r.status, std::string::as_str(current_method)) {
+            current_method = std::string::from_str("GET");
+            current_body = std::string::empty();
+        }
+        current_url = next;
+        hops = hops + 1;
+    }
+    failed()
+}
+
+/// EFFECT: `GET url`, following redirects, with the defaults.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::get("http://example.com/", 10000);
+/// ```
+pub fn get(in url_text: Str, take timeout_ms: Int) -> Response {
+    fetch("GET", url_text, "", "", timeout_ms, default_resolver())
+}
+
+/// EFFECT: `POST url` with `body` as `content_type`, following redirects,
+/// with the defaults.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::post("http://httpbin.org/post", "application/json", "{\"a\":1}", 10000);
+/// ```
+pub fn post(in url_text: Str, in content_type: Str, in body: Str, take timeout_ms: Int) -> Response {
+    var extra = std::string::empty();
+    http::message::header_line(extra, "Content-Type", content_type);
+    fetch("POST", url_text, std::string::as_str(extra), body, timeout_ms, default_resolver())
+}
+
+/// EFFECT: `GET url` over `http://` or `https://`, trusting only the
+/// Ed25519 key `pinned` for TLS, following redirects.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::get_pinned("https://localhost:4433/", pin, 10000);
+/// ```
+pub fn get_pinned(in url_text: Str, in pinned: Array[Int], take timeout_ms: Int) -> Response {
+    fetch_pinned("GET", url_text, "", "", timeout_ms, default_resolver(), pinned)
+}
+
+spec is_redirect {
+    then is_redirect(301);
+    then is_redirect(302);
+    then is_redirect(303);
+    then is_redirect(307);
+    then is_redirect(308);
+    then is_redirect(200) == false;
+    then is_redirect(304) == false;
+    then is_redirect(300) == false;
+}
+
+spec redirect_becomes_get {
+    then redirect_becomes_get(303, "POST");
+    then redirect_becomes_get(303, "GET");
+    then redirect_becomes_get(301, "POST");
+    then redirect_becomes_get(302, "POST");
+    then redirect_becomes_get(302, "GET") == false;
+    then redirect_becomes_get(307, "POST") == false;
+    then redirect_becomes_get(308, "POST") == false;
+}
+
+spec redirect_target {
+    // httpbin's `Location: /get` against the URL that produced it.
+    then std::string::as_str(redirect_target("/get", "http://httpbin.org/redirect-to?url=/get")) == "http://httpbin.org/get";
+    then std::string::as_str(redirect_target("/x", "http://127.0.0.1:8000/a/b")) == "http://127.0.0.1:8000/x";
+    then std::string::as_str(redirect_target("http://other.example/", "http://a/")) == "http://other.example/";
+    // An https target is returned so the caller sees where it was sent;
+    // fetch_once then refuses it.
+    then std::string::as_str(redirect_target("https://secure.example/", "http://a/")) == "https://secure.example/";
+    then std::string::as_str(redirect_target("relative/path", "http://a/")) == "";
+    then std::string::as_str(redirect_target("", "http://a/")) == "";
+    then std::string::as_str(redirect_target("/x", "not a url")) == "";
+}
+
+fn parsed_status(in raw: Str) -> Int {
+    let r = parse_response(std::string::from_str(raw), false);
+    r.status
+}
+
+fn parsed_ok(in raw: Str) -> Bool {
+    let r = parse_response(std::string::from_str(raw), false);
+    r.ok
+}
+
+fn parsed_body(in raw: Str) -> String {
+    let r = parse_response(std::string::from_str(raw), false);
+    r.body
+}
+
+fn parsed_header(in raw: Str, in name: Str) -> String {
+    header(parse_response(std::string::from_str(raw), false), name)
+}
+
+spec parse_response {
+    then parsed_status(http::fixture::httpbin_redirect()) == 302;
+    then parsed_ok(http::fixture::httpbin_redirect());
+    then std::string::as_str(parsed_header(http::fixture::httpbin_redirect(), "location")) == "/get";
+    then std::string::len(parsed_body(http::fixture::example_com())) == 559;
+    then parsed_ok("garbage") == false;
+    then parsed_status("garbage") == 0;
+    then parsed_ok("") == false;
+}

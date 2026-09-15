@@ -1,0 +1,393 @@
+// tls::fixture — RFC 8448's handshake trace, and a test certificate.
+//
+// RFC 8448 walks one complete TLS 1.3 handshake with every byte printed:
+// both ephemeral keys, every handshake message, and every secret the key
+// schedule derives from them. That trace uses TLS_AES_128_GCM_SHA256 and an
+// RSA certificate — neither of which this crate speaks — but the key
+// schedule is a function of SHA-256 and the transcript alone, so every
+// secret, every IV, and both Finished values are reproducible here from the
+// RFC's own private key and messages. `tls::handshake`'s specs do exactly
+// that. (The AES keys are not comparable: HKDF-Expand-Label folds the
+// requested length into its input, and a 16-byte AES key is not a prefix of
+// a 32-byte ChaCha20 key.)
+//
+// The test certificate at the end is a self-signed Ed25519 certificate for
+// `CN=localhost`, generated with OpenSSL 3.6 on 2026-09-15 for the loopback
+// and OpenSSL oracles. Its private seed is committed on purpose: it
+// authenticates nothing but this repository's own test servers, and a
+// reproducible oracle needs a reproducible key.
+//
+// Every value is a lowercase hex `Str`; `bytes` decodes one.
+
+module tls::fixture;
+
+/// The value of one hex digit, or -1.
+fn nibble(take b: Int) -> Int {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    0 - 1
+}
+
+/// The bytes a hex string spells; empty for an odd length or a non-digit.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes("0304"); // [3, 4]
+/// ```
+pub fn bytes(in hex: Str) -> Array[Int] {
+    var out = std::array::empty();
+    let n = std::str::len(hex);
+    if n % 2 != 0 {
+        return out;
+    }
+    var i = 0;
+    while i < n {
+        let hi = nibble(std::str::byte_at(hex, i));
+        let lo = nibble(std::str::byte_at(hex, i + 1));
+        if hi < 0 || lo < 0 {
+            return std::array::empty();
+        }
+        std::array::push(out, hi * 16 + lo);
+        i = i + 2;
+    }
+    out
+}
+
+/// Lowercase hex of `data`, the inverse of `bytes`.
+///
+/// # Example
+/// ```tuo
+/// let h = tls::fixture::hex(tls::fixture::bytes("0304")); // "0304"
+/// ```
+pub fn hex(in data: Array[Int]) -> String {
+    std::crypto::to_hex(data)
+}
+
+/// The client's ephemeral X25519 private key (RFC 8448 §3).
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::client_private()); // 32 bytes
+/// ```
+pub fn client_private() -> Str {
+    "49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005"
+}
+
+/// The client's X25519 public key — the key_share it offers.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::client_public()); // 32 bytes
+/// ```
+pub fn client_public() -> Str {
+    "99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c"
+}
+
+/// The server's ephemeral X25519 private key.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::server_private()); // 32 bytes
+/// ```
+pub fn server_private() -> Str {
+    "b1580eeadf6dd589b8ef4f2d5652578cc810e9980191ec8d058308cea216a21e"
+}
+
+/// The server's X25519 public key — the key_share in its ServerHello.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::server_public()); // 32 bytes
+/// ```
+pub fn server_public() -> Str {
+    "c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f"
+}
+
+/// The ClientHello handshake message, 196 bytes, offering three suites and many groups.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::client_hello()); // 196 bytes
+/// ```
+pub fn client_hello() -> Str {
+    "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603020308040805080604010501060102010402050206020202002d00020101001c00024001"
+}
+
+/// The ServerHello handshake message, 90 bytes: TLS_AES_128_GCM_SHA256 and an X25519 share.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::server_hello()); // 90 bytes
+/// ```
+pub fn server_hello() -> Str {
+    "020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304"
+}
+
+/// The EncryptedExtensions handshake message, 40 bytes.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::encrypted_extensions()); // 40 bytes
+/// ```
+pub fn encrypted_extensions() -> Str {
+    "080000240022000a00140012001d00170018001901000101010201030104001c0002400100000000"
+}
+
+/// The Certificate handshake message, 445 bytes, carrying an RSA certificate.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::certificate()); // 445 bytes
+/// ```
+pub fn certificate() -> Str {
+    "0b0001b9000001b50001b0308201ac30820115a003020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d3236303733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f8279303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0ccb0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b42b4de10000"
+}
+
+/// The CertificateVerify handshake message, 136 bytes, an RSA-PSS signature.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::certificate_verify()); // 136 bytes
+/// ```
+pub fn certificate_verify() -> Str {
+    "0f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be152a3da5043e063dda65cdf5aea20d53dfacd42f74f3"
+}
+
+/// The server's Finished handshake message, 36 bytes.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::server_finished()); // 36 bytes
+/// ```
+pub fn server_finished() -> Str {
+    "140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"
+}
+
+/// The client's Finished handshake message, 36 bytes.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::client_finished()); // 36 bytes
+/// ```
+pub fn client_finished() -> Str {
+    "14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"
+}
+
+/// HKDF-Extract(derived, ECDHE): the handshake secret.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::handshake_secret()); // 32 bytes
+/// ```
+pub fn handshake_secret() -> Str {
+    "1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac"
+}
+
+/// The client_handshake_traffic_secret.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::client_hs_traffic()); // 32 bytes
+/// ```
+pub fn client_hs_traffic() -> Str {
+    "b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"
+}
+
+/// The server_handshake_traffic_secret.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::server_hs_traffic()); // 32 bytes
+/// ```
+pub fn server_hs_traffic() -> Str {
+    "b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"
+}
+
+/// The transcript hash of ClientHello || ServerHello.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::hello_hash()); // 32 bytes
+/// ```
+pub fn hello_hash() -> Str {
+    "860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8"
+}
+
+/// The master secret.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::master_secret()); // 32 bytes
+/// ```
+pub fn master_secret() -> Str {
+    "18df06843d13a08bf2a449844c5f8a478001bc4d4c627984d5a41da8d0402919"
+}
+
+/// The server's handshake write IV — key lengths differ per suite, IVs do not.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::server_hs_iv()); // 12 bytes
+/// ```
+pub fn server_hs_iv() -> Str {
+    "5d313eb2671276ee13000b30"
+}
+
+/// The client's handshake write IV.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::client_hs_iv()); // 12 bytes
+/// ```
+pub fn client_hs_iv() -> Str {
+    "5bd3c71b836e0b76bb73265f"
+}
+
+/// The server's Finished verify_data.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::server_finished_data()); // 32 bytes
+/// ```
+pub fn server_finished_data() -> Str {
+    "9b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718"
+}
+
+/// The client's Finished verify_data.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::client_finished_data()); // 32 bytes
+/// ```
+pub fn client_finished_data() -> Str {
+    "a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"
+}
+
+/// The client_application_traffic_secret_0.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::client_ap_traffic()); // 32 bytes
+/// ```
+pub fn client_ap_traffic() -> Str {
+    "9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"
+}
+
+/// The server_application_traffic_secret_0.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::server_ap_traffic()); // 32 bytes
+/// ```
+pub fn server_ap_traffic() -> Str {
+    "a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"
+}
+
+/// The transcript hash through the server's Finished.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::finished_hash()); // 32 bytes
+/// ```
+pub fn finished_hash() -> Str {
+    "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13"
+}
+
+/// The server's application write IV.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::server_ap_iv()); // 12 bytes
+/// ```
+pub fn server_ap_iv() -> Str {
+    "cf782b88dd83549aadf1e984"
+}
+
+/// The client's application write IV.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::fixture::bytes(tls::fixture::client_ap_iv()); // 12 bytes
+/// ```
+pub fn client_ap_iv() -> Str {
+    "5b78923dee08579033e523d9"
+}
+
+/// The ECDHE shared secret X25519 produces from either private key and the
+/// other's public key — the IKM of the handshake extract. Given here so the
+/// key schedule can be spec'd without a curve operation, which exceeds the
+/// spec sandbox's fuel; the curve operation itself is asserted natively by
+/// `examples/tls.tuo`.
+///
+/// # Example
+/// ```tuo
+/// let s = tls::fixture::bytes(tls::fixture::shared_secret()); // 32 bytes
+/// ```
+pub fn shared_secret() -> Str {
+    "8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"
+}
+
+/// The test certificate, DER: self-signed Ed25519, `CN=localhost`, valid
+/// for a hundred years from 2026-09-15.
+///
+/// # Example
+/// ```tuo
+/// let der = tls::fixture::bytes(tls::fixture::test_certificate()); // 322 bytes
+/// ```
+pub fn test_certificate() -> Str {
+    "3082013e3081f1a003020102021415d5e2437e6d04d912a0ac2b2162c52326843956300506032b657030143112301006035504030c096c6f63616c686f73743020170d3236303931353133343931335a180f32313236303832323133343931335a30143112301006035504030c096c6f63616c686f7374302a300506032b6570032100cf2097bae627caec3a6a5e7fcb13bf10c119d8e9a73d0492889e2fb4f0ee2ce9a3533051301d0603551d0e041604140a6749167216f725764b830b1af7de43c8792977301f0603551d230418301680140a6749167216f725764b830b1af7de43c8792977300f0603551d130101ff040530030101ff300506032b6570034100b287a65206dbdcbf71c76ff17ef920484d338acb4813c12a281a7c84265269fd9f68e6720d5d077fe6d760158a12532fbb92a58d52a1a41c213f11c10b019e07"
+}
+
+/// The test certificate's Ed25519 private seed. A TEST KEY: it signs for
+/// this repository's oracle servers and nothing else.
+///
+/// # Example
+/// ```tuo
+/// let seed = tls::fixture::bytes(tls::fixture::test_seed()); // 32 bytes
+/// ```
+pub fn test_seed() -> Str {
+    "171f2960631c359a5ee96e378afdf61630503c63cf74d675a7b76d09e3447ce0"
+}
+
+/// The test certificate's Ed25519 public key, as OpenSSL prints it — what
+/// a client pins. `examples/tls.tuo` asserts natively that `test_seed`
+/// produces it.
+///
+/// # Example
+/// ```tuo
+/// let pin = tls::fixture::bytes(tls::fixture::test_public_key()); // 32 bytes
+/// ```
+pub fn test_public_key() -> Str {
+    "cf2097bae627caec3a6a5e7fcb13bf10c119d8e9a73d0492889e2fb4f0ee2ce9"
+}
+
+spec bytes {
+    then std::array::len(bytes("0304")) == 2;
+    then std::array::get(bytes("0304"), 1) == 4;
+    then std::array::get(bytes("ff"), 0) == 255;
+    then std::array::len(bytes("abc")) == 0;
+    then std::array::len(bytes("zz")) == 0;
+    then std::string::as_str(hex(bytes("00ff10"))) == "00ff10";
+    then std::array::len(bytes(client_hello())) == 196;
+    then std::array::len(bytes(server_hello())) == 90;
+    then std::array::len(bytes(certificate())) == 445;
+    then std::array::len(bytes(client_private())) == 32;
+    then std::array::len(bytes(test_certificate())) == 322;
+    then std::array::len(bytes(test_seed())) == 32;
+    // The test certificate is what it says: an Ed25519 certificate carrying
+    // the public key OpenSSL printed for it. (That the seed produces this
+    // key, and that the RFC's private keys produce its public keys, are
+    // curve operations beyond the sandbox's fuel: `examples/tls.tuo`
+    // asserts both natively.)
+    then std::der::certificate_is_ed25519(bytes(test_certificate()));
+    then std::string::as_str(hex(std::der::certificate_public_key(bytes(test_certificate())))) == test_public_key();
+    then std::array::len(bytes(shared_secret())) == 32;
+    then std::array::len(bytes(test_public_key())) == 32;
+}

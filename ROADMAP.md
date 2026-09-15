@@ -21,8 +21,11 @@ SHA-256/HMAC/PBKDF2, `std::bignum`, `std::json`, `std::fs`, `std::sync`,
 | [`tuolang-celery`](../tuolang-celery) | `celery` + `redis` broker | queue engine, routing, retries, beat; 57 specs |
 | this repo, `dns` | `socket.getaddrinfo` | stub resolver over UDP; 82 specs; resolves real names |
 | this repo, `argon2` | `passlib[argon2]` | Argon2id/i/d + BLAKE2b + PHC strings; 125 specs; verifies the backend's own hashes |
+| this repo, `redis` | `redis` | RESP2 client, the backend's commands, `redis://` URLs; 40 specs; 35 live checks against Redis 7 |
+| this repo, `http` | `httpx`, `requests`, `uvicorn` | HTTP/1.1 framing, client with redirects, keep-alive server; 107 specs; 29 live checks |
+| this repo, `tls` | `ssl` (client side, pinned keys) | TLS 1.3 client on the catalog's stack; RFC 8448 reproduced; handshakes with `std::tls` and OpenSSL |
 
-All four prove the thesis: the *engine* of a Python library is pure logic, and pure
+All seven prove the thesis: the *engine* of a Python library is pure logic, and pure
 logic is what tuonelang specs pin best.
 
 ---
@@ -31,18 +34,21 @@ logic is what tuonelang specs pin best.
 
 Nothing else ships without these. Each is a hard blocker for the request path.
 
-### 1. TLS 1.3 — replaces the `ssl` module (blocks `httpx`, `stripe`, `boto3`, `redis` over TLS)
+### 1. TLS 1.3 — replaces the `ssl` module (blocks `httpx`, `stripe`, `boto3`, `redis` over TLS) — ◐ client done, chain validation next
 
 **The single highest-value port, and the one everything external waits on.**
-Today the workspace refuses TLS deliberately (ADR-0017) because it would need a
-crypto dependency. But `std::bignum` already ships modular arithmetic, and
-`std::crypto` already ships SHA-256/HMAC with RFC test vectors — the two hard
-halves of a handshake.
+On 2026-09-15 the tuonelang catalog landed X25519, ChaCha20-Poly1305,
+Ed25519, HKDF, DER, and a TLS 1.3 *server* verified against OpenSSL. This
+repo added the *client* the same day: `https://` now works in `http::client`
+against any server on that profile, with the certificate's Ed25519 key
+pinned by the caller.
 
-What is still missing: X25519, AES-GCM or ChaCha20-Poly1305, P-256 ECDSA
-verification, and X.509 certificate parsing. Certificate chain validation is
-where the real bugs live, and it is *exactly* the kind of pure, spec-shaped
-logic tuonelang is good at pinning.
+What is still missing is what public servers need: P-256 ECDSA (and RSA)
+signature verification, X.509 chain building with names and validity
+dates, and a root store. Certificate chain validation is where the real
+bugs live, and it is *exactly* the kind of pure, spec-shaped logic
+tuonelang is good at pinning. Until it lands, `get` refuses `https://`
+rather than offer an unverified mode.
 
 ### 2. DNS resolution — replaces `socket.getaddrinfo` — ✅ done
 
@@ -53,12 +59,16 @@ over UDP, with a wire-format parser that specs cleanly. Done first as a
 warm-up — it was the shortest path to a real win, and it surfaced a runtime
 bug (`udp_bind` on loopback) that ADR-0017 had to be amended for.
 
-### 3. HTTP/1.1 client + server — replaces `httpx`, `requests`, `uvicorn`, `gunicorn`
+### 3. HTTP/1.1 client + server — replaces `httpx`, `requests`, `uvicorn`, `gunicorn` — ✅ done
 
-`examples/http-service` already serves itself over a live loopback socket, so
-the socket half is proven. What is needed is the full protocol: chunked transfer
-encoding, keep-alive, header parsing, redirects, timeouts, connection pooling.
-Pair it with TLS and the whole outbound-integration surface (Stripe, R2, Sentry)
+`examples/http-service` had already served itself over a live loopback
+socket, so the socket half was proven. The port adds the protocol: RFC 9112
+body framing (with the smuggling shapes refused), chunked transfer encoding
+both ways, keep-alive on the server, header parsing with injection refused
+on the way out, redirects with the RFC's method changes, bounded timeouts,
+and name resolution through `dns`. Client-side connection pooling is the
+one item left; `http::message::message_end` is what it loops on. Pair it
+with TLS and the whole outbound-integration surface (Stripe, R2, Sentry)
 becomes reachable.
 
 ### 4. FastAPI-equivalent routing + validation — replaces `fastapi` + `pydantic`
@@ -96,7 +106,7 @@ Achievable on v0 as it stands, in rough order of value-per-effort.
 
 | Port | Replaces | Notes |
 |---|---|---|
-| **Redis client** | `redis` | RESP protocol is trivially simple over TCP; the natural next port after `tuolang-celery`, which currently models the broker rather than speaking to one. |
+| **Redis client** — ✅ done | `redis` | RESP2 over TCP, spec'd against bytes a real server sent; the transport `tuolang-celery` lacked, which still models the broker in memory until its message envelope is written over this client. |
 | **Structured logging + Sentry** | `sentry-sdk` | Needs only JSON + HTTP. Error capture, breadcrumbs, envelope format. |
 | **JWT / JOSE** | (part of your auth) | HMAC-SHA256 already exists — HS256 is nearly free today. RS256 waits on TLS-era RSA. |
 | **S3 client** | `boto3` | You only use Cloudflare R2. SigV4 signing is pure HMAC-SHA256 — already available. A tiny, targeted client beats all of boto3. |
@@ -129,9 +139,11 @@ Be honest about these rather than half-porting them.
 
 1. ✅ **DNS** — small, unblocks name resolution, proves the UDP primitives.
 2. ✅ **Argon2** — small, self-contained, RFC test vectors, real security value.
-3. **Redis client** — makes `tuolang-celery` talk to a real broker. **Next.**
-4. **HTTP/1.1** — the backbone of everything outbound and inbound.
-5. **TLS 1.3** — the big one; unlocks every external integration at once.
+3. ✅ **Redis client** — the transport `tuolang-celery` needs to talk to a real broker.
+4. ✅ **HTTP/1.1** — the backbone of everything outbound and inbound.
+5. ◐ **TLS 1.3** — the client is done on the catalog's profile; **next** is
+   P-256 ECDSA and X.509 chain validation, which is what makes it reach
+   Stripe, R2, and Sentry.
 6. **Router + validation**, then **query layer** — the application framework.
 
 Tiers 2 and 3 fall out largely for free once 4 and 5 exist.

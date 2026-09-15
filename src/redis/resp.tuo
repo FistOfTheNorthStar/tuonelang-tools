@@ -1,0 +1,840 @@
+// redis::resp — the Redis Serialization Protocol, version 2.
+//
+// Everything a Redis client says is one RESP array of bulk strings, and
+// everything it hears back is one of five reply types: a simple string
+// (`+OK`), an error (`-ERR ...`), an integer (`:42`), a bulk string
+// (`$5\r\nhello`), or an array of replies (`*3\r\n...`), the last two of which
+// can also be null (`$-1`, `*-1`). Every element is terminated by `\r\n`,
+// and a bulk string carries its byte length up front so that its payload
+// may contain anything — including `\r\n`. That length prefix is what makes
+// the protocol binary-safe, and it is what this module is careful to honour.
+//
+// THE REPLY IS A FLAT ARENA, not a tree. Arrays nest, but v0 refuses
+// recursive types, so a reply is parsed into a flat node list in preorder —
+// the same shape `std::json` uses — and each node records its kind, its
+// value or length, where its payload starts in the raw bytes, and its
+// parent. The text of a node is never copied out during parsing; `text_of`
+// slices the raw buffer on demand.
+//
+// PARSING REPORTS WHAT IT NEEDS. A reply arrives over a socket one read at a
+// time, so `parse` distinguishes *incomplete* — with a lower bound on how
+// many more bytes would help, exact for a bulk payload — from *malformed*.
+// `needed` is the one-value summary the effect layer loops on, and being
+// pure it is spec'd against the server's own reply bytes below.
+//
+// CORRECTNESS IS EXTERNALLY DEFINED. Every reply fixture in the specs is the
+// literal byte string a Redis 7.4 server sent back over a socket on
+// 2026-09-14, captured with a raw client — not this module's own output.
+
+module redis::resp;
+
+/// The kind of a `+` simple-string node.
+///
+/// # Example
+/// ```tuo
+/// let k = redis::resp::kind_simple(); // 0
+/// ```
+pub fn kind_simple() -> Int {
+    0
+}
+
+/// The kind of a `-` error node.
+///
+/// # Example
+/// ```tuo
+/// let k = redis::resp::kind_error(); // 1
+/// ```
+pub fn kind_error() -> Int {
+    1
+}
+
+/// The kind of a `:` integer node.
+///
+/// # Example
+/// ```tuo
+/// let k = redis::resp::kind_integer(); // 2
+/// ```
+pub fn kind_integer() -> Int {
+    2
+}
+
+/// The kind of a `$` bulk-string node.
+///
+/// # Example
+/// ```tuo
+/// let k = redis::resp::kind_bulk(); // 3
+/// ```
+pub fn kind_bulk() -> Int {
+    3
+}
+
+/// The kind of a `*` array node.
+///
+/// # Example
+/// ```tuo
+/// let k = redis::resp::kind_array(); // 4
+/// ```
+pub fn kind_array() -> Int {
+    4
+}
+
+/// The kind of a null node — a `$-1` (no such key) or a `*-1` (a blocking
+/// pop that timed out). Both mean "nothing", and a client treats them alike.
+///
+/// # Example
+/// ```tuo
+/// let k = redis::resp::kind_null(); // 5
+/// ```
+pub fn kind_null() -> Int {
+    5
+}
+
+/// `parse` outcome: the buffer holds one complete reply.
+///
+/// # Example
+/// ```tuo
+/// let s = redis::resp::status_complete(); // 0
+/// ```
+pub fn status_complete() -> Int {
+    0
+}
+
+/// `parse` outcome: the buffer holds a valid prefix of a reply.
+///
+/// # Example
+/// ```tuo
+/// let s = redis::resp::status_incomplete(); // 1
+/// ```
+pub fn status_incomplete() -> Int {
+    1
+}
+
+/// `parse` outcome: the buffer cannot be a RESP reply.
+///
+/// # Example
+/// ```tuo
+/// let s = redis::resp::status_malformed(); // 2
+/// ```
+pub fn status_malformed() -> Int {
+    2
+}
+
+/// A parsed reply. `nodes` holds four `Int`s per node — kind, value, start,
+/// parent — in preorder, so node 0 is the root and an array's elements
+/// follow it. `value` is the integer of a `:` node, the byte length of a
+/// bulk, simple, or error payload, or the element count of an array;
+/// `start` is the byte offset of the payload in the raw reply.
+struct Reply {
+    status: Int,
+    need: Int,
+    end: Int,
+    nodes: Array[Int],
+}
+
+/// The number of `Int`s each node occupies in `nodes`.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::resp::stride(); // 4
+/// ```
+pub fn stride() -> Int {
+    4
+}
+
+/// The index of the root node.
+///
+/// # Example
+/// ```tuo
+/// let r = redis::resp::root(); // 0
+/// ```
+pub fn root() -> Int {
+    0
+}
+
+// ----------------------------------------------------------------------------
+// Encoding: a command is an array of bulk strings.
+// ----------------------------------------------------------------------------
+
+/// Append the bytes of `piece` to `out`.
+fn push_str(mut out: String, in piece: Str) {
+    let n = std::str::len(piece);
+    var i = 0;
+    while i < n {
+        std::string::push_byte(out, std::str::byte_at(piece, i));
+        i = i + 1;
+    }
+}
+
+/// Append `\r\n`.
+fn push_crlf(mut out: String) {
+    std::string::push_byte(out, 13);
+    std::string::push_byte(out, 10);
+}
+
+/// Append one bulk string: `$<len>\r\n<bytes>\r\n`.
+///
+/// # Example
+/// ```tuo
+/// redis::resp::push_bulk(out, "hello"); // $5\r\nhello\r\n
+/// ```
+pub fn push_bulk(mut out: String, in piece: Str) {
+    std::string::push_byte(out, 36);
+    std::str::push_int(out, std::str::len(piece));
+    push_crlf(out);
+    push_str(out, piece);
+    push_crlf(out);
+}
+
+/// Encode `args` as one command: `*<n>\r\n` followed by each argument as a
+/// bulk string. Every argument is sent with its length, so a key or value
+/// may hold spaces, `\r\n`, or any byte at all.
+///
+/// # Example
+/// ```tuo
+/// var args = std::array::empty();
+/// redis::resp::push_arg(args, "SET");
+/// redis::resp::push_arg(args, "k");
+/// redis::resp::push_arg(args, "v");
+/// let cmd = redis::resp::encode(args); // *3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n
+/// ```
+pub fn encode(in args: Array[String]) -> String {
+    var out = std::string::empty();
+    std::string::push_byte(out, 42);
+    std::str::push_int(out, std::array::len(args));
+    push_crlf(out);
+    let n = std::array::len(args);
+    var i = 0;
+    while i < n {
+        let piece = std::array::get(args, i);
+        push_bulk(out, std::string::as_str(piece));
+        i = i + 1;
+    }
+    out
+}
+
+/// Append an owned copy of `piece` to an argument list.
+///
+/// # Example
+/// ```tuo
+/// redis::resp::push_arg(args, "GET");
+/// ```
+pub fn push_arg(mut args: Array[String], in piece: Str) {
+    std::array::push(args, std::string::from_str(piece));
+}
+
+/// Append the decimal text of `n` to an argument list — a TTL, a count, a
+/// database index.
+///
+/// # Example
+/// ```tuo
+/// redis::resp::push_int_arg(args, 100); // "100"
+/// ```
+pub fn push_int_arg(mut args: Array[String], take n: Int) {
+    std::array::push(args, std::str::to_string(n));
+}
+
+// ----------------------------------------------------------------------------
+// Decoding.
+// ----------------------------------------------------------------------------
+
+/// The offset of the `\r` of the first `\r\n` at or after `at`, or `-1`
+/// when the buffer ends first.
+///
+/// # Example
+/// ```tuo
+/// let e = redis::resp::line_end("+OK\r\n", 0); // 3
+/// ```
+pub fn line_end(in raw: Str, take at: Int) -> Int {
+    let n = std::str::len(raw);
+    var i = at;
+    while i + 1 < n {
+        if std::str::byte_at(raw, i) == 13 && std::str::byte_at(raw, i + 1) == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// The decimal integer spelled by bytes `from` (inclusive) to `to`
+/// (exclusive) of `raw`: an optional `-`, then one or more digits.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::resp::line_int(":-42\r\n", 1, 4); // Some(-42)
+/// ```
+pub fn line_int(in raw: Str, take from: Int, take to: Int) -> Option[Int] {
+    if to <= from {
+        return None;
+    }
+    var negative = false;
+    var i = from;
+    if std::str::byte_at(raw, i) == 45 {
+        negative = true;
+        i = i + 1;
+        if i >= to {
+            return None;
+        }
+    }
+    var value = 0;
+    while i < to {
+        let b = std::str::byte_at(raw, i);
+        if b < 48 || b > 57 {
+            return None;
+        }
+        // A length or count wider than this is not a reply; refuse rather
+        // than trap on the multiply.
+        if value > 100000000000000 {
+            return None;
+        }
+        value = value * 10 + (b - 48);
+        i = i + 1;
+    }
+    if negative {
+        return Some { value: 0 - value };
+    }
+    Some { value: value }
+}
+
+/// Record one node.
+fn push_node(mut nodes: Array[Int], take kind: Int, take value: Int, take start: Int, take parent: Int) {
+    std::array::push(nodes, kind);
+    std::array::push(nodes, value);
+    std::array::push(nodes, start);
+    std::array::push(nodes, parent);
+}
+
+/// The encoding of "incomplete, at least `need` more bytes" as a negative
+/// return from `parse_node`; `-1` alone is malformed.
+fn incomplete(take need: Int) -> Int {
+    0 - (2 + need)
+}
+
+/// Parse one reply element at `at`, appending its node (and its
+/// descendants) to `nodes` under `parent`. Returns the offset just past the
+/// element, `-1` for malformed input, or `-(2 + n)` when at least `n` more
+/// bytes are needed.
+///
+/// # Example
+/// ```tuo
+/// let next = redis::resp::parse_node("+OK\r\n", 0, 0 - 1, nodes); // 5
+/// ```
+pub fn parse_node(in raw: Str, take at: Int, take parent: Int, mut nodes: Array[Int]) -> Int {
+    let n = std::str::len(raw);
+    if at >= n {
+        return incomplete(1);
+    }
+    let t = std::str::byte_at(raw, at);
+    let end = line_end(raw, at + 1);
+    if end < 0 {
+        return incomplete(1);
+    }
+    let node = std::array::len(nodes) / stride();
+    if t == 43 {
+        push_node(nodes, kind_simple(), end - (at + 1), at + 1, parent);
+        return end + 2;
+    }
+    if t == 45 {
+        push_node(nodes, kind_error(), end - (at + 1), at + 1, parent);
+        return end + 2;
+    }
+    let number = match line_int(raw, at + 1, end) {
+        Some { value } => value,
+        None => 0 - 2,
+    };
+    if number == 0 - 2 {
+        // Not a number at all (`-2` cannot be a real length, count, or the
+        // only negative either accepts).
+        if t == 58 {
+            return 0 - 1;
+        }
+        return 0 - 1;
+    }
+    if t == 58 {
+        push_node(nodes, kind_integer(), number, at + 1, parent);
+        return end + 2;
+    }
+    if t == 36 {
+        if number == 0 - 1 {
+            push_node(nodes, kind_null(), 0 - 1, end + 2, parent);
+            return end + 2;
+        }
+        if number < 0 {
+            return 0 - 1;
+        }
+        let start = end + 2;
+        if n < start + number + 2 {
+            return incomplete(start + number + 2 - n);
+        }
+        if std::str::byte_at(raw, start + number) != 13 || std::str::byte_at(raw, start + number + 1) != 10 {
+            return 0 - 1;
+        }
+        push_node(nodes, kind_bulk(), number, start, parent);
+        return start + number + 2;
+    }
+    if t == 42 {
+        if number == 0 - 1 {
+            push_node(nodes, kind_null(), 0 - 1, end + 2, parent);
+            return end + 2;
+        }
+        if number < 0 {
+            return 0 - 1;
+        }
+        push_node(nodes, kind_array(), number, end + 2, parent);
+        var pos = end + 2;
+        var i = 0;
+        while i < number {
+            let r = parse_node(raw, pos, node, nodes);
+            if r < 0 {
+                return r;
+            }
+            pos = r;
+            i = i + 1;
+        }
+        return pos;
+    }
+    0 - 1
+}
+
+/// Parse the reply at the start of `raw`.
+///
+/// # Example
+/// ```tuo
+/// let r = redis::resp::parse("$5\r\nhello\r\n");
+/// ```
+pub fn parse(in raw: Str) -> Reply {
+    var nodes = std::array::empty();
+    let r = parse_node(raw, 0, 0 - 1, nodes);
+    if r >= 0 {
+        return Reply { status: status_complete(), need: 0, end: r, nodes: nodes };
+    }
+    if r == 0 - 1 {
+        return Reply { status: status_malformed(), need: 0, end: 0, nodes: nodes };
+    }
+    Reply { status: status_incomplete(), need: (0 - r) - 2, end: 0, nodes: nodes }
+}
+
+/// How many more bytes the reader should fetch before `raw` can hold one
+/// complete reply: `0` when it already does, `-1` when it never will, and
+/// otherwise a positive lower bound — exact for a bulk payload, one for a
+/// line whose length is not yet known.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::resp::needed("$5\r\nhel"); // 4: "lo\r\n"
+/// ```
+pub fn needed(in raw: Str) -> Int {
+    let r = parse(raw);
+    if r.status == status_complete() {
+        return 0;
+    }
+    if r.status == status_malformed() {
+        return 0 - 1;
+    }
+    r.need
+}
+
+// ----------------------------------------------------------------------------
+// Reading a parsed reply.
+// ----------------------------------------------------------------------------
+
+/// Whether `r` is a complete reply.
+///
+/// # Example
+/// ```tuo
+/// let ok = redis::resp::is_complete(redis::resp::parse("+OK\r\n")); // true
+/// ```
+pub fn is_complete(in r: Reply) -> Bool {
+    r.status == status_complete()
+}
+
+/// The number of bytes the reply occupied — where the next pipelined reply
+/// would begin.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::resp::end_of(redis::resp::parse("+OK\r\n")); // 5
+/// ```
+pub fn end_of(in r: Reply) -> Int {
+    r.end
+}
+
+/// The number of nodes in `r`.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::resp::node_count(redis::resp::parse("*2\r\n:1\r\n:2\r\n")); // 3
+/// ```
+pub fn node_count(in r: Reply) -> Int {
+    std::array::len(r.nodes) / stride()
+}
+
+fn field(in r: Reply, take node: Int, take which: Int) -> Int {
+    if node < 0 || node >= node_count(r) {
+        return 0 - 1;
+    }
+    std::array::get(r.nodes, node * stride() + which)
+}
+
+/// The kind of `node`, or `-1` for no such node.
+///
+/// # Example
+/// ```tuo
+/// let k = redis::resp::kind_of(reply, 0);
+/// ```
+pub fn kind_of(in r: Reply, take node: Int) -> Int {
+    field(r, node, 0)
+}
+
+/// The integer of a `:` node, the payload length of a text node, or the
+/// element count of an array.
+///
+/// # Example
+/// ```tuo
+/// let n = redis::resp::int_of(redis::resp::parse(":42\r\n"), 0); // 42
+/// ```
+pub fn int_of(in r: Reply, take node: Int) -> Int {
+    field(r, node, 1)
+}
+
+/// The byte offset of `node`'s payload in the raw reply.
+///
+/// # Example
+/// ```tuo
+/// let s = redis::resp::start_of(redis::resp::parse("$5\r\nhello\r\n"), 0); // 4
+/// ```
+pub fn start_of(in r: Reply, take node: Int) -> Int {
+    field(r, node, 2)
+}
+
+/// The parent of `node`, or `-1` for the root.
+///
+/// # Example
+/// ```tuo
+/// let p = redis::resp::parent_of(reply, 1); // 0
+/// ```
+pub fn parent_of(in r: Reply, take node: Int) -> Int {
+    field(r, node, 3)
+}
+
+/// Whether `node` is a null bulk or null array.
+///
+/// # Example
+/// ```tuo
+/// let gone = redis::resp::is_null(redis::resp::parse("$-1\r\n"), 0); // true
+/// ```
+pub fn is_null(in r: Reply, take node: Int) -> Bool {
+    kind_of(r, node) == kind_null()
+}
+
+/// Whether `node` is an error reply.
+///
+/// # Example
+/// ```tuo
+/// let bad = redis::resp::is_error(redis::resp::parse("-ERR x\r\n"), 0); // true
+/// ```
+pub fn is_error(in r: Reply, take node: Int) -> Bool {
+    kind_of(r, node) == kind_error()
+}
+
+/// The text of a simple, error, or bulk `node` — a copy of its bytes from
+/// `raw`, the buffer `r` was parsed from. Empty for any other kind.
+///
+/// # Example
+/// ```tuo
+/// let raw = "$5\r\nhello\r\n";
+/// let t = redis::resp::text_of(redis::resp::parse(raw), raw, 0); // "hello"
+/// ```
+pub fn text_of(in r: Reply, in raw: Str, take node: Int) -> String {
+    var out = std::string::empty();
+    let kind = kind_of(r, node);
+    if kind != kind_simple() && kind != kind_error() && kind != kind_bulk() {
+        return out;
+    }
+    let start = start_of(r, node);
+    let len = int_of(r, node);
+    if start < 0 || len < 0 || start + len > std::str::len(raw) {
+        return out;
+    }
+    var i = 0;
+    while i < len {
+        std::string::push_byte(out, std::str::byte_at(raw, start + i));
+        i = i + 1;
+    }
+    out
+}
+
+/// Whether `r`'s root is the simple string `OK`.
+///
+/// # Example
+/// ```tuo
+/// let ok = redis::resp::is_ok(redis::resp::parse("+OK\r\n"), "+OK\r\n"); // true
+/// ```
+pub fn is_ok(in r: Reply, in raw: Str) -> Bool {
+    if kind_of(r, root()) != kind_simple() {
+        return false;
+    }
+    let text = text_of(r, raw, root());
+    std::string::as_str(text) == "OK"
+}
+
+/// The `i`th element of array `node`, or `-1` when there is none.
+///
+/// Elements follow their array in preorder, so this walks forward counting
+/// the nodes whose parent is `node` — nested arrays' own elements have a
+/// different parent and are skipped.
+///
+/// # Example
+/// ```tuo
+/// let second = redis::resp::child_at(reply, 0, 1);
+/// ```
+pub fn child_at(in r: Reply, take node: Int, take i: Int) -> Int {
+    if kind_of(r, node) != kind_array() || i < 0 {
+        return 0 - 1;
+    }
+    let n = node_count(r);
+    var seen = 0;
+    var k = node + 1;
+    while k < n {
+        if parent_of(r, k) == node {
+            if seen == i {
+                return k;
+            }
+            seen = seen + 1;
+        }
+        k = k + 1;
+    }
+    0 - 1
+}
+
+/// The text of element `i` of the root array — the common shape of a
+/// `LRANGE`, `BRPOP`, or `SMEMBERS` reply. Empty when there is no such
+/// element or it is not text.
+///
+/// # Example
+/// ```tuo
+/// let raw = "*2\r\n$1\r\na\r\n$1\r\nb\r\n";
+/// let b = redis::resp::element_text(redis::resp::parse(raw), raw, 1); // "b"
+/// ```
+pub fn element_text(in r: Reply, in raw: Str, take i: Int) -> String {
+    let node = child_at(r, root(), i);
+    if node < 0 {
+        return std::string::empty();
+    }
+    text_of(r, raw, node)
+}
+
+// ----------------------------------------------------------------------------
+// Spec fixtures: byte strings a Redis 7.4 server sent on 2026-09-14.
+// ----------------------------------------------------------------------------
+
+fn encoded(take which: Int) -> String {
+    var args = std::array::empty();
+    if which == 0 {
+        push_arg(args, "PING");
+    }
+    if which == 1 {
+        push_arg(args, "SET");
+        push_arg(args, "k");
+        push_arg(args, "v");
+    }
+    if which == 2 {
+        push_arg(args, "SET");
+        push_arg(args, "k");
+        push_arg(args, "");
+    }
+    if which == 3 {
+        push_arg(args, "SET");
+        push_arg(args, "k");
+        push_arg(args, "a\r\nb");
+    }
+    if which == 4 {
+        push_arg(args, "EXPIRE");
+        push_arg(args, "k");
+        push_int_arg(args, 100);
+    }
+    encode(args)
+}
+
+fn int_or(take o: Option[Int], take fallback: Int) -> Int {
+    match o {
+        Some { value } => value,
+        None => fallback,
+    }
+}
+
+fn absent(take o: Option[Int]) -> Bool {
+    match o {
+        Some { value } => value != value,
+        None => true,
+    }
+}
+
+fn status_of(in raw: Str) -> Int {
+    let r = parse(raw);
+    r.status
+}
+
+fn root_kind(in raw: Str) -> Int {
+    kind_of(parse(raw), root())
+}
+
+fn root_int(in raw: Str) -> Int {
+    int_of(parse(raw), root())
+}
+
+fn root_text(in raw: Str) -> String {
+    text_of(parse(raw), raw, root())
+}
+
+fn node_kind(in raw: Str, take node: Int) -> Int {
+    kind_of(parse(raw), node)
+}
+
+fn nested_exec() -> Str {
+    "*2\r\n+OK\r\n*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"
+}
+
+fn exec_inner_text(take i: Int) -> String {
+    let r = parse(nested_exec());
+    let inner = child_at(r, root(), 1);
+    let node = child_at(r, inner, i);
+    text_of(r, nested_exec(), node)
+}
+
+fn exec_inner_count() -> Int {
+    let r = parse(nested_exec());
+    int_of(r, child_at(r, root(), 1))
+}
+
+spec encode {
+    then std::string::as_str(encoded(0)) == "*1\r\n$4\r\nPING\r\n";
+    then std::string::as_str(encoded(1)) == "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+    // An empty argument is a zero-length bulk, not an absent one.
+    then std::string::as_str(encoded(2)) == "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$0\r\n\r\n";
+    // A value containing the terminator is sent by length, untouched.
+    then std::string::as_str(encoded(3)) == "*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$4\r\na\r\nb\r\n";
+    then std::string::as_str(encoded(4)) == "*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$3\r\n100\r\n";
+}
+
+spec line_end {
+    then line_end("+OK\r\n", 0) == 3;
+    then line_end("+OK\r\n", 1) == 3;
+    then line_end("+OK\r", 0) == 0 - 1;
+    then line_end("", 0) == 0 - 1;
+    then line_end("\r\n", 0) == 0;
+}
+
+spec line_int {
+    then int_or(line_int(":42\r\n", 1, 3), 0 - 9) == 42;
+    then int_or(line_int(":-1\r\n", 1, 3), 0 - 9) == 0 - 1;
+    then int_or(line_int(":0\r\n", 1, 2), 0 - 9) == 0;
+    then absent(line_int(":\r\n", 1, 1));
+    then absent(line_int(":-\r\n", 1, 2));
+    then absent(line_int(":4x\r\n", 1, 3));
+    then absent(line_int(":+4\r\n", 1, 3));
+}
+
+spec parse {
+    // `SELECT 15` and `PING`.
+    then root_kind("+OK\r\n") == kind_simple();
+    then std::string::as_str(root_text("+OK\r\n")) == "OK";
+    then is_ok(parse("+OK\r\n"), "+OK\r\n");
+    then std::string::as_str(root_text("+PONG\r\n")) == "PONG";
+    then is_ok(parse("+PONG\r\n"), "+PONG\r\n") == false;
+    then end_of(parse("+OK\r\n")) == 5;
+    // `DEL` of absent keys, `INCR`, `EXPIRE`, `TTL`.
+    then root_kind(":0\r\n") == kind_integer();
+    then root_int(":0\r\n") == 0;
+    then root_int(":42\r\n") == 42;
+    then root_int(":100\r\n") == 100;
+    // `GET` of a missing key is null; `GET` of a value is a bulk of that length.
+    then root_kind("$-1\r\n") == kind_null();
+    then is_null(parse("$-1\r\n"), root());
+    then root_kind("$5\r\nhello\r\n") == kind_bulk();
+    then std::string::as_str(root_text("$5\r\nhello\r\n")) == "hello";
+    then end_of(parse("$5\r\nhello\r\n")) == 11;
+    // A bulk holding the terminator is read by its length, not to the next
+    // `\r\n`.
+    then std::string::as_str(root_text("$12\r\nline1\r\nline2\r\n")) == "line1\r\nline2";
+    then root_int("$12\r\nline1\r\nline2\r\n") == 12;
+    // The empty value is a bulk of length zero.
+    then root_kind("$0\r\n\r\n") == kind_bulk();
+    then std::string::as_str(root_text("$0\r\n\r\n")) == "";
+    // `INCR` of a non-number.
+    then root_kind("-ERR value is not an integer or out of range\r\n") == kind_error();
+    then is_error(parse("-ERR value is not an integer or out of range\r\n"), root());
+    then std::string::as_str(root_text("-ERR value is not an integer or out of range\r\n")) == "ERR value is not an integer or out of range";
+    // `LRANGE` of three elements, of none, and `BRPOP` that timed out.
+    then root_kind("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n") == kind_array();
+    then root_int("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n") == 3;
+    then node_count(parse("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")) == 4;
+    then std::string::as_str(element_text(parse("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"), "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n", 2)) == "c";
+    then std::string::as_str(element_text(parse("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n"), "*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n", 3)) == "";
+    then end_of(parse("*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n")) == 25;
+    then root_kind("*0\r\n") == kind_array();
+    then root_int("*0\r\n") == 0;
+    then node_count(parse("*0\r\n")) == 1;
+    then root_kind("*-1\r\n") == kind_null();
+    // `EXEC` of a `SET` and an `LRANGE`: an array holding a simple string and
+    // an array.
+    then node_count(parse(nested_exec())) == 6;
+    then node_kind(nested_exec(), 1) == kind_simple();
+    then node_kind(nested_exec(), 2) == kind_array();
+    then exec_inner_count() == 3;
+    then std::string::as_str(exec_inner_text(0)) == "a";
+    then std::string::as_str(exec_inner_text(2)) == "c";
+    // Only the first reply of a pipelined buffer is parsed; `end_of` says
+    // where the next begins.
+    then end_of(parse("+OK\r\n+PONG\r\n")) == 5;
+    then node_count(parse("+OK\r\n+PONG\r\n")) == 1;
+}
+
+spec needed {
+    // Nothing yet, or a line not yet terminated: one more byte, at least.
+    then needed("") == 1;
+    then needed("+OK") == 1;
+    then needed("+OK\r") == 1;
+    then needed("$5") == 1;
+    // A bulk whose length is known: exactly the bytes still missing.
+    then needed("$5\r\n") == 7;
+    then needed("$5\r\nhel") == 4;
+    then needed("$5\r\nhello\r") == 1;
+    then needed("$5\r\nhello\r\n") == 0;
+    // An array short of an element.
+    then needed("*2\r\n$1\r\na\r\n") == 1;
+    then needed("*2\r\n$1\r\na\r\n$1\r\nb\r\n") == 0;
+    then needed("*0\r\n") == 0;
+    then needed("$-1\r\n") == 0;
+    // Malformed: an unknown type byte, a non-numeric length, a bulk whose
+    // payload is not followed by the terminator, a negative count.
+    then needed("?x\r\n") == 0 - 1;
+    then needed("$abc\r\n") == 0 - 1;
+    then needed("$5\r\nhelloXX") == 0 - 1;
+    then needed("*-2\r\n") == 0 - 1;
+    then needed(":4x\r\n") == 0 - 1;
+    then status_of("$abc\r\n") == status_malformed();
+    then status_of("$5\r\nhel") == status_incomplete();
+}
+
+spec child_at {
+    then child_at(parse("*0\r\n"), 0, 0) == 0 - 1;
+    then child_at(parse("+OK\r\n"), 0, 0) == 0 - 1;
+    then child_at(parse("*2\r\n:1\r\n:2\r\n"), 0, 0) == 1;
+    then child_at(parse("*2\r\n:1\r\n:2\r\n"), 0, 1) == 2;
+    then child_at(parse("*2\r\n:1\r\n:2\r\n"), 0, 2) == 0 - 1;
+    then parent_of(parse("*2\r\n:1\r\n:2\r\n"), 2) == 0;
+    then parent_of(parse("*2\r\n:1\r\n:2\r\n"), 0) == 0 - 1;
+    // In the nested EXEC reply, element 1 of the root is the inner array,
+    // whose own elements are not counted as the root's.
+    then child_at(parse(nested_exec()), 0, 1) == 2;
+    then child_at(parse(nested_exec()), 0, 2) == 0 - 1;
+    then child_at(parse(nested_exec()), 2, 0) == 3;
+}
+
+spec text_of {
+    then std::string::as_str(text_of(parse(":1\r\n"), ":1\r\n", 0)) == "";
+    then std::string::as_str(text_of(parse("*0\r\n"), "*0\r\n", 0)) == "";
+    then std::string::as_str(text_of(parse("+OK\r\n"), "+OK\r\n", 5)) == "";
+    then kind_of(parse("+OK\r\n"), 5) == 0 - 1;
+}

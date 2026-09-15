@@ -1,0 +1,190 @@
+// examples/tls — the TLS 1.3 client against the catalog's server, in one process.
+//
+// `tls::handshake` is pure and proven against RFC 8448; `tls::client` is
+// the effect boundary. This program is what shows the two complete a real
+// handshake with a real peer: it listens on an ephemeral loopback port,
+// forks a server built on `std::tls` (the catalog's own stack, the one
+// OpenSSL clients complete handshakes with) and a client built on
+// `http::client::get_pinned`, and joins them.
+//
+//     tuo run examples/tls.tuo src/tls/*.tuo src/http/*.tuo src/dns/*.tuo src/std_*.tuo
+//
+// It also asserts natively the curve operations the spec sandbox cannot
+// afford: that RFC 8448's private keys produce its public keys and its
+// shared secret, that the test seed produces the test certificate's key,
+// and that a real Ed25519 signature verifies while a wrong key's does not.
+// No network beyond loopback. One line per check; exit is the failure count.
+
+module tls_check;
+
+fn timeout() -> Int {
+    5000
+}
+
+/// The client opens exactly this many TLS connections.
+fn connections_expected() -> Int {
+    2
+}
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn hex_is(in data: Array[Int], in expected: Str) -> Bool {
+    std::string::as_str(tls::fixture::hex(data)) == expected
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+// --- The server: the catalog's std::tls, serving one HTTP response per connection ---
+
+/// Serve one accepted connection: handshake as the server, answer one
+/// request, close. Returns 1 if a request was answered.
+fn serve_one(take fd: Int) -> Int {
+    let record = tls::client::read_record(fd, timeout());
+    if std::array::len(record) == 0 || std::tls::byte_at(record, 0) != std::tls::content_handshake() {
+        let _ = std::net::close(fd);
+        return 0;
+    }
+    let client_hello = std::tls::slice(record, 5, std::array::len(record) - 5);
+    let server_private = std::crypto::nonce(32);
+    let server_random = std::crypto::nonce(32);
+    let certificate = tls::fixture::bytes(tls::fixture::test_certificate());
+    let content = std::tls::signing_content(client_hello, std::x25519::public_key(server_private), server_random, certificate);
+    let signature = std::ed25519::sign(tls::fixture::bytes(tls::fixture::test_seed()), content);
+    let handshake = std::tls::server_handshake(client_hello, server_private, certificate, signature, server_random);
+    if !handshake.ok {
+        let _ = std::net::close(fd);
+        return 0;
+    }
+    let _ = std::rt::write(fd, std::string::as_str(std::crypto::str_of_bytes(handshake.flight)));
+    var connection = std::tls::connect(fd, handshake);
+    // Read the request until the blank line that ends its head. The
+    // catalog's `Connection` is not `pub`, so this loop lives here rather
+    // than in a helper that would have to name the type.
+    var last = std::array::empty();
+    var reading = true;
+    var seen = false;
+    while reading {
+        let b = std::tls::read_byte(connection, timeout());
+        if b < 0 {
+            reading = false;
+        } else {
+            std::array::push(last, b);
+            let n = std::array::len(last);
+            if n >= 4 && std::array::get(last, n - 4) == 13 && std::array::get(last, n - 3) == 10 && std::array::get(last, n - 2) == 13 && std::array::get(last, n - 1) == 10 {
+                seen = true;
+                reading = false;
+            }
+            if n > 65536 {
+                reading = false;
+            }
+        }
+    }
+    if !seen {
+        let _ = std::net::close(fd);
+        return 0;
+    }
+    let _ = std::tls::write_all(connection, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 14\r\nConnection: close\r\n\r\nhello over tls");
+    let _ = std::tls::close_notify(connection);
+    let _ = std::net::close(fd);
+    1
+}
+
+fn server_role(take listener: Int) -> Int {
+    var answered = 0;
+    var accepted = 0;
+    while accepted < connections_expected() {
+        let fd = std::net::accept_timeout(listener, timeout());
+        if fd < 0 {
+            return answered;
+        }
+        answered = answered + serve_one(fd);
+        accepted = accepted + 1;
+    }
+    answered
+}
+
+// --- The client -----------------------------------------------------------------------
+
+fn base(take port: Int, in path: Str) -> String {
+    var u = std::string::from_str("https://127.0.0.1:");
+    std::str::push_int(u, port);
+    std::str::push(u, path);
+    u
+}
+
+fn client_role(take port: Int) -> Int {
+    var failed = 0;
+    let t = timeout();
+    let pin = tls::fixture::bytes(tls::fixture::test_public_key());
+
+    // The curve operations the sandbox cannot afford, asserted natively.
+    failed = failed + report("RFC 8448's client private key produces its public key", hex_is(std::x25519::public_key(tls::fixture::bytes(tls::fixture::client_private())), tls::fixture::client_public()));
+    failed = failed + report("RFC 8448's server private key produces its public key", hex_is(std::x25519::public_key(tls::fixture::bytes(tls::fixture::server_private())), tls::fixture::server_public()));
+    failed = failed + report("X25519 of the RFC's keys is the RFC's shared secret", hex_is(tls::handshake::shared_secret(tls::fixture::bytes(tls::fixture::client_private()), tls::fixture::bytes(tls::fixture::server_public())), tls::fixture::shared_secret()));
+    failed = failed + report("the test seed produces the test certificate's key", hex_is(std::ed25519::public_key(tls::fixture::bytes(tls::fixture::test_seed())), tls::fixture::test_public_key()));
+    let hash = tls::fixture::bytes(tls::fixture::hello_hash());
+    let der = tls::fixture::bytes(tls::fixture::test_certificate());
+    let good = std::ed25519::sign(tls::fixture::bytes(tls::fixture::test_seed()), std::tls::certificate_verify_content(hash));
+    failed = failed + report("a CertificateVerify signature by the test key verifies", tls::handshake::signature_valid(der, hash, good));
+    let other = std::ed25519::sign(std::hkdf::zeros(32), std::tls::certificate_verify_content(hash));
+    failed = failed + report("a signature by another key does not", !tls::handshake::signature_valid(der, hash, other));
+    failed = failed + report("nor does the right signature over another transcript", !tls::handshake::signature_valid(der, tls::fixture::bytes(tls::fixture::finished_hash()), good));
+
+    // 1 connection: a full handshake and an HTTPS request against std::tls.
+    let r1 = http::client::get_pinned(std::string::as_str(base(port, "/")), pin, t);
+    failed = failed + report("GET https://127.0.0.1/ with the pinned key is 200", r1.ok && r1.status == 200);
+    failed = failed + report("the body arrived through the record layer intact", text_is(r1.body, "hello over tls"));
+
+    // 1 connection: the same server, a different pin — refused after the
+    // certificate arrives, before any Finished is sent.
+    let r2 = http::client::get_pinned(std::string::as_str(base(port, "/")), std::hkdf::zeros(32), t);
+    failed = failed + report("the same server with a wrong pin is refused", !r2.ok);
+
+    // 0 connections: no pin at all is refused before connecting.
+    let r3 = http::client::get(std::string::as_str(base(port, "/")), t);
+    failed = failed + report("https:// without a pin is refused without connecting", !r3.ok);
+
+    failed
+}
+
+fn role(take task: Int) -> Int {
+    if task >= 100000 {
+        return client_role(task - 100000);
+    }
+    server_role(task)
+}
+
+fn main() -> Int {
+    let listener = std::net::listen(0);
+    if listener < 0 {
+        let _ = std::rt::write(1, "FAIL  listen on an ephemeral loopback port\n");
+        return 1;
+    }
+    let port = std::net::bound_port(listener);
+    var tasks = std::array::empty();
+    std::array::push(tasks, listener);
+    std::array::push(tasks, port + 100000);
+    let results = std::sync::par_map(role, tasks, 2);
+    let answered = std::array::get(results, 0);
+    var failed = std::array::get(results, 1);
+    failed = failed + report("the server answered exactly the one request that authenticated", answered == 1);
+    let _ = std::net::close(listener);
+    failed
+}

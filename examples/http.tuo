@@ -1,0 +1,228 @@
+// examples/http — the HTTP/1.1 server and client, each proving the other.
+//
+// `http::message` and `http::url` are pure and proven by specs against
+// bytes real servers sent. `http::server` and `http::client` are the effect
+// boundaries, and this program is what shows they agree with each other
+// and with the specs: it listens on an ephemeral loopback port, then forks
+// two workers with `std::sync::par_map` — one serving, one fetching — and
+// joins them. The client's checks and the server's request count are the
+// two results.
+//
+//     tuo run examples/http.tuo src/http/*.tuo src/dns/*.tuo src/std_str.tuo src/std_net.tuo src/std_bits.tuo src/std_sync.tuo
+//
+// No network beyond loopback; nothing outside this process is touched. It
+// prints one line per check and exits with the number that failed.
+
+module http_check;
+
+fn timeout() -> Int {
+    5000
+}
+
+/// Every connection the client below opens, so the server knows when to
+/// stop accepting.
+fn connections_expected() -> Int {
+    18
+}
+
+/// Every request the handler should answer across those connections.
+fn requests_expected() -> Int {
+    18
+}
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+/// A 200 000-byte body: larger than any socket buffer, so both directions
+/// are framed by `Content-Length` across many reads.
+fn big_body() -> String {
+    var v = std::string::empty();
+    var i = 0;
+    while i < 200000 {
+        std::string::push_byte(v, 97 + (i % 26));
+        i = i + 1;
+    }
+    v
+}
+
+// --- The server's handler ------------------------------------------------------
+
+/// The routes the client exercises. Everything it knows arrives in `raw`.
+fn handle(in raw: String) -> String {
+    let view = std::string::as_str(raw);
+    let head = http::message::parse_head(view, false);
+    let method = std::string::as_str(head.method);
+    let target = std::string::as_str(head.target);
+    if method == "GET" && target == "/" {
+        return http::message::response(200, "Content-Type: text/plain\r\n", "hello");
+    }
+    if target == "/chunked" {
+        return http::message::chunked_response(200, "Content-Type: text/plain\r\n", "0123456789abcdefghij", 7);
+    }
+    if target == "/redirect" {
+        return http::message::response(302, "Location: /\r\n", "");
+    }
+    if target == "/see-other" {
+        return http::message::response(303, "Location: /\r\n", "");
+    }
+    if target == "/loop" {
+        return http::message::response(302, "Location: /loop\r\n", "");
+    }
+    if method == "POST" && target == "/echo" {
+        let body = http::message::body(view, false, false);
+        return http::message::response(200, "Content-Type: application/octet-stream\r\n", std::string::as_str(body));
+    }
+    if target == "/close" {
+        return http::message::response(200, "Connection: close\r\n", "bye");
+    }
+    http::message::response(404, "Content-Type: text/plain\r\n", "not found")
+}
+
+fn server_role(take listener: Int) -> Int {
+    http::server::serve(listener, handle, connections_expected(), timeout())
+}
+
+// --- The client's checks ------------------------------------------------------------
+
+fn base(take port: Int, in path: Str) -> String {
+    var u = std::string::from_str("http://127.0.0.1:");
+    std::str::push_int(u, port);
+    std::str::push(u, path);
+    u
+}
+
+fn client_role(take port: Int) -> Int {
+    var failed = 0;
+    let t = timeout();
+
+    // 1 connection: a plain GET.
+    let r1 = http::client::get(std::string::as_str(base(port, "/")), t);
+    failed = failed + report("GET / is 200 with the body the handler wrote", r1.ok && r1.status == 200 && text_is(r1.body, "hello"));
+    failed = failed + report("its Content-Type header is read back", text_is(http::client::header(r1, "content-type"), "text/plain"));
+
+    // 1: a chunked response, dechunked.
+    let r2 = http::client::get(std::string::as_str(base(port, "/chunked")), t);
+    failed = failed + report("a chunked response is dechunked", r2.ok && text_is(r2.body, "0123456789abcdefghij"));
+
+    // 1: a large body each way.
+    let big = big_body();
+    let r3 = http::client::post(std::string::as_str(base(port, "/echo")), "application/octet-stream", std::string::as_str(big), t);
+    failed = failed + report("a 200 000-byte POST body is echoed back intact", r3.ok && r3.status == 200 && std::string::as_str(r3.body) == std::string::as_str(big));
+
+    // 1: a 404 is a response, not a failure.
+    let r4 = http::client::get(std::string::as_str(base(port, "/missing")), t);
+    failed = failed + report("GET /missing is 404, and ok", r4.ok && r4.status == 404);
+
+    // 2: a redirect is followed to the root.
+    let r5 = http::client::get(std::string::as_str(base(port, "/redirect")), t);
+    failed = failed + report("302 to / is followed and lands on 200 hello", r5.ok && r5.status == 200 && text_is(r5.body, "hello"));
+
+    // 2: 303 turns the POST into a GET of /.
+    let r6 = http::client::post(std::string::as_str(base(port, "/see-other")), "text/plain", "x", t);
+    failed = failed + report("303 after POST is followed as GET", r6.ok && r6.status == 200 && text_is(r6.body, "hello"));
+
+    // 6: a redirect loop stops after max_redirects and returns the 302.
+    let r7 = http::client::get(std::string::as_str(base(port, "/loop")), t);
+    failed = failed + report("a redirect loop ends after max_redirects with the last 302", r7.ok && r7.status == 302);
+
+    // 1: fetch_once does not follow.
+    let r8 = http::client::fetch_once("GET", std::string::as_str(base(port, "/redirect")), "", "", t, "1.1.1.1");
+    // The header is bound before the `&&` chain: a temporary owned value in
+    // the right operand of `&&` is refused by native codegen today (see
+    // docs/COMPILER-FINDING.md).
+    let location = http::client::header(r8, "Location");
+    failed = failed + report("fetch_once returns the 302 itself", r8.ok && r8.status == 302 && text_is(location, "/"));
+
+    // 1 connection, 3 requests: keep-alive with two pipelined requests, then
+    // one the handler closes.
+    let fd = std::net::connect_timeout("127.0.0.1", port, t);
+    failed = failed + report("a raw connection opens", fd >= 0);
+    if fd >= 0 {
+        var two = http::message::request("GET", "/", "127.0.0.1", "", "");
+        let second = http::message::request("GET", "/missing", "127.0.0.1", "", "");
+        std::str::push(two, std::string::as_str(second));
+        let _ = std::rt::write_string(fd, two);
+        let a = http::client::parse_response(http::client::read_response(fd, false, t), false);
+        let b = http::client::parse_response(http::client::read_response(fd, false, t), false);
+        failed = failed + report("two pipelined requests on one connection get two responses in order", a.ok && a.status == 200 && b.ok && b.status == 404);
+        let _ = std::rt::write_string(fd, http::message::request("GET", "/close", "127.0.0.1", "", ""));
+        let c = http::client::parse_response(http::client::read_response(fd, false, t), false);
+        failed = failed + report("a third request on the same connection is answered", c.ok && text_is(c.body, "bye"));
+        let after = std::net::read_byte_timeout(fd, t);
+        failed = failed + report("after Connection: close the server closes", after == 0 - 1);
+        let _ = std::net::close(fd);
+    }
+
+    // 1: a malformed request is refused with 400 by the server itself.
+    let fd2 = std::net::connect_timeout("127.0.0.1", port, t);
+    if fd2 >= 0 {
+        let _ = std::rt::write(fd2, "GARBAGE\r\n\r\n");
+        let d = http::client::parse_response(http::client::read_response(fd2, false, t), false);
+        failed = failed + report("a malformed request line is answered 400", d.ok && d.status == 400);
+        let _ = std::net::close(fd2);
+    } else {
+        failed = failed + 1;
+    }
+
+    // 1: the smuggling shape is refused before any handler runs.
+    let fd3 = std::net::connect_timeout("127.0.0.1", port, t);
+    if fd3 >= 0 {
+        let _ = std::rt::write(fd3, "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n");
+        let e = http::client::parse_response(http::client::read_response(fd3, false, t), false);
+        failed = failed + report("Content-Length with Transfer-Encoding is answered 400", e.ok && e.status == 400);
+        let _ = std::net::close(fd3);
+    } else {
+        failed = failed + 1;
+    }
+
+    // Pure refusals: no connection.
+    let r9 = http::client::get("https://127.0.0.1/", t);
+    failed = failed + report("https:// is refused without connecting", !r9.ok);
+    let r10 = http::client::get("not a url", t);
+    failed = failed + report("a malformed URL is refused", !r10.ok);
+
+    failed
+}
+
+fn role(take task: Int) -> Int {
+    if task >= 100000 {
+        return client_role(task - 100000);
+    }
+    server_role(task)
+}
+
+fn main() -> Int {
+    let listener = std::net::listen(0);
+    if listener < 0 {
+        let _ = std::rt::write(1, "FAIL  listen on an ephemeral loopback port\n");
+        return 1;
+    }
+    let port = std::net::bound_port(listener);
+    var tasks = std::array::empty();
+    std::array::push(tasks, listener);
+    std::array::push(tasks, port + 100000);
+    let results = std::sync::par_map(role, tasks, 2);
+    let answered = std::array::get(results, 0);
+    var failed = std::array::get(results, 1);
+    failed = failed + report("the server answered every request the client sent", answered == requests_expected());
+    let _ = std::net::close(listener);
+    failed
+}

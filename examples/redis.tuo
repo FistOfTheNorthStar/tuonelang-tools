@@ -1,0 +1,189 @@
+// examples/redis — the live oracle for the Redis client.
+//
+// `redis::resp`, `redis::command`, and `redis::url` are pure and proven by
+// specs against bytes a real server sent. `redis::client` is the effect
+// boundary, and this program is what shows the two agree: every reply shape
+// the specs parse from a fixture is here produced by a running Redis 7 and
+// read back through the client, framed by `redis::resp::needed` one socket
+// read at a time.
+//
+//     tuo run examples/redis.tuo src/redis/*.tuo src/std_str.tuo src/std_net.tuo
+//
+// It talks to 127.0.0.1:6380 — the port `shallowflaws/docker/docker-compose.yml`
+// publishes its Redis on — in database 15, under keys prefixed
+// `tuo:oracle:`, which it deletes before and after. It prints one line per
+// check and exits with the number that failed.
+
+module redis_check;
+
+fn host() -> Str {
+    "127.0.0.1"
+}
+
+fn port() -> Int {
+    6380
+}
+
+fn timeout() -> Int {
+    3000
+}
+
+fn scratch_db() -> Int {
+    15
+}
+
+/// A key under this program's prefix.
+fn key(in suffix: Str) -> String {
+    var k = std::string::empty();
+    std::str::push(k, "tuo:oracle:");
+    std::str::push(k, suffix);
+    k
+}
+
+/// Print one result line and report 0 on success or 1 on failure.
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+/// A 5000-byte value: long enough that no single socket read returns it
+/// whole, so the parser's exact byte count is what frames it.
+fn big_value() -> String {
+    var v = std::string::empty();
+    var i = 0;
+    while i < 5000 {
+        std::string::push_byte(v, 97 + (i % 26));
+        i = i + 1;
+    }
+    v
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+/// Delete every key this program uses.
+fn cleanup(take fd: Int) {
+    let k = key("k");
+    let list = key("list");
+    let hash = key("hash");
+    let _ = redis::client::del(fd, std::string::as_str(k), timeout());
+    let _ = redis::client::del(fd, std::string::as_str(list), timeout());
+    let _ = redis::client::del(fd, std::string::as_str(hash), timeout());
+}
+
+/// The number of elements in the `EXEC` reply, or -1 if it is not an array.
+fn exec_count(in raw: String) -> Int {
+    let view = std::string::as_str(raw);
+    let r = redis::resp::parse(view);
+    if !redis::resp::is_complete(r) {
+        return 0 - 1;
+    }
+    if redis::resp::kind_of(r, redis::resp::root()) != redis::resp::kind_array() {
+        return 0 - 1;
+    }
+    redis::resp::int_of(r, redis::resp::root())
+}
+
+fn main() -> Int {
+    var failed = 0;
+    let t = timeout();
+
+    let fd = redis::client::open(host(), port(), t);
+    failed = failed + report("connect to 127.0.0.1:6380 (shallowflaws docker redis)", redis::client::is_open(fd));
+    if !redis::client::is_open(fd) {
+        let _ = std::rt::write(1, "      is `docker compose up -d` running in shallowflaws/docker?\n");
+        return failed;
+    }
+
+    failed = failed + report("PING replies PONG", redis::client::ping(fd, t));
+    failed = failed + report("SELECT 15 replies OK", redis::client::select(fd, scratch_db(), t));
+    cleanup(fd);
+
+    let k = key("k");
+    let ks = std::string::as_str(k);
+    let list = key("list");
+    let ls = std::string::as_str(list);
+    let hash = key("hash");
+    let hs = std::string::as_str(hash);
+    let missing = key("missing");
+    let ms = std::string::as_str(missing);
+
+    // Strings.
+    failed = failed + report("GET of a missing key is null", redis::client::reply_is_null(redis::client::call(fd, redis::command::get(ms), t)));
+    failed = failed + report("SET replies OK", redis::client::set(fd, ks, "hello", t));
+    failed = failed + report("GET returns what SET stored", text_is(redis::client::get_or(fd, ks, "?", t), "hello"));
+    let _ = redis::client::set(fd, ks, "line1\r\nline2", t);
+    failed = failed + report("a value containing CRLF survives the round trip", text_is(redis::client::get_or(fd, ks, "?", t), "line1\r\nline2"));
+    let _ = redis::client::set(fd, ks, "", t);
+    failed = failed + report("an empty value is empty, not the fallback", text_is(redis::client::get_or(fd, ks, "?", t), ""));
+    let big = big_value();
+    let _ = redis::client::set(fd, ks, std::string::as_str(big), t);
+    let back = redis::client::get_or(fd, ks, "?", t);
+    failed = failed + report("a 5000-byte value is framed by length across reads", std::string::as_str(back) == std::string::as_str(big));
+    failed = failed + report("DEL of an existing key replies 1", redis::client::del(fd, ks, t) == 1);
+    failed = failed + report("INCR of a missing key replies 1", redis::client::incr(fd, ks, t) == 1);
+    failed = failed + report("INCRBY 41 replies 42", redis::client::reply_int(redis::client::call(fd, redis::command::incrby(ks, 41), t)) == 42);
+    failed = failed + report("EXPIRE replies 1", redis::client::reply_int(redis::client::call(fd, redis::command::expire(ks, 100), t)) == 1);
+    let ttl = redis::client::reply_int(redis::client::call(fd, redis::command::ttl(ks), t));
+    failed = failed + report("TTL is within the expiry just set", ttl > 0 && ttl <= 100);
+    failed = failed + report("LPUSH onto a string key is a WRONGTYPE error reply", redis::client::reply_is_error(redis::client::call(fd, redis::command::lpush(ks, "x"), t)));
+
+    // Lists: the queue shape.
+    let _ = redis::client::call(fd, redis::command::rpush(ls, "a"), t);
+    let _ = redis::client::call(fd, redis::command::rpush(ls, "b"), t);
+    let depth = redis::client::reply_int(redis::client::call(fd, redis::command::rpush(ls, "c"), t));
+    failed = failed + report("three RPUSHes leave a depth of 3", depth == 3);
+    let all = redis::client::lrange_all(fd, ls, t);
+    failed = failed + report("LRANGE 0 -1 returns three elements", std::array::len(all) == 3);
+    let third = std::array::get(all, 2);
+    failed = failed + report("the third element is c", text_is(third, "c"));
+    failed = failed + report("LLEN agrees", redis::client::llen(fd, ls, t) == 3);
+    failed = failed + report("RPOP returns c", text_is(redis::client::rpop_or(fd, ls, "?", t), "c"));
+    failed = failed + report("BRPOP on an empty list times out to the fallback", text_is(redis::client::brpop_or(fd, ms, 1, "?", t), "?"));
+    failed = failed + report("BRPOP on a populated list returns its tail", text_is(redis::client::brpop_or(fd, ls, 1, "?", t), "b"));
+    failed = failed + report("one element remains", redis::client::llen(fd, ls, t) == 1);
+    failed = failed + report("LPOP of a missing key is null", redis::client::reply_is_null(redis::client::call(fd, redis::command::lpop(ms), t)));
+
+    // Hashes.
+    failed = failed + report("HSET of a new field replies 1", redis::client::reply_int(redis::client::call(fd, redis::command::hset(hs, "f", "v"), t)) == 1);
+    failed = failed + report("HGET returns the field", text_is(redis::client::reply_text(redis::client::call(fd, redis::command::hget(hs, "f"), t), "?"), "v"));
+
+    // A transaction: the nested reply.
+    failed = failed + report("MULTI replies OK", redis::client::reply_is_ok(redis::client::call(fd, redis::command::multi(), t)));
+    failed = failed + report("a queued command replies QUEUED", text_is(redis::client::reply_text(redis::client::call(fd, redis::command::set(ks, "1"), t), "?"), "QUEUED"));
+    let _ = redis::client::call(fd, redis::command::lrange(ls, 0, 0 - 1), t);
+    failed = failed + report("EXEC replies an array of two replies", exec_count(redis::client::call(fd, redis::command::exec(), t)) == 2);
+
+    // An unknown command is an error reply, not a broken connection.
+    var bogus = std::array::empty();
+    redis::resp::push_arg(bogus, "NOSUCHCOMMAND");
+    failed = failed + report("an unknown command is an error reply", redis::client::reply_is_error(redis::client::call(fd, redis::command::custom(bogus), t)));
+    failed = failed + report("the connection is still usable afterwards", redis::client::ping(fd, t));
+
+    // URLs.
+    let fd2 = redis::client::open_url("redis://127.0.0.1:6380/15", t);
+    failed = failed + report("open_url on the docker URL connects and selects", redis::client::is_open(fd2) && redis::client::ping(fd2, t));
+    if redis::client::is_open(fd2) {
+        let _ = redis::client::close(fd2);
+    }
+    failed = failed + report("open_url refuses rediss:// (no TLS in v0)", !redis::client::is_open(redis::client::open_url("rediss://127.0.0.1:6380/0", t)));
+    failed = failed + report("open_url refuses a malformed URL", !redis::client::is_open(redis::client::open_url("localhost:6380", t)));
+
+    cleanup(fd);
+    failed = failed + report("QUIT replies OK", redis::client::reply_is_ok(redis::client::call(fd, redis::command::quit(), t)));
+    let _ = redis::client::close(fd);
+    failed
+}

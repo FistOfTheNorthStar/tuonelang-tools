@@ -1,0 +1,291 @@
+// redis::url — `redis://[user][:password@]host[:port][/db]`.
+//
+// The backend never names its Redis by host and port; it reads `REDIS_URL`
+// (or `CELERY_BROKER_URL`) and hands the string to redis-py, which takes it
+// apart. `app/config.py` assembles the same shape when only the parts are
+// set. This module is that taking-apart, so a tuonelang program can be
+// configured the way the Python one is — and so that the one case v0
+// cannot serve, `rediss://` (TLS), is refused at parse time rather than at
+// the first byte of a handshake it cannot perform.
+//
+// THE HOST IS NOT RESOLVED HERE. `std::net::connect` takes a numeric
+// address, and this crate's own `dns::resolver` is what turns a name into
+// one; `parse` only separates the fields. `localhost` is a name.
+
+module redis::url;
+
+/// The parts of a Redis URL. `ok` is false when `text` was not one; `tls`
+/// is true for `rediss://`, which this crate cannot connect to.
+struct Url {
+    ok: Bool,
+    tls: Bool,
+    user: String,
+    password: String,
+    host: String,
+    port: Int,
+    db: Int,
+}
+
+/// The port a URL without one means.
+///
+/// # Example
+/// ```tuo
+/// let p = redis::url::default_port(); // 6379
+/// ```
+pub fn default_port() -> Int {
+    6379
+}
+
+/// A `Url` with `ok` false.
+///
+/// # Example
+/// ```tuo
+/// let u = redis::url::malformed();
+/// ```
+pub fn malformed() -> Url {
+    Url { ok: false, tls: false, user: std::string::empty(), password: std::string::empty(), host: std::string::empty(), port: 0, db: 0 }
+}
+
+/// The bytes of `s` from `from` (inclusive) to `to` (exclusive).
+fn slice(in s: Str, take from: Int, take to: Int) -> String {
+    var out = std::string::empty();
+    var i = from;
+    while i < to {
+        std::string::push_byte(out, std::str::byte_at(s, i));
+        i = i + 1;
+    }
+    out
+}
+
+/// The decimal integer `s` spells, or `-1` if it does not spell a
+/// non-negative one.
+fn decimal(in s: Str) -> Int {
+    let n = std::str::len(s);
+    if n == 0 {
+        return 0 - 1;
+    }
+    var value = 0;
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(s, i);
+        if b < 48 || b > 57 {
+            return 0 - 1;
+        }
+        if value > 100000000 {
+            return 0 - 1;
+        }
+        value = value * 10 + (b - 48);
+        i = i + 1;
+    }
+    value
+}
+
+/// The offset of the first `needle` byte in `s` at or after `from`, or
+/// `-1`.
+fn index_from(in s: Str, take needle: Int, take from: Int) -> Int {
+    let n = std::str::len(s);
+    var i = from;
+    while i < n {
+        if std::str::byte_at(s, i) == needle {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// The offset of the last `needle` byte in `s`, or `-1`.
+fn last_index(in s: Str, take needle: Int) -> Int {
+    var i = std::str::len(s) - 1;
+    while i >= 0 {
+        if std::str::byte_at(s, i) == needle {
+            return i;
+        }
+        i = i - 1;
+    }
+    0 - 1
+}
+
+/// Parse `text`. Accepted: `redis://` or `rediss://`; an optional
+/// `user:password@` or `:password@` (the last `@` splits it, so a password
+/// may contain `@`); a host, either bare or `[...]` for IPv6; an optional
+/// `:port`; an optional `/db`, a non-negative integer. Anything else, or an
+/// empty host, is not ok.
+///
+/// # Example
+/// ```tuo
+/// let u = redis::url::parse("redis://localhost:6380/0");
+/// ```
+pub fn parse(in text: Str) -> Url {
+    var tls = false;
+    var rest_from = 0;
+    if std::str::starts_with(text, "redis://") {
+        rest_from = 8;
+    } else {
+        if std::str::starts_with(text, "rediss://") {
+            tls = true;
+            rest_from = 9;
+        } else {
+            return malformed();
+        }
+    }
+    let n = std::str::len(text);
+    // The path, if any, starts at the first `/` after the scheme.
+    let slash = index_from(text, 47, rest_from);
+    let authority_end = if slash < 0 {
+        n
+    } else {
+        slash
+    };
+    var db = 0;
+    if slash >= 0 {
+        let path = slice(text, slash + 1, n);
+        if std::str::len(std::string::as_str(path)) > 0 {
+            db = decimal(std::string::as_str(path));
+            if db < 0 {
+                return malformed();
+            }
+        }
+    }
+    // Userinfo, if any, ends at the last `@` before the path.
+    var user = std::string::empty();
+    var password = std::string::empty();
+    var host_from = rest_from;
+    let authority = slice(text, rest_from, authority_end);
+    let at = last_index(std::string::as_str(authority), 64);
+    if at >= 0 {
+        let userinfo = slice(text, rest_from, rest_from + at);
+        let colon = index_from(std::string::as_str(userinfo), 58, 0);
+        if colon < 0 {
+            user = slice(std::string::as_str(userinfo), 0, std::str::len(std::string::as_str(userinfo)));
+        } else {
+            user = slice(std::string::as_str(userinfo), 0, colon);
+            password = slice(std::string::as_str(userinfo), colon + 1, std::str::len(std::string::as_str(userinfo)));
+        }
+        host_from = rest_from + at + 1;
+    }
+    // Host and port.
+    var host = std::string::empty();
+    var port = default_port();
+    var port_from = 0 - 1;
+    if host_from < authority_end && std::str::byte_at(text, host_from) == 91 {
+        let close = index_from(text, 93, host_from);
+        if close < 0 || close >= authority_end {
+            return malformed();
+        }
+        host = slice(text, host_from + 1, close);
+        if close + 1 < authority_end {
+            if std::str::byte_at(text, close + 1) != 58 {
+                return malformed();
+            }
+            port_from = close + 2;
+        }
+    } else {
+        let colon = index_from(text, 58, host_from);
+        if colon >= 0 && colon < authority_end {
+            host = slice(text, host_from, colon);
+            port_from = colon + 1;
+        } else {
+            host = slice(text, host_from, authority_end);
+        }
+    }
+    if port_from >= 0 {
+        let port_text = slice(text, port_from, authority_end);
+        port = decimal(std::string::as_str(port_text));
+        if port < 0 || port > 65535 {
+            return malformed();
+        }
+    }
+    if std::str::len(std::string::as_str(host)) == 0 {
+        return malformed();
+    }
+    Url { ok: true, tls: tls, user: user, password: password, host: host, port: port, db: db }
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers: observations of a parsed URL, one scalar at a time.
+// ----------------------------------------------------------------------------
+
+fn ok_of(in text: Str) -> Bool {
+    let u = parse(text);
+    u.ok
+}
+
+fn tls_of(in text: Str) -> Bool {
+    let u = parse(text);
+    u.tls
+}
+
+fn host_of(in text: Str) -> String {
+    let u = parse(text);
+    u.host
+}
+
+fn port_of(in text: Str) -> Int {
+    let u = parse(text);
+    u.port
+}
+
+fn db_of(in text: Str) -> Int {
+    let u = parse(text);
+    u.db
+}
+
+fn user_of(in text: Str) -> String {
+    let u = parse(text);
+    u.user
+}
+
+fn password_of(in text: Str) -> String {
+    let u = parse(text);
+    u.password
+}
+
+spec parse {
+    // `.env.example`: REDIS_URL=redis://localhost:6380/0
+    then ok_of("redis://localhost:6380/0");
+    then std::string::as_str(host_of("redis://localhost:6380/0")) == "localhost";
+    then port_of("redis://localhost:6380/0") == 6380;
+    then db_of("redis://localhost:6380/0") == 0;
+    then tls_of("redis://localhost:6380/0") == false;
+    then std::string::as_str(password_of("redis://localhost:6380/0")) == "";
+    // `app/config.py`'s fallback shape and `celery_config.py`'s default.
+    then std::string::as_str(host_of("redis://127.0.0.1:6379/3")) == "127.0.0.1";
+    then db_of("redis://127.0.0.1:6379/3") == 3;
+    then db_of("redis://localhost:6379/0") == 0;
+    // `.env.analysis.example`: rediss://rekryon:<password>@<host>:6379/0 —
+    // parsed, and flagged as TLS this crate cannot open.
+    then ok_of("rediss://rekryon:s3cret@valkey.example.net:6379/0");
+    then tls_of("rediss://rekryon:s3cret@valkey.example.net:6379/0");
+    then std::string::as_str(user_of("rediss://rekryon:s3cret@valkey.example.net:6379/0")) == "rekryon";
+    then std::string::as_str(password_of("rediss://rekryon:s3cret@valkey.example.net:6379/0")) == "s3cret";
+    then std::string::as_str(host_of("rediss://rekryon:s3cret@valkey.example.net:6379/0")) == "valkey.example.net";
+    // Defaults: no port is 6379, no path or a bare `/` is db 0.
+    then port_of("redis://10.0.0.5") == 6379;
+    then db_of("redis://10.0.0.5") == 0;
+    then db_of("redis://10.0.0.5/") == 0;
+    then std::string::as_str(host_of("redis://10.0.0.5/")) == "10.0.0.5";
+    // The password-only form, and a password containing `@`.
+    then std::string::as_str(password_of("redis://:pw@10.0.0.5:6379/1")) == "pw";
+    then std::string::as_str(user_of("redis://:pw@10.0.0.5:6379/1")) == "";
+    then std::string::as_str(password_of("redis://:p@ss@10.0.0.5")) == "p@ss";
+    then std::string::as_str(host_of("redis://:p@ss@10.0.0.5")) == "10.0.0.5";
+    // IPv6 in brackets, with and without a port.
+    then std::string::as_str(host_of("redis://[::1]:6380/2")) == "::1";
+    then port_of("redis://[::1]:6380/2") == 6380;
+    then db_of("redis://[::1]:6380/2") == 2;
+    then std::string::as_str(host_of("redis://[::1]")) == "::1";
+    then port_of("redis://[::1]") == 6379;
+    // Refused: wrong scheme, empty host, non-numeric port or db, port out of
+    // range, an unterminated bracket.
+    then ok_of("http://localhost:6379") == false;
+    then ok_of("localhost:6379") == false;
+    then ok_of("redis://") == false;
+    then ok_of("redis://:6379") == false;
+    then ok_of("redis://localhost:abc") == false;
+    then ok_of("redis://localhost:6379/x") == false;
+    then ok_of("redis://localhost:99999") == false;
+    then ok_of("redis://[::1") == false;
+    then ok_of("redis://[::1]x") == false;
+    then ok_of("") == false;
+}

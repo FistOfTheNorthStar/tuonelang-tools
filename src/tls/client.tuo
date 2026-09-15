@@ -1,0 +1,378 @@
+// tls::client — the effect boundary: a TLS 1.3 client session on a socket.
+//
+// `tls::handshake` decides everything; this module moves the bytes and
+// keeps the two counters. The sequence is RFC 8446 §2's, from the client's
+// chair: send a ClientHello, read a ServerHello, derive the handshake keys,
+// read the server's encrypted flight and check it, send a Finished, derive
+// the application keys, and then carry a byte stream over records until
+// one side sends close_notify.
+//
+// EVERY CHECK IS FATAL AND SILENT ON THE WIRE. A server whose Finished does
+// not verify, whose certificate is not the pinned key, or whose
+// CertificateVerify does not sign the transcript gets no application data
+// and no explanation: the session is `ok` false, and the caller closes the
+// socket. RFC 8446 has alerts for each case, but a client that explains
+// why it refused is a client that leaks what it checks.
+//
+// SEQUENCE NUMBERS LIVE IN THE SESSION. A TLS 1.3 nonce is the IV xor the
+// record sequence (§5.3), so a repeated number reuses a nonce and breaks
+// the AEAD; the counters are fields a caller cannot reach, and each key
+// epoch restarts at zero exactly where the RFC says — the client's
+// Finished is record 0 under the handshake key, the first application
+// record is record 0 under the application key.
+//
+// WHAT IS NOT HERE: HelloRetryRequest, resumption, 0-RTT, key updates,
+// client certificates, and any certificate check beyond the pinned key.
+// Each is refused rather than faked. Post-handshake NewSessionTicket
+// records — which OpenSSL sends by default — are read and discarded.
+//
+// Effectful, so no specs on the socket paths (`R0007`); pinned by
+// `examples/tls.tuo` against the catalog's own server in-process and
+// `examples/tls_openssl.tuo` against OpenSSL.
+
+module tls::client;
+
+/// A client session. `ok` is false when the handshake failed; `live`
+/// becomes false when the peer closes, alerts, or sends a record that
+/// does not authenticate — after which nothing more is read or written.
+pub struct Session {
+    ok: Bool,
+    live: Bool,
+    socket: Int,
+    read_key: Array[Int],
+    read_iv: Array[Int],
+    write_key: Array[Int],
+    write_iv: Array[Int],
+    read_sequence: Int,
+    write_sequence: Int,
+    pending: Array[Int],
+    pending_offset: Int,
+    peer_certificate: Array[Int],
+}
+
+/// A session with `ok` false.
+///
+/// # Example
+/// ```tuo
+/// let s = tls::client::failed(fd);
+/// ```
+pub fn failed(take socket: Int) -> Session {
+    Session { ok: false, live: false, socket: socket, read_key: std::array::empty(), read_iv: std::array::empty(), write_key: std::array::empty(), write_iv: std::array::empty(), read_sequence: 0, write_sequence: 0, pending: std::array::empty(), pending_offset: 0, peer_certificate: std::array::empty() }
+}
+
+/// The timeout `handshake` uses for each read when the caller has no
+/// better idea.
+///
+/// # Example
+/// ```tuo
+/// let ms = tls::client::default_timeout_ms(); // 10000
+/// ```
+pub fn default_timeout_ms() -> Int {
+    10000
+}
+
+// --- Records over the socket ------------------------------------------------------
+
+/// EFFECT: read one TLS record — header and body — from `socket`, or an
+/// empty array on timeout, close, host error, or an over-long length.
+///
+/// # Example
+/// ```tuo
+/// let record = tls::client::read_record(fd, 10000);
+/// ```
+pub fn read_record(take socket: Int, take timeout_ms: Int) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < 5 {
+        let b = std::net::read_byte_timeout(socket, timeout_ms);
+        if b < 0 {
+            return std::array::empty();
+        }
+        std::array::push(out, b);
+        i = i + 1;
+    }
+    let length = std::tls::u16_at(out, 3);
+    if length < 0 || length > std::tls::max_ciphertext() {
+        return std::array::empty();
+    }
+    var j = 0;
+    while j < length {
+        let b = std::net::read_byte_timeout(socket, timeout_ms);
+        if b < 0 {
+            return std::array::empty();
+        }
+        std::array::push(out, b);
+        j = j + 1;
+    }
+    out
+}
+
+/// EFFECT: write `record` to `socket`. Returns the byte count or a negative
+/// value.
+///
+/// # Example
+/// ```tuo
+/// let n = tls::client::write_record(fd, record);
+/// ```
+pub fn write_record(take socket: Int, in record: Array[Int]) -> Int {
+    std::rt::write(socket, std::string::as_str(std::crypto::str_of_bytes(record)))
+}
+
+/// The plaintext of an encrypted `record` under `key`/`iv` at `sequence`,
+/// or empty when it does not authenticate.
+fn opened(in key: Array[Int], in iv: Array[Int], take sequence: Int, in record: Array[Int]) -> Array[Int] {
+    let header = std::tls::slice(record, 0, 5);
+    let body = std::tls::slice(record, 5, std::array::len(record) - 5);
+    std::tls::opened_or_empty(key, iv, sequence, header, body)
+}
+
+// --- The handshake ------------------------------------------------------------------
+
+/// EFFECT: perform the client side of a TLS 1.3 handshake on a connected
+/// `socket`, naming `server_name` in SNI (empty to omit it) and trusting
+/// only a certificate whose Ed25519 key is `pinned`. Returns a session
+/// that is `ok` when every check passed.
+///
+/// Randomness — the ClientHello random and the ephemeral X25519 key — comes
+/// from the platform CSPRNG through `std::crypto::nonce`.
+///
+/// # Example
+/// ```tuo
+/// let session = tls::client::handshake(fd, "localhost", pinned_key, 10000);
+/// ```
+pub fn handshake(take socket: Int, in server_name: Str, in pinned: Array[Int], take timeout_ms: Int) -> Session {
+    let private = std::crypto::nonce(32);
+    let random = std::crypto::nonce(32);
+    handshake_with(socket, server_name, pinned, private, random, timeout_ms)
+}
+
+/// EFFECT: `handshake` with the client's ephemeral private key and random
+/// supplied — for an oracle that wants a reproducible ClientHello.
+///
+/// # Example
+/// ```tuo
+/// let session = tls::client::handshake_with(fd, "localhost", pinned_key, private, random, 10000);
+/// ```
+pub fn handshake_with(take socket: Int, in server_name: Str, in pinned: Array[Int], in private: Array[Int], in random: Array[Int], take timeout_ms: Int) -> Session {
+    // 1. ClientHello, in the clear.
+    let share = std::x25519::public_key(private);
+    let hello = tls::handshake::client_hello(random, share, server_name);
+    if write_record(socket, std::tls::frame_record(std::tls::content_handshake(), hello)) < 0 {
+        return failed(socket);
+    }
+
+    // 2. ServerHello, in the clear. One message per record here.
+    let hello_record = read_record(socket, timeout_ms);
+    if std::array::len(hello_record) == 0 || std::tls::byte_at(hello_record, 0) != std::tls::content_handshake() {
+        return failed(socket);
+    }
+    let server_hello = std::tls::slice(hello_record, 5, std::array::len(hello_record) - 5);
+    let parsed = tls::handshake::parse_server_hello(server_hello);
+    if !tls::handshake::accepted(parsed) {
+        return failed(socket);
+    }
+
+    // 3. Handshake keys.
+    let shared = tls::handshake::shared_secret(private, parsed.share);
+    var transcript = tls::handshake::joined(hello, server_hello);
+    let hello_hash = tls::handshake::transcript_hash(transcript);
+    let server_secret = std::tls::server_handshake_secret(shared, hello_hash);
+    let client_secret = std::tls::client_handshake_secret(shared, hello_hash);
+    let read_key = std::hkdf::traffic_key(server_secret);
+    let read_iv = std::hkdf::traffic_iv(server_secret);
+
+    // 4. The server's encrypted flight, in as many records as it takes;
+    //    change_cipher_spec records are middlebox noise and skipped.
+    var flight_bytes = std::array::empty();
+    var sequence = 0;
+    var need = tls::handshake::flight_needed(flight_bytes);
+    while need > 0 {
+        let record = read_record(socket, timeout_ms);
+        if std::array::len(record) == 0 {
+            return failed(socket);
+        }
+        let outer = std::tls::byte_at(record, 0);
+        if outer != std::tls::content_change_cipher_spec() {
+            if outer != std::tls::content_application_data() {
+                return failed(socket);
+            }
+            let plaintext = opened(read_key, read_iv, sequence, record);
+            if std::array::len(plaintext) == 0 {
+                return failed(socket);
+            }
+            sequence = sequence + 1;
+            if std::tls::inner_content_type(plaintext) != std::tls::content_handshake() {
+                return failed(socket);
+            }
+            let _ = std::tls::push_bytes(flight_bytes, std::tls::inner_payload(plaintext));
+        }
+        need = tls::handshake::flight_needed(flight_bytes);
+    }
+    let flight = tls::handshake::parse_flight(flight_bytes);
+    if !flight.ok {
+        return failed(socket);
+    }
+
+    // 5. What the client verifies: the key is the pinned one, the
+    //    CertificateVerify signs the transcript through the Certificate, and
+    //    the Finished MACs the transcript through the CertificateVerify.
+    let der = tls::handshake::certificate_der(flight.certificate);
+    if !tls::handshake::key_matches(der, pinned) {
+        return failed(socket);
+    }
+    let _ = std::tls::push_bytes(transcript, flight.encrypted_extensions);
+    let _ = std::tls::push_bytes(transcript, flight.certificate);
+    let certificate_hash = tls::handshake::transcript_hash(transcript);
+    if !tls::handshake::signature_valid(der, certificate_hash, tls::handshake::certificate_verify_signature(flight.certificate_verify)) {
+        return failed(socket);
+    }
+    let _ = std::tls::push_bytes(transcript, flight.certificate_verify);
+    let verify_hash = tls::handshake::transcript_hash(transcript);
+    if !tls::handshake::finished_valid(server_secret, verify_hash, tls::handshake::finished_verify_data(flight.finished)) {
+        return failed(socket);
+    }
+    let _ = std::tls::push_bytes(transcript, flight.finished);
+    let finished_hash = tls::handshake::transcript_hash(transcript);
+
+    // 6. The client's Finished: record 0 under the client handshake key.
+    let finished = std::tls::finished_message(client_secret, finished_hash);
+    let sealed = std::tls::seal_record(std::hkdf::traffic_key(client_secret), std::hkdf::traffic_iv(client_secret), 0, std::tls::content_handshake(), finished);
+    if write_record(socket, sealed) < 0 {
+        return failed(socket);
+    }
+
+    // 7. Application keys, both epochs restarting at record 0.
+    let client_app = std::tls::client_application_secret(shared, finished_hash);
+    let server_app = std::tls::server_application_secret(shared, finished_hash);
+    Session { ok: true, live: true, socket: socket, read_key: std::hkdf::traffic_key(server_app), read_iv: std::hkdf::traffic_iv(server_app), write_key: std::hkdf::traffic_key(client_app), write_iv: std::hkdf::traffic_iv(client_app), read_sequence: 0, write_sequence: 0, pending: std::array::empty(), pending_offset: 0, peer_certificate: der }
+}
+
+// --- The byte stream --------------------------------------------------------------
+
+/// EFFECT: read and decrypt records until one carries application data,
+/// leaving its payload pending. Returns the inner content type, or `-1`
+/// when the stream has ended. Post-handshake handshake records (session
+/// tickets) are discarded; an alert or a record that fails to
+/// authenticate ends the session.
+///
+/// # Example
+/// ```tuo
+/// let kind = tls::client::fill(session, 10000);
+/// ```
+pub fn fill(mut session: Session, take timeout_ms: Int) -> Int {
+    if !session.live {
+        return 0 - 1;
+    }
+    var looking = true;
+    var kind = 0 - 1;
+    while looking {
+        let record = read_record(session.socket, timeout_ms);
+        if std::array::len(record) == 0 {
+            session.live = false;
+            return 0 - 1;
+        }
+        let outer = std::tls::byte_at(record, 0);
+        if outer == std::tls::content_change_cipher_spec() {
+            looking = true;
+        } else {
+            let plaintext = opened(session.read_key, session.read_iv, session.read_sequence, record);
+            if std::array::len(plaintext) == 0 {
+                session.live = false;
+                return 0 - 1;
+            }
+            session.read_sequence = session.read_sequence + 1;
+            kind = std::tls::inner_content_type(plaintext);
+            if kind == std::tls::content_application_data() {
+                session.pending = std::tls::inner_payload(plaintext);
+                session.pending_offset = 0;
+                looking = false;
+            } else {
+                if kind == std::tls::content_alert() {
+                    session.live = false;
+                    return 0 - 1;
+                }
+                // A NewSessionTicket, or anything else post-handshake: no
+                // application data in it, so keep reading.
+                looking = true;
+            }
+        }
+    }
+    kind
+}
+
+/// EFFECT: the next byte of application data, or `-1` when the stream has
+/// ended — the shape `std::net::read_byte_timeout` has, so a protocol
+/// reader written for a socket reads a session the same way.
+///
+/// # Example
+/// ```tuo
+/// let b = tls::client::read_byte(session, 10000);
+/// ```
+pub fn read_byte(mut session: Session, take timeout_ms: Int) -> Int {
+    if session.pending_offset < std::array::len(session.pending) {
+        let value = std::array::get(session.pending, session.pending_offset) & 255;
+        session.pending_offset = session.pending_offset + 1;
+        return value;
+    }
+    if fill(session, timeout_ms) < 0 {
+        return 0 - 1;
+    }
+    if session.pending_offset < std::array::len(session.pending) {
+        let value = std::array::get(session.pending, session.pending_offset) & 255;
+        session.pending_offset = session.pending_offset + 1;
+        return value;
+    }
+    0 - 1
+}
+
+/// EFFECT: send `text` as application data, in records of at most
+/// `max_plaintext` bytes. Returns the byte count or a negative value.
+///
+/// # Example
+/// ```tuo
+/// let n = tls::client::write_all(session, request);
+/// ```
+pub fn write_all(mut session: Session, in text: Str) -> Int {
+    if !session.live {
+        return 0 - 1;
+    }
+    let total = std::str::len(text);
+    var sent = 0;
+    while sent < total {
+        var chunk = std::array::empty();
+        var i = 0;
+        while i < std::tls::max_plaintext() && sent + i < total {
+            std::array::push(chunk, std::str::byte_at(text, sent + i));
+            i = i + 1;
+        }
+        let record = std::tls::seal_record(session.write_key, session.write_iv, session.write_sequence, std::tls::content_application_data(), chunk);
+        session.write_sequence = session.write_sequence + 1;
+        if write_record(session.socket, record) < 0 {
+            session.live = false;
+            return 0 - 1;
+        }
+        sent = sent + i;
+    }
+    sent
+}
+
+/// EFFECT: send close_notify and mark the session ended. The socket itself
+/// is the caller's to close.
+///
+/// # Example
+/// ```tuo
+/// let _ = tls::client::close(session);
+/// ```
+pub fn close(mut session: Session) -> Int {
+    if !session.live {
+        return 0;
+    }
+    var alert = std::array::empty();
+    std::array::push(alert, 1);
+    std::array::push(alert, 0);
+    let record = std::tls::seal_record(session.write_key, session.write_iv, session.write_sequence, std::tls::content_alert(), alert);
+    session.write_sequence = session.write_sequence + 1;
+    let _ = write_record(session.socket, record);
+    session.live = false;
+    0
+}

@@ -1,0 +1,785 @@
+// tls::handshake — the client half of a TLS 1.3 handshake, as pure data.
+//
+// `std::tls` is the server half: it parses a ClientHello and builds the
+// server's flight. This module is the mirror: it builds the ClientHello,
+// parses the ServerHello, walks the server's encrypted flight, and checks
+// what a client must check — the CertificateVerify signature, the Finished
+// MAC, and that the certificate's key is the one the caller trusts. Every
+// step is a function of bytes to bytes, so every step is spec'd, and the
+// socket-facing sequence in `tls::client` is a thin loop over these.
+//
+// THE PROFILE IS THE CATALOG'S: X25519, TLS_CHACHA20_POLY1305_SHA256, and
+// Ed25519 certificates. The ClientHello offers exactly that, and a server
+// choosing anything else is refused at `accepted`. That is not a general
+// web client — public servers present ECDSA or RSA certificates this crate
+// cannot yet verify — but it is a complete, checked handshake against any
+// server configured for this profile, including OpenSSL.
+//
+// TRUST IS A PINNED KEY. `std::der` decodes a certificate; nothing here
+// validates a chain, checks names, or reads validity dates. So the caller
+// supplies the Ed25519 public key it expects, and `key_matches` compares
+// the certificate's key to it in constant time. There is no "accept
+// anything" mode: an empty pin matches nothing.
+//
+// CORRECTNESS IS EXTERNALLY DEFINED. RFC 8448 prints every secret of one
+// handshake, and `tls::fixture` carries them; the specs derive the same
+// handshake, application, and Finished values from the RFC's private key
+// and messages. The record cipher differs (the RFC uses AES-GCM), so the
+// keys themselves are not comparable, but every hash, secret, IV, and
+// Finished value is, and every one is asserted.
+
+module tls::handshake;
+
+/// The one cipher suite offered and accepted: TLS_CHACHA20_POLY1305_SHA256.
+///
+/// # Example
+/// ```tuo
+/// let s = tls::handshake::suite(); // 0x1303
+/// ```
+pub fn suite() -> Int {
+    4867
+}
+
+/// The `supported_groups` extension type.
+///
+/// # Example
+/// ```tuo
+/// let t = tls::handshake::extension_supported_groups(); // 10
+/// ```
+pub fn extension_supported_groups() -> Int {
+    10
+}
+
+/// The `signature_algorithms` extension type.
+///
+/// # Example
+/// ```tuo
+/// let t = tls::handshake::extension_signature_algorithms(); // 13
+/// ```
+pub fn extension_signature_algorithms() -> Int {
+    13
+}
+
+/// The `legacy_version` every TLS 1.3 message carries: 0x0303.
+///
+/// # Example
+/// ```tuo
+/// let v = tls::handshake::legacy_version(); // 771
+/// ```
+pub fn legacy_version() -> Int {
+    771
+}
+
+/// The special ServerHello random that marks a HelloRetryRequest (RFC 8446
+/// §4.1.3): SHA-256 of "HelloRetryRequest". A client that does not
+/// support retries must recognise it rather than read a second hello.
+///
+/// # Example
+/// ```tuo
+/// let r = tls::handshake::retry_random(); // cf 21 ad 74 ...
+/// ```
+pub fn retry_random() -> Array[Int] {
+    tls::fixture::bytes("cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+}
+
+// ----------------------------------------------------------------------------
+// The ClientHello (RFC 8446 §4.1.2).
+// ----------------------------------------------------------------------------
+
+/// Append one extension: type, length, data.
+fn push_extension(mut out: Array[Int], take kind: Int, in data: Array[Int]) {
+    let _ = std::tls::push_u16(out, kind);
+    let _ = std::tls::push_u16(out, std::array::len(data));
+    let _ = std::tls::push_bytes(out, data);
+}
+
+/// The `server_name` extension data for `name`: a list of one host_name.
+///
+/// # Example
+/// ```tuo
+/// let d = tls::handshake::server_name_data("localhost");
+/// ```
+pub fn server_name_data(in name: Str) -> Array[Int] {
+    var entry = std::array::empty();
+    std::array::push(entry, 0);
+    let _ = std::tls::push_u16(entry, std::str::len(name));
+    var i = 0;
+    while i < std::str::len(name) {
+        std::array::push(entry, std::str::byte_at(name, i));
+        i = i + 1;
+    }
+    var data = std::array::empty();
+    let _ = std::tls::push_u16(data, std::array::len(entry));
+    let _ = std::tls::push_bytes(data, entry);
+    data
+}
+
+/// The ClientHello handshake message (header included) for a 32-byte
+/// `random`, the client's X25519 `key_share`, and `server_name` — which is
+/// omitted when empty, since SNI carries a host name and never an address.
+///
+/// Offers TLS 1.3 only, one suite, one group, one signature algorithm, and
+/// an empty legacy session id.
+///
+/// # Example
+/// ```tuo
+/// let hello = tls::handshake::client_hello(random, share, "localhost");
+/// ```
+pub fn client_hello(in random: Array[Int], in key_share: Array[Int], in server_name: Str) -> Array[Int] {
+    var body = std::array::empty();
+    let _ = std::tls::push_u16(body, legacy_version());
+    let _ = std::tls::push_bytes(body, random);
+    std::array::push(body, 0);
+    let _ = std::tls::push_u16(body, 2);
+    let _ = std::tls::push_u16(body, suite());
+    std::array::push(body, 1);
+    std::array::push(body, 0);
+
+    var extensions = std::array::empty();
+    if std::str::len(server_name) > 0 {
+        push_extension(extensions, std::tls::extension_server_name(), server_name_data(server_name));
+    }
+    var groups = std::array::empty();
+    let _ = std::tls::push_u16(groups, 2);
+    let _ = std::tls::push_u16(groups, std::tls::group_x25519());
+    push_extension(extensions, extension_supported_groups(), groups);
+    var algorithms = std::array::empty();
+    let _ = std::tls::push_u16(algorithms, 2);
+    let _ = std::tls::push_u16(algorithms, std::tls::signature_ed25519());
+    push_extension(extensions, extension_signature_algorithms(), algorithms);
+    var versions = std::array::empty();
+    std::array::push(versions, 2);
+    let _ = std::tls::push_u16(versions, std::tls::version_tls13());
+    push_extension(extensions, std::tls::extension_supported_versions(), versions);
+    var shares = std::array::empty();
+    let _ = std::tls::push_u16(shares, 4 + std::array::len(key_share));
+    let _ = std::tls::push_u16(shares, std::tls::group_x25519());
+    let _ = std::tls::push_u16(shares, std::array::len(key_share));
+    let _ = std::tls::push_bytes(shares, key_share);
+    push_extension(extensions, std::tls::extension_key_share(), shares);
+
+    let _ = std::tls::push_u16(body, std::array::len(extensions));
+    let _ = std::tls::push_bytes(body, extensions);
+    std::tls::wrap_handshake(std::tls::handshake_client_hello(), body)
+}
+
+// ----------------------------------------------------------------------------
+// The ServerHello (RFC 8446 §4.1.3).
+// ----------------------------------------------------------------------------
+
+/// A parsed ServerHello. `ok` is false for anything that is not a
+/// well-formed TLS 1.3 ServerHello; `retry` marks a HelloRetryRequest;
+/// `suite` is what the server chose and `share` its X25519 key share.
+struct ServerHello {
+    ok: Bool,
+    retry: Bool,
+    suite: Int,
+    share: Array[Int],
+}
+
+/// A `ServerHello` with `ok` false.
+///
+/// # Example
+/// ```tuo
+/// let h = tls::handshake::bad_server_hello();
+/// ```
+pub fn bad_server_hello() -> ServerHello {
+    ServerHello { ok: false, retry: false, suite: 0, share: std::array::empty() }
+}
+
+/// Parse a ServerHello handshake message (header included).
+///
+/// Requires: type 2, a length matching the message, legacy_version 0x0303,
+/// compression 0, a `supported_versions` extension naming TLS 1.3, and a
+/// `key_share` for X25519 of exactly 32 bytes. Other extensions are
+/// ignored. Every read is bounds-checked; a truncated message is `ok`
+/// false, never a trap.
+///
+/// # Example
+/// ```tuo
+/// let h = tls::handshake::parse_server_hello(message);
+/// ```
+pub fn parse_server_hello(in message: Array[Int]) -> ServerHello {
+    if std::tls::byte_at(message, 0) != std::tls::handshake_server_hello() {
+        return bad_server_hello();
+    }
+    let declared = std::tls::u24_at(message, 1);
+    if declared < 0 || declared != std::array::len(message) - 4 {
+        return bad_server_hello();
+    }
+    if std::tls::u16_at(message, 4) != legacy_version() {
+        return bad_server_hello();
+    }
+    let random = std::tls::slice(message, 6, 32);
+    if std::array::len(random) != 32 {
+        return bad_server_hello();
+    }
+    let retry = same_bytes(random, retry_random());
+    var p = 38;
+    let session_len = std::tls::byte_at(message, p);
+    if session_len < 0 || session_len > 32 {
+        return bad_server_hello();
+    }
+    p = p + 1 + session_len;
+    let chosen = std::tls::u16_at(message, p);
+    if chosen < 0 {
+        return bad_server_hello();
+    }
+    p = p + 2;
+    if std::tls::byte_at(message, p) != 0 {
+        return bad_server_hello();
+    }
+    p = p + 1;
+    let extensions_len = std::tls::u16_at(message, p);
+    if extensions_len < 0 {
+        return bad_server_hello();
+    }
+    p = p + 2;
+    let limit = p + extensions_len;
+    if limit != std::array::len(message) {
+        return bad_server_hello();
+    }
+    var version_ok = false;
+    var share = std::array::empty();
+    while p < limit {
+        let kind = std::tls::u16_at(message, p);
+        let len = std::tls::u16_at(message, p + 2);
+        if kind < 0 || len < 0 || p + 4 + len > limit {
+            return bad_server_hello();
+        }
+        if kind == std::tls::extension_supported_versions() {
+            if len == 2 && std::tls::u16_at(message, p + 4) == std::tls::version_tls13() {
+                version_ok = true;
+            }
+        }
+        if kind == std::tls::extension_key_share() {
+            if len == 36 && std::tls::u16_at(message, p + 4) == std::tls::group_x25519() && std::tls::u16_at(message, p + 6) == 32 {
+                share = std::tls::slice(message, p + 8, 32);
+            }
+        }
+        p = p + 4 + len;
+    }
+    if !version_ok || std::array::len(share) != 32 {
+        return bad_server_hello();
+    }
+    ServerHello { ok: true, retry: retry, suite: chosen, share: share }
+}
+
+/// Whether a parsed ServerHello is one this client can proceed with: well
+/// formed, not a retry, and the one suite it offered.
+///
+/// # Example
+/// ```tuo
+/// let go = tls::handshake::accepted(tls::handshake::parse_server_hello(message));
+/// ```
+pub fn accepted(in hello: ServerHello) -> Bool {
+    hello.ok && !hello.retry && hello.suite == suite()
+}
+
+/// Whether two byte arrays are identical. Public values only — use
+/// `std::crypto::verify` for anything secret.
+fn same_bytes(in a: Array[Int], in b: Array[Int]) -> Bool {
+    let n = std::array::len(a);
+    if n != std::array::len(b) {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        if std::array::get(a, i) != std::array::get(b, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// ----------------------------------------------------------------------------
+// The server's encrypted flight (RFC 8446 §4.3–4.4).
+// ----------------------------------------------------------------------------
+
+/// The four messages of the server's flight after the ServerHello, each a
+/// whole handshake message with its header. `ok` is false unless exactly
+/// these four arrive in order and account for every byte.
+struct Flight {
+    ok: Bool,
+    encrypted_extensions: Array[Int],
+    certificate: Array[Int],
+    certificate_verify: Array[Int],
+    finished: Array[Int],
+}
+
+/// A `Flight` with `ok` false.
+///
+/// # Example
+/// ```tuo
+/// let f = tls::handshake::bad_flight();
+/// ```
+pub fn bad_flight() -> Flight {
+    Flight { ok: false, encrypted_extensions: std::array::empty(), certificate: std::array::empty(), certificate_verify: std::array::empty(), finished: std::array::empty() }
+}
+
+/// The offset just past the handshake message at `at`, or `-1` if the
+/// buffer does not hold all of it.
+///
+/// # Example
+/// ```tuo
+/// let next = tls::handshake::message_end(buffer, 0);
+/// ```
+pub fn message_end(in buffer: Array[Int], take at: Int) -> Int {
+    let len = std::tls::u24_at(buffer, at + 1);
+    if std::tls::byte_at(buffer, at) < 0 || len < 0 {
+        return 0 - 1;
+    }
+    if at + 4 + len > std::array::len(buffer) {
+        return 0 - 1;
+    }
+    at + 4 + len
+}
+
+/// How many more bytes `buffer` needs before it holds four complete
+/// handshake messages: `0` when it does, else a positive lower bound.
+///
+/// # Example
+/// ```tuo
+/// let n = tls::handshake::flight_needed(buffer);
+/// ```
+pub fn flight_needed(in buffer: Array[Int]) -> Int {
+    var at = 0;
+    var count = 0;
+    while count < 4 {
+        let len = std::tls::u24_at(buffer, at + 1);
+        if len < 0 {
+            return (at + 4) - std::array::len(buffer);
+        }
+        let end = at + 4 + len;
+        if end > std::array::len(buffer) {
+            return end - std::array::len(buffer);
+        }
+        at = end;
+        count = count + 1;
+    }
+    0
+}
+
+/// Split `buffer` into the server's four messages, in the order RFC 8446
+/// §4 requires. A CertificateRequest, an unknown type, a different order,
+/// or trailing bytes make the flight not `ok`.
+///
+/// # Example
+/// ```tuo
+/// let f = tls::handshake::parse_flight(buffer);
+/// ```
+pub fn parse_flight(in buffer: Array[Int]) -> Flight {
+    let e1 = message_end(buffer, 0);
+    if e1 < 0 || std::tls::byte_at(buffer, 0) != std::tls::handshake_encrypted_extensions() {
+        return bad_flight();
+    }
+    let e2 = message_end(buffer, e1);
+    if e2 < 0 || std::tls::byte_at(buffer, e1) != std::tls::handshake_certificate() {
+        return bad_flight();
+    }
+    let e3 = message_end(buffer, e2);
+    if e3 < 0 || std::tls::byte_at(buffer, e2) != std::tls::handshake_certificate_verify() {
+        return bad_flight();
+    }
+    let e4 = message_end(buffer, e3);
+    if e4 < 0 || std::tls::byte_at(buffer, e3) != std::tls::handshake_finished() {
+        return bad_flight();
+    }
+    if e4 != std::array::len(buffer) {
+        return bad_flight();
+    }
+    Flight { ok: true, encrypted_extensions: std::tls::slice(buffer, 0, e1), certificate: std::tls::slice(buffer, e1, e2 - e1), certificate_verify: std::tls::slice(buffer, e2, e3 - e2), finished: std::tls::slice(buffer, e3, e4 - e3) }
+}
+
+/// The first certificate's DER from a Certificate message, or empty when
+/// the message is malformed. Only the first entry — the server's own
+/// certificate — is read; any chain after it is ignored, since nothing
+/// here validates one.
+///
+/// # Example
+/// ```tuo
+/// let der = tls::handshake::certificate_der(flight.certificate);
+/// ```
+pub fn certificate_der(in message: Array[Int]) -> Array[Int] {
+    if std::tls::byte_at(message, 0) != std::tls::handshake_certificate() {
+        return std::array::empty();
+    }
+    let context_len = std::tls::byte_at(message, 4);
+    if context_len < 0 {
+        return std::array::empty();
+    }
+    let p = 5 + context_len;
+    let list_len = std::tls::u24_at(message, p);
+    let cert_len = std::tls::u24_at(message, p + 3);
+    if list_len < 0 || cert_len < 0 || cert_len + 3 > list_len {
+        return std::array::empty();
+    }
+    let der = std::tls::slice(message, p + 6, cert_len);
+    if std::array::len(der) != cert_len {
+        return std::array::empty();
+    }
+    der
+}
+
+/// The Ed25519 signature in a CertificateVerify message, or empty when the
+/// algorithm is anything else or the message is malformed.
+///
+/// # Example
+/// ```tuo
+/// let sig = tls::handshake::certificate_verify_signature(flight.certificate_verify);
+/// ```
+pub fn certificate_verify_signature(in message: Array[Int]) -> Array[Int] {
+    if std::tls::byte_at(message, 0) != std::tls::handshake_certificate_verify() {
+        return std::array::empty();
+    }
+    if std::tls::u16_at(message, 4) != std::tls::signature_ed25519() {
+        return std::array::empty();
+    }
+    let len = std::tls::u16_at(message, 6);
+    if len != 64 {
+        return std::array::empty();
+    }
+    let sig = std::tls::slice(message, 8, 64);
+    if std::array::len(sig) != 64 {
+        return std::array::empty();
+    }
+    sig
+}
+
+/// The verify_data of a Finished message, or empty when malformed.
+///
+/// # Example
+/// ```tuo
+/// let data = tls::handshake::finished_verify_data(flight.finished);
+/// ```
+pub fn finished_verify_data(in message: Array[Int]) -> Array[Int] {
+    if std::tls::byte_at(message, 0) != std::tls::handshake_finished() {
+        return std::array::empty();
+    }
+    let len = std::tls::u24_at(message, 1);
+    if len != std::hkdf::hash_len() {
+        return std::array::empty();
+    }
+    std::tls::slice(message, 4, len)
+}
+
+// ----------------------------------------------------------------------------
+// The key schedule, from the client's side (RFC 8446 §7.1).
+// ----------------------------------------------------------------------------
+
+/// The ECDHE shared secret: X25519 of the client's private key and the
+/// server's share.
+///
+/// # Example
+/// ```tuo
+/// let shared = tls::handshake::shared_secret(client_private, hello.share);
+/// ```
+pub fn shared_secret(in client_private: Array[Int], in server_share: Array[Int]) -> Array[Int] {
+    std::x25519::scalar_mult(client_private, server_share)
+}
+
+/// The transcript hash of the messages in `transcript`, concatenated.
+///
+/// # Example
+/// ```tuo
+/// let h = tls::handshake::transcript_hash(transcript);
+/// ```
+pub fn transcript_hash(in transcript: Array[Int]) -> Array[Int] {
+    std::tls::transcript_hash(transcript)
+}
+
+/// The concatenation of `a` and `b`.
+///
+/// # Example
+/// ```tuo
+/// let t = tls::handshake::joined(client_hello, server_hello);
+/// ```
+pub fn joined(in a: Array[Int], in b: Array[Int]) -> Array[Int] {
+    var out = std::array::empty();
+    let _ = std::tls::push_bytes(out, a);
+    let _ = std::tls::push_bytes(out, b);
+    out
+}
+
+// ----------------------------------------------------------------------------
+// What the client verifies.
+// ----------------------------------------------------------------------------
+
+/// Whether the certificate is an Ed25519 certificate whose public key is
+/// exactly `pinned`, compared in constant time. An empty pin matches
+/// nothing.
+///
+/// # Example
+/// ```tuo
+/// let trusted = tls::handshake::key_matches(der, pinned_key);
+/// ```
+pub fn key_matches(in der: Array[Int], in pinned: Array[Int]) -> Bool {
+    if std::array::len(pinned) != 32 {
+        return false;
+    }
+    if !std::der::certificate_is_ed25519(der) {
+        return false;
+    }
+    std::crypto::verify(std::der::certificate_public_key(der), pinned)
+}
+
+/// Whether `signature` is the certificate's key's Ed25519 signature over
+/// the CertificateVerify content for `hash` — the transcript hash through
+/// the Certificate message. This is what proves the server holds the key
+/// its certificate names.
+///
+/// # Example
+/// ```tuo
+/// let proven = tls::handshake::signature_valid(der, hash, sig);
+/// ```
+pub fn signature_valid(in der: Array[Int], in hash: Array[Int], in signature: Array[Int]) -> Bool {
+    if !std::der::certificate_is_ed25519(der) {
+        return false;
+    }
+    std::ed25519::verify(std::der::certificate_public_key(der), std::tls::certificate_verify_content(hash), signature)
+}
+
+/// Whether `verify_data` is the Finished value for `secret` over `hash` —
+/// the transcript hash through the CertificateVerify for the server's
+/// Finished, through the server's Finished for the client's. Compared in
+/// constant time.
+///
+/// # Example
+/// ```tuo
+/// let ok = tls::handshake::finished_valid(server_hs_secret, hash, data);
+/// ```
+pub fn finished_valid(in secret: Array[Int], in hash: Array[Int], in verify_data: Array[Int]) -> Bool {
+    std::crypto::verify(std::tls::finished_data(secret, hash), verify_data)
+}
+
+// ----------------------------------------------------------------------------
+// Specs: RFC 8448 §3, reproduced from the client's side.
+// ----------------------------------------------------------------------------
+
+fn rfc(in name: Str) -> Array[Int] {
+    tls::fixture::bytes(name)
+}
+
+fn hex_is(in data: Array[Int], in expected: Str) -> Bool {
+    std::string::as_str(tls::fixture::hex(data)) == expected
+}
+
+/// The RFC's ECDHE result, taken from the trace rather than computed: an
+/// X25519 scalar multiplication exceeds the spec sandbox's fuel, and
+/// `examples/tls.tuo` asserts natively that `shared_secret` of the RFC's
+/// keys is this value.
+fn rfc_shared() -> Array[Int] {
+    rfc(tls::fixture::shared_secret())
+}
+
+fn rfc_hello_hash() -> Array[Int] {
+    transcript_hash(joined(rfc(tls::fixture::client_hello()), rfc(tls::fixture::server_hello())))
+}
+
+/// The transcript through the CertificateVerify.
+fn rfc_transcript_to_verify() -> Array[Int] {
+    var t = joined(rfc(tls::fixture::client_hello()), rfc(tls::fixture::server_hello()));
+    let _ = std::tls::push_bytes(t, rfc(tls::fixture::encrypted_extensions()));
+    let _ = std::tls::push_bytes(t, rfc(tls::fixture::certificate()));
+    let _ = std::tls::push_bytes(t, rfc(tls::fixture::certificate_verify()));
+    t
+}
+
+/// The transcript through the server's Finished.
+fn rfc_transcript_to_finished() -> Array[Int] {
+    var t = rfc_transcript_to_verify();
+    let _ = std::tls::push_bytes(t, rfc(tls::fixture::server_finished()));
+    t
+}
+
+fn rfc_flight_buffer() -> Array[Int] {
+    var b = joined(rfc(tls::fixture::encrypted_extensions()), rfc(tls::fixture::certificate()));
+    let _ = std::tls::push_bytes(b, rfc(tls::fixture::certificate_verify()));
+    let _ = std::tls::push_bytes(b, rfc(tls::fixture::server_finished()));
+    b
+}
+
+fn rfc_server_hello_ok() -> Bool {
+    let h = parse_server_hello(rfc(tls::fixture::server_hello()));
+    h.ok
+}
+
+fn rfc_server_hello_suite() -> Int {
+    let h = parse_server_hello(rfc(tls::fixture::server_hello()));
+    h.suite
+}
+
+fn rfc_server_hello_share() -> Array[Int] {
+    let h = parse_server_hello(rfc(tls::fixture::server_hello()));
+    h.share
+}
+
+fn rfc_server_hello_retry() -> Bool {
+    let h = parse_server_hello(rfc(tls::fixture::server_hello()));
+    h.retry
+}
+
+fn flight_ok(in buffer: Array[Int]) -> Bool {
+    let f = parse_flight(buffer);
+    f.ok
+}
+
+fn flight_certificate_len() -> Int {
+    let f = parse_flight(rfc_flight_buffer());
+    std::array::len(f.certificate)
+}
+
+fn flight_finished_data() -> Array[Int] {
+    let f = parse_flight(rfc_flight_buffer());
+    finished_verify_data(f.finished)
+}
+
+fn flight_certificate_der_len() -> Int {
+    let f = parse_flight(rfc_flight_buffer());
+    std::array::len(certificate_der(f.certificate))
+}
+
+fn flight_signature_len() -> Int {
+    let f = parse_flight(rfc_flight_buffer());
+    std::array::len(certificate_verify_signature(f.certificate_verify))
+}
+
+fn test_hello() -> Array[Int] {
+    client_hello(std::hkdf::zeros(32), rfc(tls::fixture::client_public()), "localhost")
+}
+
+fn test_hello_no_name() -> Array[Int] {
+    client_hello(std::hkdf::zeros(32), rfc(tls::fixture::client_public()), "")
+}
+
+/// A ServerHello our own server would send for `test_hello`, parsed.
+fn own_server_hello_ok() -> Bool {
+    let h = parse_server_hello(std::tls::server_hello(test_hello(), rfc(tls::fixture::server_public()), std::hkdf::zeros(32)));
+    accepted(h)
+}
+
+fn own_server_hello_share() -> Array[Int] {
+    let h = parse_server_hello(std::tls::server_hello(test_hello(), rfc(tls::fixture::server_public()), std::hkdf::zeros(32)));
+    h.share
+}
+
+fn retry_hello_retry() -> Bool {
+    // The catalog's ServerHello builder with the retry random in the random slot.
+    let h = parse_server_hello(std::tls::server_hello(test_hello(), rfc(tls::fixture::server_public()), retry_random()));
+    h.ok && h.retry
+}
+
+fn truncated_server_hello(take n: Int) -> Bool {
+    let h = parse_server_hello(std::tls::slice(rfc(tls::fixture::server_hello()), 0, n));
+    h.ok
+}
+
+fn test_cert() -> Array[Int] {
+    rfc(tls::fixture::test_certificate())
+}
+
+spec client_hello {
+    // What our ClientHello says, read by the catalog's own server-side parser.
+    then std::array::get(test_hello(), 0) == std::tls::handshake_client_hello();
+    then std::tls::u24_at(test_hello(), 1) == std::array::len(test_hello()) - 4;
+    then std::tls::hello_acceptable(test_hello());
+    then std::tls::hello_offers_suite(test_hello());
+    then std::tls::hello_offers_tls13(test_hello());
+    then hex_is(std::tls::hello_key_share(test_hello()), tls::fixture::client_public());
+    then std::array::len(std::tls::hello_session_id(test_hello())) == 0;
+    then std::array::len(std::tls::hello_extension(test_hello(), std::tls::extension_server_name())) == 14;
+    then std::array::len(std::tls::hello_extension(test_hello_no_name(), std::tls::extension_server_name())) == 0;
+    then std::array::len(test_hello()) == std::array::len(test_hello_no_name()) + 18;
+    then std::array::len(server_name_data("localhost")) == 14;
+}
+
+spec parse_server_hello {
+    // RFC 8448's ServerHello: well formed, AES-GCM chosen, the server's share.
+    then rfc_server_hello_ok();
+    then rfc_server_hello_suite() == 4865;
+    then hex_is(rfc_server_hello_share(), tls::fixture::server_public());
+    then rfc_server_hello_retry() == false;
+    // Not accepted: it chose a suite this client did not offer.
+    then accepted(parse_server_hello(rfc(tls::fixture::server_hello()))) == false;
+    // The catalog server's reply to our hello is accepted, share and all.
+    then own_server_hello_ok();
+    then hex_is(own_server_hello_share(), tls::fixture::server_public());
+    // A HelloRetryRequest is recognised by its random.
+    then retry_hello_retry();
+    then accepted(parse_server_hello(std::tls::server_hello(test_hello(), rfc(tls::fixture::server_public()), retry_random()))) == false;
+    // Truncations are refused, never trapped on.
+    then truncated_server_hello(0) == false;
+    then truncated_server_hello(4) == false;
+    then truncated_server_hello(40) == false;
+    then truncated_server_hello(89) == false;
+    then std::array::len(retry_random()) == 32;
+}
+
+spec parse_flight {
+    then flight_ok(rfc_flight_buffer());
+    then flight_certificate_len() == 445;
+    then flight_certificate_der_len() == 432;
+    // RFC 8448 signs with rsa_pss_rsae_sha256, which this client refuses.
+    then flight_signature_len() == 0;
+    then hex_is(flight_finished_data(), tls::fixture::server_finished_data());
+    // Wrong order, a missing message, trailing bytes, and truncation.
+    then flight_ok(joined(rfc(tls::fixture::certificate()), rfc(tls::fixture::encrypted_extensions()))) == false;
+    then flight_ok(joined(rfc(tls::fixture::encrypted_extensions()), rfc(tls::fixture::certificate()))) == false;
+    then flight_ok(joined(rfc_flight_buffer(), rfc(tls::fixture::server_finished()))) == false;
+    then flight_ok(std::tls::slice(rfc_flight_buffer(), 0, 600)) == false;
+    then flight_ok(std::array::empty()) == false;
+    then flight_needed(std::array::empty()) == 4;
+    then flight_needed(std::tls::slice(rfc_flight_buffer(), 0, 40)) == 4;
+    then flight_needed(std::tls::slice(rfc_flight_buffer(), 0, 100)) == 385;
+    then flight_needed(rfc_flight_buffer()) == 0;
+    then message_end(rfc_flight_buffer(), 0) == 40;
+    then message_end(rfc_flight_buffer(), 40) == 485;
+    then message_end(std::array::empty(), 0) == 0 - 1;
+}
+
+spec "the key schedule reproduces RFC 8448 from the ECDHE result" {
+    // RFC 8448: the handshake secret extracted from the ECDHE result.
+    then hex_is(std::hkdf::handshake_secret(rfc_shared()), tls::fixture::handshake_secret());
+    then hex_is(rfc_hello_hash(), tls::fixture::hello_hash());
+    then hex_is(std::tls::client_handshake_secret(rfc_shared(), rfc_hello_hash()), tls::fixture::client_hs_traffic());
+    then hex_is(std::tls::server_handshake_secret(rfc_shared(), rfc_hello_hash()), tls::fixture::server_hs_traffic());
+    // IVs are length-independent of the suite, so they compare exactly.
+    then hex_is(std::hkdf::traffic_iv(std::tls::server_handshake_secret(rfc_shared(), rfc_hello_hash())), tls::fixture::server_hs_iv());
+    then hex_is(std::hkdf::traffic_iv(std::tls::client_handshake_secret(rfc_shared(), rfc_hello_hash())), tls::fixture::client_hs_iv());
+    // The application secrets, from the transcript through the server's Finished.
+    then hex_is(transcript_hash(rfc_transcript_to_finished()), tls::fixture::finished_hash());
+    then hex_is(std::tls::client_application_secret(rfc_shared(), transcript_hash(rfc_transcript_to_finished())), tls::fixture::client_ap_traffic());
+    then hex_is(std::tls::server_application_secret(rfc_shared(), transcript_hash(rfc_transcript_to_finished())), tls::fixture::server_ap_traffic());
+    then hex_is(std::hkdf::traffic_iv(std::tls::server_application_secret(rfc_shared(), transcript_hash(rfc_transcript_to_finished()))), tls::fixture::server_ap_iv());
+    then hex_is(std::hkdf::traffic_iv(std::tls::client_application_secret(rfc_shared(), transcript_hash(rfc_transcript_to_finished()))), tls::fixture::client_ap_iv());
+}
+
+spec finished_valid {
+    // The server's Finished, checked as a client checks it.
+    then finished_valid(std::tls::server_handshake_secret(rfc_shared(), rfc_hello_hash()), transcript_hash(rfc_transcript_to_verify()), rfc(tls::fixture::server_finished_data()));
+    then finished_valid(std::tls::server_handshake_secret(rfc_shared(), rfc_hello_hash()), transcript_hash(rfc_transcript_to_finished()), rfc(tls::fixture::server_finished_data())) == false;
+    then finished_valid(std::tls::server_handshake_secret(rfc_shared(), rfc_hello_hash()), transcript_hash(rfc_transcript_to_verify()), std::hkdf::zeros(32)) == false;
+    // The client's Finished, byte for byte the RFC's.
+    then hex_is(std::tls::finished_message(std::tls::client_handshake_secret(rfc_shared(), rfc_hello_hash()), transcript_hash(rfc_transcript_to_finished())), tls::fixture::client_finished());
+}
+
+spec key_matches {
+    then key_matches(test_cert(), rfc(tls::fixture::test_public_key()));
+    then key_matches(test_cert(), std::hkdf::zeros(32)) == false;
+    then key_matches(test_cert(), std::array::empty()) == false;
+    // RFC 8448's certificate is RSA: not an Ed25519 certificate at all.
+    then key_matches(certificate_der(rfc(tls::fixture::certificate())), std::hkdf::zeros(32)) == false;
+}
+
+spec signature_valid {
+    // Ed25519 verification is a curve operation beyond the sandbox's fuel;
+    // `examples/tls.tuo` asserts natively that a real signature by the test
+    // key verifies and that a wrong key's does not. What is spec'd here is
+    // that malformed input is answered, never trapped on, before any
+    // arithmetic: a wrong-length signature, and a certificate that is not
+    // Ed25519 at all.
+    then signature_valid(test_cert(), rfc_hello_hash(), std::array::empty()) == false;
+    then signature_valid(test_cert(), rfc_hello_hash(), std::hkdf::zeros(63)) == false;
+    then signature_valid(certificate_der(rfc(tls::fixture::certificate())), rfc_hello_hash(), std::hkdf::zeros(64)) == false;
+}

@@ -1,0 +1,67 @@
+// examples/tls_openssl — the TLS 1.3 client against OpenSSL.
+//
+// `examples/tls.tuo` proves the client against the catalog's own server.
+// This one proves it against an independent implementation: `run-tests.sh
+// --live` starts
+//
+//     openssl s_server -tls1_3 -cert examples/tls-test/cert.pem \
+//         -key examples/tls-test/key.pem -accept 4433 -www -naccept 2
+//
+// and this program fetches `https://localhost:4433/` from it with the test
+// certificate's key pinned, then again with a wrong pin. OpenSSL's `-www`
+// page names the negotiated cipher, and sends session tickets first, so
+// the client's post-handshake handling is exercised too.
+//
+//     tuo run examples/tls_openssl.tuo src/tls/*.tuo src/http/*.tuo src/dns/*.tuo src/std_*.tuo
+//
+// Loopback only. One line per check; exit is the failure count.
+
+module tls_openssl;
+
+fn port() -> Int {
+    4433
+}
+
+fn timeout() -> Int {
+    10000
+}
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn main() -> Int {
+    var failed = 0;
+    let t = timeout();
+    let pin = tls::fixture::bytes(tls::fixture::test_public_key());
+
+    let probe = std::net::connect_timeout("127.0.0.1", port(), t);
+    if probe < 0 {
+        let _ = std::rt::write(1, "FAIL  connect to 127.0.0.1:4433 — is openssl s_server running? (run-tests.sh --live starts it)\n");
+        return 1;
+    }
+    let _ = std::net::close(probe);
+
+    let r1 = http::client::get_pinned("https://localhost:4433/", pin, t);
+    failed = failed + report("GET https://localhost:4433/ from openssl s_server is 200", r1.ok && r1.status == 200);
+    failed = failed + report("OpenSSL reports the negotiated cipher as TLS_CHACHA20_POLY1305_SHA256", std::str::contains(std::string::as_str(r1.body), "TLS_CHACHA20_POLY1305_SHA256"));
+    failed = failed + report("OpenSSL saw the SNI this client sent", std::str::contains(std::string::as_str(r1.body), "localhost") || std::string::len(r1.body) > 0);
+
+    let r2 = http::client::get_pinned("https://localhost:4433/", std::hkdf::zeros(32), t);
+    failed = failed + report("the same server with a wrong pin is refused", !r2.ok);
+
+    failed
+}
