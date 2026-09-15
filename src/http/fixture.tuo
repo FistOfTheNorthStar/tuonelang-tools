@@ -1,0 +1,64 @@
+// http::fixture — responses real servers sent, byte for byte.
+//
+// Every `Str` below is the exact byte string a public HTTP/1.1 server
+// returned over a plain TCP socket on 2026-09-15, captured with a raw
+// client and escaped only as a tuonelang literal requires. `http::message`'s
+// specs parse these rather than anything this crate produced, so the parser
+// is checked against Cloudflare and gunicorn, not against itself.
+//
+// They are fixtures, not test vectors from a standard: RFC 9112 publishes
+// no byte-exact examples of whole responses. What they pin is the *shape*
+// servers actually emit — a chunked body with a hex size and no extension,
+// a header block that ends `\r\n\r\n`, a reason phrase in capitals
+// (`302 FOUND`), a `Content-Length` that must be trusted exactly.
+
+module http::fixture;
+
+/// `GET / HTTP/1.1` to example.com:80 — `200 OK`, `Transfer-Encoding: chunked`, one 559-byte chunk from Cloudflare, `Connection: close`.
+///
+/// # Example
+/// ```tuo
+/// let raw = http::fixture::example_com(); // 867 bytes
+/// ```
+pub fn example_com() -> Str {
+    "HTTP/1.1 200 OK\r\nDate: Tue, 15 Sep 2026 08:37:26 GMT\r\nContent-Type: text/html\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nServer: cloudflare\r\nLast-Modified: Mon, 14 Sep 2026 18:00:02 GMT\r\nAllow: GET, HEAD\r\nAccept-Ranges: bytes\r\nAge: 502\r\ncf-cache-status: HIT\r\nCF-RAY: a3b64f38fc806567-AMS\r\n\r\n22f\r\n<!doctype html><html lang=\"en\"><head><title>Example Domain</title><link rel=\"icon\" href=\"data:,\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>body{background:#eee;width:60vw;margin:15vh auto;font-family:system-ui,sans-serif}h1{font-size:1.5em}div{opacity:0.8}a:link,a:visited{color:#348}</style></head><body><div><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href=\"https://iana.org/domains/example\">Learn more</a></p></div></body></html>\n\r\n0\r\n\r\n"
+}
+
+/// `GET /stream/2` to httpbin.org:80 — `200 OK`, chunked, two JSON lines in two chunks from gunicorn.
+///
+/// # Example
+/// ```tuo
+/// let raw = http::fixture::httpbin_chunked(); // 727 bytes
+/// ```
+pub fn httpbin_chunked() -> Str {
+    "HTTP/1.1 200 OK\r\nDate: Tue, 15 Sep 2026 08:37:26 GMT\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\nServer: gunicorn/19.9.0\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\n\r\nef\r\n{\"url\": \"http://httpbin.org/stream/2\", \"args\": {}, \"headers\": {\"Host\": \"httpbin.org\", \"X-Amzn-Trace-Id\": \"Root=1-6aa903c6-7fd99c4c4349e4c931d05b12\", \"User-Agent\": \"tuonelang-http/0.1\", \"Accept\": \"*/*\"}, \"origin\": \"103.69.224.61\", \"id\": 0}\n\r\nef\r\n{\"url\": \"http://httpbin.org/stream/2\", \"args\": {}, \"headers\": {\"Host\": \"httpbin.org\", \"X-Amzn-Trace-Id\": \"Root=1-6aa903c6-7fd99c4c4349e4c931d05b12\", \"User-Agent\": \"tuonelang-http/0.1\", \"Accept\": \"*/*\"}, \"origin\": \"103.69.224.61\", \"id\": 1}\n\r\n0\r\n\r\n"
+}
+
+/// `GET /redirect-to?url=/get` to httpbin.org:80 — `302 FOUND`, `Location: /get`, `Content-Length: 0`.
+///
+/// # Example
+/// ```tuo
+/// let raw = http::fixture::httpbin_redirect(); // 250 bytes
+/// ```
+pub fn httpbin_redirect() -> Str {
+    "HTTP/1.1 302 FOUND\r\nDate: Tue, 15 Sep 2026 08:37:27 GMT\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: 0\r\nConnection: close\r\nServer: gunicorn/19.9.0\r\nLocation: /get\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\n\r\n"
+}
+
+/// `POST /post` with a 13-byte JSON body to httpbin.org:80 — `200 OK`, `Content-Length: 437`, the echo containing escaped quotes and backslashes.
+///
+/// # Example
+/// ```tuo
+/// let raw = http::fixture::httpbin_post(); // 662 bytes
+/// ```
+pub fn httpbin_post() -> Str {
+    "HTTP/1.1 200 OK\r\nDate: Tue, 15 Sep 2026 08:37:27 GMT\r\nContent-Type: application/json\r\nContent-Length: 437\r\nConnection: close\r\nServer: gunicorn/19.9.0\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Credentials: true\r\n\r\n{\n  \"args\": {}, \n  \"data\": \"{\\\"a\\\":1,\\\"b\\\":2}\", \n  \"files\": {}, \n  \"form\": {}, \n  \"headers\": {\n    \"Accept\": \"*/*\", \n    \"Content-Length\": \"13\", \n    \"Content-Type\": \"application/json\", \n    \"Host\": \"httpbin.org\", \n    \"User-Agent\": \"tuonelang-http/0.1\", \n    \"X-Amzn-Trace-Id\": \"Root=1-6aa903c7-1ff5359e1bc5909e206eef3d\"\n  }, \n  \"json\": {\n    \"a\": 1, \n    \"b\": 2\n  }, \n  \"origin\": \"103.69.224.61\", \n  \"url\": \"http://httpbin.org/post\"\n}\n"
+}
+
+spec example_com {
+    then std::str::len(example_com()) == 867;
+    then std::str::len(httpbin_chunked()) == 727;
+    then std::str::len(httpbin_redirect()) == 250;
+    then std::str::len(httpbin_post()) == 662;
+    then std::str::starts_with(example_com(), "HTTP/1.1 200 OK\r\n");
+    then std::str::starts_with(httpbin_redirect(), "HTTP/1.1 302 FOUND\r\n");
+}

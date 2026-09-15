@@ -1,0 +1,454 @@
+// http::url — `http://host[:port]/path?query`, and the encodings around it.
+//
+// A client is given a URL and needs four things from it: whether it can
+// speak the scheme at all (`http` yes, `https` not in v0), where to connect
+// (host and port), what to put on the request line (path and query, never
+// the fragment), and what to put in the `Host` header. This module is that
+// taking-apart, plus the percent-encoding a query string needs so that a
+// user-supplied value cannot break the URL it is placed in — the
+// `urlencode` the backend's `app/emails/auth.py` reaches for.
+//
+// THE HOST IS NOT RESOLVED HERE. `is_ipv4_literal` says whether it needs
+// to be; `localhost` is mapped to `127.0.0.1` because no public resolver
+// answers for it; anything else is a name for `dns::resolver::lookup`.
+
+module http::url;
+
+/// The parts of a URL. `ok` is false when `text` was not an `http` or
+/// `https` URL; `https` is true for the scheme this crate cannot open.
+/// `target` is what goes on the request line: the path (at least `/`) and
+/// the query, without the fragment.
+struct Url {
+    ok: Bool,
+    https: Bool,
+    host: String,
+    port: Int,
+    target: String,
+}
+
+/// A `Url` with `ok` false.
+///
+/// # Example
+/// ```tuo
+/// let u = http::url::malformed();
+/// ```
+pub fn malformed() -> Url {
+    Url { ok: false, https: false, host: std::string::empty(), port: 0, target: std::string::empty() }
+}
+
+fn slice(in s: Str, take from: Int, take to: Int) -> String {
+    var out = std::string::empty();
+    let n = std::str::len(s);
+    var i = if from < 0 {
+        0
+    } else {
+        from
+    };
+    let stop = if to > n {
+        n
+    } else {
+        to
+    };
+    while i < stop {
+        std::string::push_byte(out, std::str::byte_at(s, i));
+        i = i + 1;
+    }
+    out
+}
+
+fn index_from(in s: Str, take needle: Int, take from: Int) -> Int {
+    let n = std::str::len(s);
+    var i = from;
+    while i < n {
+        if std::str::byte_at(s, i) == needle {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+fn decimal(in s: Str) -> Int {
+    let n = std::str::len(s);
+    if n == 0 || n > 9 {
+        return 0 - 1;
+    }
+    var value = 0;
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(s, i);
+        if b < 48 || b > 57 {
+            return 0 - 1;
+        }
+        value = value * 10 + (b - 48);
+        i = i + 1;
+    }
+    value
+}
+
+/// Parse `text`. Accepted: `http://` or `https://`, a host (bare or
+/// `[...]`), an optional `:port`, an optional path, query, and fragment.
+///
+/// # Example
+/// ```tuo
+/// let u = http::url::parse("http://example.com/index.html?x=1#top");
+/// ```
+pub fn parse(in text: Str) -> Url {
+    var https = false;
+    var from = 0;
+    if std::str::starts_with(text, "http://") {
+        from = 7;
+    } else {
+        if std::str::starts_with(text, "https://") {
+            https = true;
+            from = 8;
+        } else {
+            return malformed();
+        }
+    }
+    let n = std::str::len(text);
+    // The authority ends at the first `/`, `?`, or `#`.
+    var authority_end = n;
+    var i = from;
+    while i < n {
+        let b = std::str::byte_at(text, i);
+        if b == 47 || b == 63 || b == 35 {
+            authority_end = i;
+            i = n;
+        } else {
+            i = i + 1;
+        }
+    }
+    var host = std::string::empty();
+    var port = if https {
+        443
+    } else {
+        80
+    };
+    var port_from = 0 - 1;
+    if from < authority_end && std::str::byte_at(text, from) == 91 {
+        let close = index_from(text, 93, from);
+        if close < 0 || close >= authority_end {
+            return malformed();
+        }
+        host = slice(text, from + 1, close);
+        if close + 1 < authority_end {
+            if std::str::byte_at(text, close + 1) != 58 {
+                return malformed();
+            }
+            port_from = close + 2;
+        }
+    } else {
+        let colon = index_from(text, 58, from);
+        if colon >= 0 && colon < authority_end {
+            host = slice(text, from, colon);
+            port_from = colon + 1;
+        } else {
+            host = slice(text, from, authority_end);
+        }
+    }
+    if port_from >= 0 {
+        let port_text = slice(text, port_from, authority_end);
+        port = decimal(std::string::as_str(port_text));
+        if port < 1 || port > 65535 {
+            return malformed();
+        }
+    }
+    if std::str::len(std::string::as_str(host)) == 0 {
+        return malformed();
+    }
+    // The target: path and query, up to the fragment.
+    var target = std::string::empty();
+    let hash = index_from(text, 35, authority_end);
+    let target_end = if hash < 0 {
+        n
+    } else {
+        hash
+    };
+    if authority_end == target_end || std::str::byte_at(text, authority_end) == 63 {
+        std::string::push_byte(target, 47);
+    }
+    std::str::push(target, std::string::as_str(slice(text, authority_end, target_end)));
+    Url { ok: true, https: https, host: host, port: port, target: target }
+}
+
+/// Whether `host` is a dotted-quad IPv4 literal: four decimal parts, each
+/// `0 ..= 255`.
+///
+/// # Example
+/// ```tuo
+/// let yes = http::url::is_ipv4_literal("127.0.0.1"); // true
+/// let no = http::url::is_ipv4_literal("example.com"); // false
+/// ```
+pub fn is_ipv4_literal(in host: Str) -> Bool {
+    let parts = std::str::split(host, ".");
+    if std::array::len(parts) != 4 {
+        return false;
+    }
+    var i = 0;
+    while i < 4 {
+        let part = std::array::get(parts, i);
+        let text = std::string::as_str(part);
+        let v = decimal(text);
+        if v < 0 || v > 255 || std::str::len(text) > 3 {
+            return false;
+        }
+        // A leading zero is octal to some resolvers and refused by others;
+        // it is never a plain dotted quad.
+        if std::str::len(text) > 1 && std::str::byte_at(text, 0) == 48 {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// The address to connect to without asking a resolver: the literal itself,
+/// `127.0.0.1` for `localhost`, or empty when `host` is a name that needs
+/// resolving.
+///
+/// # Example
+/// ```tuo
+/// let a = http::url::address_hint("localhost"); // "127.0.0.1"
+/// let b = http::url::address_hint("example.com"); // ""
+/// ```
+pub fn address_hint(in host: Str) -> String {
+    if is_ipv4_literal(host) {
+        return std::string::from_str(host);
+    }
+    if host == "localhost" {
+        return std::string::from_str("127.0.0.1");
+    }
+    std::string::empty()
+}
+
+/// The `Host` header value: the host, with the port unless it is the
+/// scheme's default.
+///
+/// # Example
+/// ```tuo
+/// let h = http::url::host_header(http::url::parse("http://api.local:8000/x")); // "api.local:8000"
+/// ```
+pub fn host_header(in u: Url) -> String {
+    var out = std::string::from_str(std::string::as_str(u.host));
+    let default = if u.https {
+        443
+    } else {
+        80
+    };
+    if u.port != default {
+        std::string::push_byte(out, 58);
+        std::str::push_int(out, u.port);
+    }
+    out
+}
+
+/// Whether byte `b` may appear unencoded in a query component: the
+/// unreserved set of RFC 3986 §2.3.
+fn is_unreserved(take b: Int) -> Bool {
+    if b >= 48 && b <= 57 {
+        return true;
+    }
+    if b >= 65 && b <= 90 {
+        return true;
+    }
+    if b >= 97 && b <= 122 {
+        return true;
+    }
+    b == 45 || b == 46 || b == 95 || b == 126
+}
+
+/// `s` percent-encoded for a query component: unreserved bytes kept,
+/// everything else as `%XX` uppercase.
+///
+/// # Example
+/// ```tuo
+/// let e = http::url::percent_encode("a b&c=d/é"); // "a%20b%26c%3Dd%2F%C3%A9"
+/// ```
+pub fn percent_encode(in s: Str) -> String {
+    var out = std::string::empty();
+    let n = std::str::len(s);
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(s, i);
+        if is_unreserved(b) {
+            std::string::push_byte(out, b);
+        } else {
+            std::string::push_byte(out, 37);
+            std::string::push_byte(out, hex_digit(b / 16));
+            std::string::push_byte(out, hex_digit(b % 16));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn hex_digit(take v: Int) -> Int {
+    if v < 10 {
+        return 48 + v;
+    }
+    55 + v
+}
+
+fn hex_value(take b: Int) -> Int {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    0 - 1
+}
+
+/// `s` with `%XX` sequences decoded and `+` read as a space (the
+/// `application/x-www-form-urlencoded` convention). A malformed `%` is kept
+/// as is.
+///
+/// # Example
+/// ```tuo
+/// let d = http::url::percent_decode("a%20b+c"); // "a b c"
+/// ```
+pub fn percent_decode(in s: Str) -> String {
+    var out = std::string::empty();
+    let n = std::str::len(s);
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(s, i);
+        if b == 37 && i + 2 < n && hex_value(std::str::byte_at(s, i + 1)) >= 0 && hex_value(std::str::byte_at(s, i + 2)) >= 0 {
+            std::string::push_byte(out, hex_value(std::str::byte_at(s, i + 1)) * 16 + hex_value(std::str::byte_at(s, i + 2)));
+            i = i + 3;
+        } else {
+            if b == 43 {
+                std::string::push_byte(out, 32);
+            } else {
+                std::string::push_byte(out, b);
+            }
+            i = i + 1;
+        }
+    }
+    out
+}
+
+/// Append `key=value` to a query string being built in `out`, encoding
+/// both and separating pairs with `&` — Python's `urlencode`, one pair at a
+/// time.
+///
+/// # Example
+/// ```tuo
+/// var q = std::string::empty();
+/// http::url::push_pair(q, "token", "a b");
+/// http::url::push_pair(q, "next", "/x?y=1"); // "token=a%20b&next=%2Fx%3Fy%3D1"
+/// ```
+pub fn push_pair(mut out: String, in key: Str, in value: Str) {
+    if std::string::len(out) > 0 {
+        std::string::push_byte(out, 38);
+    }
+    let k = percent_encode(key);
+    std::str::push(out, std::string::as_str(k));
+    std::string::push_byte(out, 61);
+    let v = percent_encode(value);
+    std::str::push(out, std::string::as_str(v));
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+// ----------------------------------------------------------------------------
+
+fn ok_of(in text: Str) -> Bool {
+    let u = parse(text);
+    u.ok
+}
+
+fn https_of(in text: Str) -> Bool {
+    let u = parse(text);
+    u.https
+}
+
+fn host_of(in text: Str) -> String {
+    let u = parse(text);
+    u.host
+}
+
+fn port_of(in text: Str) -> Int {
+    let u = parse(text);
+    u.port
+}
+
+fn target_of(in text: Str) -> String {
+    let u = parse(text);
+    u.target
+}
+
+fn host_header_of(in text: Str) -> String {
+    host_header(parse(text))
+}
+
+fn pairs() -> String {
+    var q = std::string::empty();
+    push_pair(q, "token", "a b");
+    push_pair(q, "next", "/x?y=1");
+    q
+}
+
+spec parse {
+    then ok_of("http://example.com/");
+    then std::string::as_str(host_of("http://example.com/")) == "example.com";
+    then port_of("http://example.com/") == 80;
+    then std::string::as_str(target_of("http://example.com/")) == "/";
+    then https_of("http://example.com/") == false;
+    // No path means `/`; a query without a path gets one; the fragment is
+    // never sent.
+    then std::string::as_str(target_of("http://example.com")) == "/";
+    then std::string::as_str(target_of("http://example.com?x=1")) == "/?x=1";
+    then std::string::as_str(target_of("http://example.com/index.html?x=1#top")) == "/index.html?x=1";
+    then std::string::as_str(target_of("http://example.com/a/b#frag")) == "/a/b";
+    // Ports: explicit, default per scheme, and the Host header's rendering.
+    then port_of("http://127.0.0.1:8000/health") == 8000;
+    then std::string::as_str(host_of("http://127.0.0.1:8000/health")) == "127.0.0.1";
+    then port_of("https://api.stripe.com/v1/charges") == 443;
+    then https_of("https://api.stripe.com/v1/charges");
+    then std::string::as_str(host_header_of("http://api.local:8000/x")) == "api.local:8000";
+    then std::string::as_str(host_header_of("http://api.local/x")) == "api.local";
+    then std::string::as_str(host_header_of("http://api.local:80/x")) == "api.local";
+    then std::string::as_str(host_header_of("https://api.local:443/x")) == "api.local";
+    // IPv6 literals.
+    then std::string::as_str(host_of("http://[::1]:8000/")) == "::1";
+    then port_of("http://[::1]:8000/") == 8000;
+    then std::string::as_str(host_of("http://[::1]/")) == "::1";
+    // The redirect target httpbin sent is a path, not a URL.
+    then ok_of("/get") == false;
+    then ok_of("ftp://x/") == false;
+    then ok_of("http://") == false;
+    then ok_of("http:///path") == false;
+    then ok_of("http://host:0/") == false;
+    then ok_of("http://host:abc/") == false;
+    then ok_of("http://[::1/") == false;
+}
+
+spec is_ipv4_literal {
+    then is_ipv4_literal("127.0.0.1");
+    then is_ipv4_literal("1.1.1.1");
+    then is_ipv4_literal("255.255.255.255");
+    then is_ipv4_literal("256.0.0.1") == false;
+    then is_ipv4_literal("1.2.3") == false;
+    then is_ipv4_literal("example.com") == false;
+    then is_ipv4_literal("01.2.3.4") == false;
+    then is_ipv4_literal("") == false;
+    then std::string::as_str(address_hint("localhost")) == "127.0.0.1";
+    then std::string::as_str(address_hint("10.0.0.5")) == "10.0.0.5";
+    then std::string::as_str(address_hint("example.com")) == "";
+}
+
+spec percent_encode {
+    then std::string::as_str(percent_encode("abc-_.~")) == "abc-_.~";
+    then std::string::as_str(percent_encode("a b&c=d/")) == "a%20b%26c%3Dd%2F";
+    then std::string::as_str(percent_encode("\u{e9}")) == "%C3%A9";
+    then std::string::as_str(percent_decode("a%20b+c")) == "a b c";
+    then std::string::as_str(percent_decode("%C3%A9")) == "\u{e9}";
+    then std::string::as_str(percent_decode("100%")) == "100%";
+    then std::string::as_str(percent_decode("%zz")) == "%zz";
+    then std::string::as_str(pairs()) == "token=a%20b&next=%2Fx%3Fy%3D1";
+}

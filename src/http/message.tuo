@@ -1,0 +1,1473 @@
+// http::message — HTTP/1.1 messages: framing, headers, bodies (RFC 9112).
+//
+// An HTTP/1.1 message is a start line, a block of `name: value` header
+// lines, a blank line, and then — depending on what the headers said — a
+// body of a length given up front, a body sent as a sequence of sized
+// chunks, no body at all, or (for a response only) everything until the
+// server closes. Deciding which of those four applies is the single most
+// consequential judgement in the protocol: get it wrong and the next
+// message on a kept-alive connection starts in the middle of this one's
+// body, which is the mechanism behind request smuggling. RFC 9112 §6.3
+// gives the rule as an ordered list; `body_rule` is that list, and its
+// specs pin each step.
+//
+// PARSING SAYS WHAT IT NEEDS, as `redis::resp` does: `needed` reports that
+// the buffer holds a complete message, can never hold one, needs at least
+// `n` more bytes, or — the response-only case — needs to be read until the
+// peer closes. The effect layers in `http::client` and `http::server` loop
+// on that number and make no framing decision of their own.
+//
+// A HEAD IS A STRUCT OF ARRAYS. Headers are two parallel `Array[String]`s,
+// looked up by case-insensitive name; the first match wins, and
+// `content_length` refuses two that disagree. The head is bounded —
+// `max_head_bytes`, `max_headers` — so a peer cannot make a server hold an
+// unbounded header block in memory before it has decided anything.
+//
+// BUILDING REFUSES INJECTION. `header_line` will not write a name or value
+// containing `\r` or `\n`; a caller who tries gets nothing appended, so a
+// user-controlled string cannot smuggle a second header or end the block.
+//
+// CORRECTNESS IS EXTERNALLY DEFINED where it can be: `http::fixture` holds
+// responses Cloudflare and gunicorn actually sent, and the specs parse those.
+
+module http::message;
+
+/// The most bytes a head — start line through the blank line — may occupy.
+///
+/// # Example
+/// ```tuo
+/// let n = http::message::max_head_bytes(); // 65536
+/// ```
+pub fn max_head_bytes() -> Int {
+    65536
+}
+
+/// The most header lines a head may carry.
+///
+/// # Example
+/// ```tuo
+/// let n = http::message::max_headers(); // 100
+/// ```
+pub fn max_headers() -> Int {
+    100
+}
+
+/// `body_rule`: the message has no body.
+///
+/// # Example
+/// ```tuo
+/// let r = http::message::rule_none(); // 0
+/// ```
+pub fn rule_none() -> Int {
+    0
+}
+
+/// `body_rule`: the body is exactly `Content-Length` bytes.
+///
+/// # Example
+/// ```tuo
+/// let r = http::message::rule_length(); // 1
+/// ```
+pub fn rule_length() -> Int {
+    1
+}
+
+/// `body_rule`: the body is chunked.
+///
+/// # Example
+/// ```tuo
+/// let r = http::message::rule_chunked(); // 2
+/// ```
+pub fn rule_chunked() -> Int {
+    2
+}
+
+/// `body_rule`: the body runs until the server closes the connection.
+///
+/// # Example
+/// ```tuo
+/// let r = http::message::rule_until_close(); // 3
+/// ```
+pub fn rule_until_close() -> Int {
+    3
+}
+
+/// `body_rule`: the headers are contradictory or invalid; a server answers
+/// 400 and closes.
+///
+/// # Example
+/// ```tuo
+/// let r = http::message::rule_invalid(); // -1
+/// ```
+pub fn rule_invalid() -> Int {
+    0 - 1
+}
+
+/// `needed`: the message never completes on its own — read until the peer
+/// closes.
+///
+/// # Example
+/// ```tuo
+/// let n = http::message::until_close(); // -2
+/// ```
+pub fn until_close() -> Int {
+    0 - 2
+}
+
+/// A parsed start line and header block. `ok` is false when the bytes were
+/// not a valid head; `end` is the offset just past the blank line.
+/// `version_minor` is the `x` of `HTTP/1.x`. Requests fill `method` and
+/// `target`; responses fill `status` and `reason`.
+struct Head {
+    ok: Bool,
+    is_response: Bool,
+    method: String,
+    target: String,
+    version_minor: Int,
+    status: Int,
+    reason: String,
+    names: Array[String],
+    values: Array[String],
+    end: Int,
+}
+
+/// A `Head` with `ok` false.
+///
+/// # Example
+/// ```tuo
+/// let h = http::message::bad_head();
+/// ```
+pub fn bad_head() -> Head {
+    Head { ok: false, is_response: false, method: std::string::empty(), target: std::string::empty(), version_minor: 0, status: 0, reason: std::string::empty(), names: std::array::empty(), values: std::array::empty(), end: 0 }
+}
+
+// ----------------------------------------------------------------------------
+// Byte helpers.
+// ----------------------------------------------------------------------------
+
+/// The bytes of `s` from `from` (inclusive) to `to` (exclusive), clamped.
+///
+/// # Example
+/// ```tuo
+/// let s = http::message::slice("hello", 1, 3); // "el"
+/// ```
+pub fn slice(in s: Str, take from: Int, take to: Int) -> String {
+    var out = std::string::empty();
+    let n = std::str::len(s);
+    var i = if from < 0 {
+        0
+    } else {
+        from
+    };
+    let stop = if to > n {
+        n
+    } else {
+        to
+    };
+    while i < stop {
+        std::string::push_byte(out, std::str::byte_at(s, i));
+        i = i + 1;
+    }
+    out
+}
+
+/// ASCII lowercase of one byte.
+fn lower(take b: Int) -> Int {
+    if b >= 65 && b <= 90 {
+        return b + 32;
+    }
+    b
+}
+
+/// Whether `a` and `b` are equal ignoring ASCII case — how header names and
+/// transfer codings compare.
+///
+/// # Example
+/// ```tuo
+/// let same = http::message::eq_ignore_case("Content-Length", "content-length"); // true
+/// ```
+pub fn eq_ignore_case(in a: Str, in b: Str) -> Bool {
+    let n = std::str::len(a);
+    if n != std::str::len(b) {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        if lower(std::str::byte_at(a, i)) != lower(std::str::byte_at(b, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// The offset of the first `\r\n` at or after `at`, or `-1`.
+fn line_end(in raw: Str, take at: Int) -> Int {
+    let n = std::str::len(raw);
+    var i = at;
+    while i + 1 < n {
+        if std::str::byte_at(raw, i) == 13 && std::str::byte_at(raw, i + 1) == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// The offset of the first space at or after `from` and before `to`, or `-1`.
+fn space_at(in s: Str, take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to {
+        if std::str::byte_at(s, i) == 32 {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// Whether `b` is a `tchar` (RFC 9110 §5.6.2): what a header name or method
+/// may consist of.
+///
+/// # Example
+/// ```tuo
+/// let ok = http::message::is_token_byte(45); // '-' — true
+/// let no = http::message::is_token_byte(58); // ':' — false
+/// ```
+pub fn is_token_byte(take b: Int) -> Bool {
+    if b >= 48 && b <= 57 {
+        return true;
+    }
+    if b >= 65 && b <= 90 {
+        return true;
+    }
+    if b >= 97 && b <= 122 {
+        return true;
+    }
+    b == 33 || b == 35 || b == 36 || b == 37 || b == 38 || b == 39 || b == 42 || b == 43 || b == 45 || b == 46 || b == 94 || b == 95 || b == 96 || b == 124 || b == 126
+}
+
+/// Whether every byte of `s` is a token byte and `s` is not empty.
+fn is_token(in s: Str) -> Bool {
+    let n = std::str::len(s);
+    if n == 0 {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        if !is_token_byte(std::str::byte_at(s, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// `s` without leading and trailing spaces and tabs (optional whitespace).
+fn trim_ows(in s: Str) -> String {
+    let n = std::str::len(s);
+    var from = 0;
+    while from < n && (std::str::byte_at(s, from) == 32 || std::str::byte_at(s, from) == 9) {
+        from = from + 1;
+    }
+    var to = n;
+    while to > from && (std::str::byte_at(s, to - 1) == 32 || std::str::byte_at(s, to - 1) == 9) {
+        to = to - 1;
+    }
+    slice(s, from, to)
+}
+
+/// The non-negative decimal integer `s` spells, or `-1`.
+///
+/// # Example
+/// ```tuo
+/// let n = http::message::decimal("437"); // 437
+/// ```
+pub fn decimal(in s: Str) -> Int {
+    let n = std::str::len(s);
+    if n == 0 || n > 15 {
+        return 0 - 1;
+    }
+    var value = 0;
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(s, i);
+        if b < 48 || b > 57 {
+            return 0 - 1;
+        }
+        value = value * 10 + (b - 48);
+        i = i + 1;
+    }
+    value
+}
+
+/// The value of one hex digit, or `-1`.
+fn hex_value(take b: Int) -> Int {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    0 - 1
+}
+
+/// The hexadecimal integer at the start of `s`, stopping at the first
+/// non-hex byte — a chunk-size line, whose `;extension` is ignored. `-1`
+/// when there is no digit at all or the value would not fit.
+///
+/// # Example
+/// ```tuo
+/// let n = http::message::hex_prefix("22f"); // 559
+/// let m = http::message::hex_prefix("5;name=value"); // 5
+/// ```
+pub fn hex_prefix(in s: Str) -> Int {
+    let n = std::str::len(s);
+    var value = 0;
+    var digits = 0;
+    var i = 0;
+    while i < n {
+        let d = hex_value(std::str::byte_at(s, i));
+        if d < 0 {
+            if digits == 0 {
+                return 0 - 1;
+            }
+            return value;
+        }
+        if digits >= 12 {
+            return 0 - 1;
+        }
+        value = value * 16 + d;
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if digits == 0 {
+        return 0 - 1;
+    }
+    value
+}
+
+// ----------------------------------------------------------------------------
+// The head.
+// ----------------------------------------------------------------------------
+
+/// The offset of the `\r\n\r\n` that ends the head, or `-1` if `raw` has
+/// none yet.
+///
+/// # Example
+/// ```tuo
+/// let e = http::message::blank_line_at("HTTP/1.1 200 OK\r\n\r\nbody"); // 15
+/// ```
+pub fn blank_line_at(in raw: Str) -> Int {
+    let n = std::str::len(raw);
+    var i = 0;
+    while i + 3 < n {
+        if std::str::byte_at(raw, i) == 13 && std::str::byte_at(raw, i + 1) == 10 && std::str::byte_at(raw, i + 2) == 13 && std::str::byte_at(raw, i + 3) == 10 {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// How many more bytes the head needs: `0` when the blank line is present,
+/// `-1` when `max_head_bytes` have arrived without one, else `1`.
+///
+/// # Example
+/// ```tuo
+/// let n = http::message::head_needed("GET / HTTP/1.1\r\nHost: x\r\n"); // 1
+/// ```
+pub fn head_needed(in raw: Str) -> Int {
+    if blank_line_at(raw) >= 0 {
+        return 0;
+    }
+    if std::str::len(raw) >= max_head_bytes() {
+        return 0 - 1;
+    }
+    1
+}
+
+/// Parse the head at the start of `raw`, as a response when
+/// `expect_response`, else as a request. `ok` is false unless the start
+/// line is well-formed HTTP/1.0 or HTTP/1.1, every header line is
+/// `token: value` with no whitespace before the colon (RFC 9112 §5.1
+/// requires rejecting that), and the limits hold.
+///
+/// # Example
+/// ```tuo
+/// let h = http::message::parse_head("GET /health HTTP/1.1\r\nHost: api\r\n\r\n", false);
+/// ```
+pub fn parse_head(in raw: Str, take expect_response: Bool) -> Head {
+    let blank = blank_line_at(raw);
+    if blank < 0 || blank > max_head_bytes() {
+        return bad_head();
+    }
+    let end = blank + 4;
+    let first_end = line_end(raw, 0);
+    if first_end < 0 || first_end == 0 {
+        return bad_head();
+    }
+    var method = std::string::empty();
+    var target = std::string::empty();
+    var reason = std::string::empty();
+    var status = 0;
+    var minor = 0 - 1;
+    if expect_response {
+        // HTTP/1.x SP 3DIGIT SP reason
+        if first_end < 12 {
+            return bad_head();
+        }
+        minor = version_minor_at(raw, 0);
+        if minor < 0 || std::str::byte_at(raw, 8) != 32 {
+            return bad_head();
+        }
+        let code = slice(raw, 9, 12);
+        status = decimal(std::string::as_str(code));
+        if status < 100 || status > 999 {
+            return bad_head();
+        }
+        if first_end > 12 {
+            if std::str::byte_at(raw, 12) != 32 {
+                return bad_head();
+            }
+            reason = slice(raw, 13, first_end);
+        }
+    } else {
+        // method SP target SP HTTP/1.x
+        let sp1 = space_at(raw, 0, first_end);
+        if sp1 < 0 {
+            return bad_head();
+        }
+        let sp2 = space_at(raw, sp1 + 1, first_end);
+        if sp2 < 0 {
+            return bad_head();
+        }
+        method = slice(raw, 0, sp1);
+        if !is_token(std::string::as_str(method)) {
+            return bad_head();
+        }
+        target = slice(raw, sp1 + 1, sp2);
+        if std::str::len(std::string::as_str(target)) == 0 || space_at(raw, sp2 + 1, first_end) >= 0 {
+            return bad_head();
+        }
+        if first_end - (sp2 + 1) != 8 {
+            return bad_head();
+        }
+        minor = version_minor_at(raw, sp2 + 1);
+        if minor < 0 {
+            return bad_head();
+        }
+    }
+    var names = std::array::empty();
+    var values = std::array::empty();
+    var at = first_end + 2;
+    while at < blank + 2 {
+        let e = line_end(raw, at);
+        if e < 0 || e > blank {
+            return bad_head();
+        }
+        if e == at {
+            // The blank line itself.
+            at = e + 2;
+        } else {
+            let colon = colon_at(raw, at, e);
+            if colon < 0 {
+                return bad_head();
+            }
+            let name = slice(raw, at, colon);
+            if !is_token(std::string::as_str(name)) {
+                return bad_head();
+            }
+            let value_raw = slice(raw, colon + 1, e);
+            if std::array::len(names) >= max_headers() {
+                return bad_head();
+            }
+            std::array::push(names, name);
+            std::array::push(values, trim_ows(std::string::as_str(value_raw)));
+            at = e + 2;
+        }
+    }
+    Head { ok: true, is_response: expect_response, method: method, target: target, version_minor: minor, status: status, reason: reason, names: names, values: values, end: end }
+}
+
+/// The offset of the first `:` in `[from, to)`, or `-1`.
+fn colon_at(in s: Str, take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to {
+        if std::str::byte_at(s, i) == 58 {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// The `x` of an `HTTP/1.x` at `at`, or `-1` if the eight bytes there are
+/// not that.
+fn version_minor_at(in raw: Str, take at: Int) -> Int {
+    if at + 8 > std::str::len(raw) {
+        return 0 - 1;
+    }
+    let tag = slice(raw, at, at + 7);
+    if std::string::as_str(tag) != "HTTP/1." {
+        return 0 - 1;
+    }
+    let m = std::str::byte_at(raw, at + 7);
+    if m == 48 {
+        return 0;
+    }
+    if m == 49 {
+        return 1;
+    }
+    0 - 1
+}
+
+/// The number of header lines.
+///
+/// # Example
+/// ```tuo
+/// let n = http::message::header_count(head);
+/// ```
+pub fn header_count(in h: Head) -> Int {
+    std::array::len(h.names)
+}
+
+/// The value of the first header named `name`, case-insensitively, or empty.
+///
+/// # Example
+/// ```tuo
+/// let ct = http::message::header(head, "content-type");
+/// ```
+pub fn header(in h: Head, in name: Str) -> String {
+    let n = std::array::len(h.names);
+    var i = 0;
+    while i < n {
+        let candidate = std::array::get(h.names, i);
+        if eq_ignore_case(std::string::as_str(candidate), name) {
+            return std::array::get(h.values, i);
+        }
+        i = i + 1;
+    }
+    std::string::empty()
+}
+
+/// Whether a header named `name` is present.
+///
+/// # Example
+/// ```tuo
+/// let has = http::message::has_header(head, "Transfer-Encoding");
+/// ```
+pub fn has_header(in h: Head, in name: Str) -> Bool {
+    let n = std::array::len(h.names);
+    var i = 0;
+    while i < n {
+        let candidate = std::array::get(h.names, i);
+        if eq_ignore_case(std::string::as_str(candidate), name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+/// Whether the comma-separated token list `list` contains `token`,
+/// case-insensitively — `Connection: keep-alive, Upgrade`.
+///
+/// # Example
+/// ```tuo
+/// let yes = http::message::list_has("gzip, chunked", "chunked"); // true
+/// ```
+pub fn list_has(in list: Str, in token: Str) -> Bool {
+    let parts = std::str::split(list, ",");
+    let n = std::array::len(parts);
+    var i = 0;
+    while i < n {
+        let part = std::array::get(parts, i);
+        let trimmed = trim_ows(std::string::as_str(part));
+        if eq_ignore_case(std::string::as_str(trimmed), token) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+/// The `Content-Length`: its value, `-1` when absent, `-2` when invalid —
+/// not a decimal, or present more than once with differing values (RFC
+/// 9112 §6.3 step 5: a message like that is a smuggling vector and MUST be
+/// rejected).
+///
+/// # Example
+/// ```tuo
+/// let n = http::message::content_length(head); // 437
+/// ```
+pub fn content_length(in h: Head) -> Int {
+    var found = 0 - 1;
+    let n = std::array::len(h.names);
+    var i = 0;
+    while i < n {
+        let candidate = std::array::get(h.names, i);
+        if eq_ignore_case(std::string::as_str(candidate), "Content-Length") {
+            let value = std::array::get(h.values, i);
+            let parsed = decimal(std::string::as_str(value));
+            if parsed < 0 {
+                return 0 - 2;
+            }
+            if found >= 0 && found != parsed {
+                return 0 - 2;
+            }
+            found = parsed;
+        }
+        i = i + 1;
+    }
+    found
+}
+
+/// Whether the message is chunked: `Transfer-Encoding` is present and its
+/// final coding is `chunked`. A `Transfer-Encoding` whose final coding is
+/// anything else has no length this crate can determine.
+///
+/// # Example
+/// ```tuo
+/// let c = http::message::is_chunked(head);
+/// ```
+pub fn is_chunked(in h: Head) -> Bool {
+    if !has_header(h, "Transfer-Encoding") {
+        return false;
+    }
+    let te = header(h, "Transfer-Encoding");
+    let parts = std::str::split(std::string::as_str(te), ",");
+    let n = std::array::len(parts);
+    if n == 0 {
+        return false;
+    }
+    let last = std::array::get(parts, n - 1);
+    let trimmed = trim_ows(std::string::as_str(last));
+    eq_ignore_case(std::string::as_str(trimmed), "chunked")
+}
+
+/// How the body's length is determined (RFC 9112 §6.3), for a message with
+/// head `h`; `head_request` says the response answers a `HEAD`.
+///
+/// 1. A response to `HEAD`, or with status 1xx, 204, or 304, has no body.
+/// 2. `Transfer-Encoding` ending in `chunked` is chunked. Any other
+///    `Transfer-Encoding` is invalid in a request, and until-close in a
+///    response. A request carrying both `Transfer-Encoding` and
+///    `Content-Length` is invalid — the smuggling shape.
+/// 3. A valid `Content-Length` gives the length; an invalid one is invalid.
+/// 4. Otherwise a request has no body, and a response runs until close.
+///
+/// # Example
+/// ```tuo
+/// let r = http::message::body_rule(head, false);
+/// ```
+pub fn body_rule(in h: Head, take head_request: Bool) -> Int {
+    if !h.ok {
+        return rule_invalid();
+    }
+    if h.is_response {
+        if head_request || h.status < 200 || h.status == 204 || h.status == 304 {
+            return rule_none();
+        }
+    }
+    if has_header(h, "Transfer-Encoding") {
+        if !h.is_response && has_header(h, "Content-Length") {
+            return rule_invalid();
+        }
+        if is_chunked(h) {
+            return rule_chunked();
+        }
+        if h.is_response {
+            return rule_until_close();
+        }
+        return rule_invalid();
+    }
+    let cl = content_length(h);
+    if cl == 0 - 2 {
+        return rule_invalid();
+    }
+    if cl >= 0 {
+        return rule_length();
+    }
+    if h.is_response {
+        return rule_until_close();
+    }
+    rule_none()
+}
+
+/// Whether the peer intends to close after this message: `Connection:
+/// close`, or HTTP/1.0 without `Connection: keep-alive`.
+///
+/// # Example
+/// ```tuo
+/// let bye = http::message::wants_close(head);
+/// ```
+pub fn wants_close(in h: Head) -> Bool {
+    let conn = header(h, "Connection");
+    if list_has(std::string::as_str(conn), "close") {
+        return true;
+    }
+    if h.version_minor == 0 {
+        return !list_has(std::string::as_str(conn), "keep-alive");
+    }
+    false
+}
+
+// ----------------------------------------------------------------------------
+// Chunked bodies (RFC 9112 §7.1).
+// ----------------------------------------------------------------------------
+
+/// Walk the chunked body starting at `at`. Returns the offset just past the
+/// final `0\r\n` and its trailer block, `-1` for malformed chunking, or
+/// `-(2 + n)` when at least `n` more bytes are needed.
+///
+/// # Example
+/// ```tuo
+/// let e = http::message::chunked_end("5\r\nhello\r\n0\r\n\r\n", 0); // 15
+/// ```
+pub fn chunked_end(in raw: Str, take at: Int) -> Int {
+    let n = std::str::len(raw);
+    var pos = at;
+    while true {
+        let e = line_end(raw, pos);
+        if e < 0 {
+            return 0 - 3;
+        }
+        let size_line = slice(raw, pos, e);
+        let size = hex_prefix(std::string::as_str(size_line));
+        if size < 0 {
+            return 0 - 1;
+        }
+        if size == 0 {
+            // Trailer section: header lines until a blank line.
+            var t = e + 2;
+            while true {
+                let te = line_end(raw, t);
+                if te < 0 {
+                    return 0 - 3;
+                }
+                if te == t {
+                    return t + 2;
+                }
+                t = te + 2;
+            }
+        }
+        let data = e + 2;
+        if n < data + size + 2 {
+            return 0 - (2 + (data + size + 2 - n));
+        }
+        if std::str::byte_at(raw, data + size) != 13 || std::str::byte_at(raw, data + size + 1) != 10 {
+            return 0 - 1;
+        }
+        pos = data + size + 2;
+    }
+    0 - 1
+}
+
+/// The concatenated chunk data of a complete chunked body at `at`.
+///
+/// # Example
+/// ```tuo
+/// let b = http::message::dechunk("5\r\nhello\r\n0\r\n\r\n", 0); // "hello"
+/// ```
+pub fn dechunk(in raw: Str, take at: Int) -> String {
+    var out = std::string::empty();
+    var pos = at;
+    while true {
+        let e = line_end(raw, pos);
+        if e < 0 {
+            return out;
+        }
+        let size_line = slice(raw, pos, e);
+        let size = hex_prefix(std::string::as_str(size_line));
+        if size <= 0 {
+            return out;
+        }
+        let data = e + 2;
+        var i = 0;
+        while i < size && data + i < std::str::len(raw) {
+            std::string::push_byte(out, std::str::byte_at(raw, data + i));
+            i = i + 1;
+        }
+        pos = data + size + 2;
+    }
+    out
+}
+
+/// `body` as one chunk per `chunk_size` bytes, then the final zero chunk.
+///
+/// # Example
+/// ```tuo
+/// let b = http::message::chunked("hello", 3); // "3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n"
+/// ```
+pub fn chunked(in body: Str, take chunk_size: Int) -> String {
+    var out = std::string::empty();
+    let n = std::str::len(body);
+    let step = if chunk_size < 1 {
+        1
+    } else {
+        chunk_size
+    };
+    var at = 0;
+    while at < n {
+        let size = if n - at < step {
+            n - at
+        } else {
+            step
+        };
+        push_hex(out, size);
+        std::string::push_byte(out, 13);
+        std::string::push_byte(out, 10);
+        var i = 0;
+        while i < size {
+            std::string::push_byte(out, std::str::byte_at(body, at + i));
+            i = i + 1;
+        }
+        std::string::push_byte(out, 13);
+        std::string::push_byte(out, 10);
+        at = at + size;
+    }
+    std::str::push(out, "0\r\n\r\n");
+    out
+}
+
+/// Append `value` in lowercase hex.
+fn push_hex(mut out: String, take value: Int) {
+    if value == 0 {
+        std::string::push_byte(out, 48);
+        return;
+    }
+    var digits = std::array::empty();
+    var v = value;
+    while v > 0 {
+        std::array::push(digits, v % 16);
+        v = v / 16;
+    }
+    var i = std::array::len(digits) - 1;
+    while i >= 0 {
+        let d = std::array::get(digits, i);
+        if d < 10 {
+            std::string::push_byte(out, 48 + d);
+        } else {
+            std::string::push_byte(out, 87 + d);
+        }
+        i = i - 1;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Whole messages.
+// ----------------------------------------------------------------------------
+
+/// How many more bytes `raw` needs to hold one complete message: `0` when
+/// it does; `-1` when it never will (malformed, over the limits, or an
+/// invalid body rule); `until_close` when a response has no length and
+/// runs to the close; otherwise a positive lower bound.
+///
+/// # Example
+/// ```tuo
+/// let n = http::message::needed("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhel", true, false); // 2
+/// ```
+pub fn needed(in raw: Str, take expect_response: Bool, take head_request: Bool) -> Int {
+    let hn = head_needed(raw);
+    if hn != 0 {
+        return hn;
+    }
+    let h = parse_head(raw, expect_response);
+    if !h.ok {
+        return 0 - 1;
+    }
+    let rule = body_rule(h, head_request);
+    if rule == rule_none() {
+        return 0;
+    }
+    if rule == rule_length() {
+        let have = std::str::len(raw) - h.end;
+        let want = content_length(h);
+        if have >= want {
+            return 0;
+        }
+        return want - have;
+    }
+    if rule == rule_chunked() {
+        let r = chunked_end(raw, h.end);
+        if r >= 0 {
+            return 0;
+        }
+        if r == 0 - 1 {
+            return 0 - 1;
+        }
+        return (0 - r) - 2;
+    }
+    if rule == rule_until_close() {
+        return until_close();
+    }
+    0 - 1
+}
+
+/// The offset just past the complete message at the start of `raw` — where
+/// the next message on the connection begins — or `-1` if it is not
+/// complete. A message read until close ends at the end of `raw`.
+///
+/// # Example
+/// ```tuo
+/// let e = http::message::message_end(raw, false, false);
+/// ```
+pub fn message_end(in raw: Str, take expect_response: Bool, take head_request: Bool) -> Int {
+    let h = parse_head(raw, expect_response);
+    if !h.ok {
+        return 0 - 1;
+    }
+    let rule = body_rule(h, head_request);
+    if rule == rule_none() {
+        return h.end;
+    }
+    if rule == rule_length() {
+        let e = h.end + content_length(h);
+        if e > std::str::len(raw) {
+            return 0 - 1;
+        }
+        return e;
+    }
+    if rule == rule_chunked() {
+        let r = chunked_end(raw, h.end);
+        if r < 0 {
+            return 0 - 1;
+        }
+        return r;
+    }
+    if rule == rule_until_close() {
+        return std::str::len(raw);
+    }
+    0 - 1
+}
+
+/// The decoded body of the complete message at the start of `raw`:
+/// dechunked, or exactly `Content-Length` bytes, or everything after the
+/// head, or empty.
+///
+/// # Example
+/// ```tuo
+/// let body = http::message::body(raw, true, false);
+/// ```
+pub fn body(in raw: Str, take expect_response: Bool, take head_request: Bool) -> String {
+    let h = parse_head(raw, expect_response);
+    if !h.ok {
+        return std::string::empty();
+    }
+    let rule = body_rule(h, head_request);
+    if rule == rule_length() {
+        return slice(raw, h.end, h.end + content_length(h));
+    }
+    if rule == rule_chunked() {
+        return dechunk(raw, h.end);
+    }
+    if rule == rule_until_close() {
+        return slice(raw, h.end, std::str::len(raw));
+    }
+    std::string::empty()
+}
+
+// ----------------------------------------------------------------------------
+// Building.
+// ----------------------------------------------------------------------------
+
+/// Whether `s` may be written as a header name or value: no `\r`, no `\n`,
+/// no NUL. A string that fails this is the injection shape — a value that
+/// ends the line and starts a header of its own.
+///
+/// # Example
+/// ```tuo
+/// let ok = http::message::is_header_safe("text/html"); // true
+/// let no = http::message::is_header_safe("x\r\nSet-Cookie: a=b"); // false
+/// ```
+pub fn is_header_safe(in s: Str) -> Bool {
+    let n = std::str::len(s);
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(s, i);
+        if b == 13 || b == 10 || b == 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// Append `name: value\r\n` to `out` — unless `name` is not a token or
+/// either contains a line break, in which case nothing is appended.
+///
+/// # Example
+/// ```tuo
+/// http::message::header_line(out, "Content-Type", "application/json");
+/// ```
+pub fn header_line(mut out: String, in name: Str, in value: Str) {
+    if !is_token(name) || !is_header_safe(value) {
+        return;
+    }
+    std::str::push(out, name);
+    std::str::push(out, ": ");
+    std::str::push(out, value);
+    std::str::push(out, "\r\n");
+}
+
+/// The standard reason phrase for `status`, or `Unknown`.
+///
+/// # Example
+/// ```tuo
+/// let r = http::message::reason_of(404); // "Not Found"
+/// ```
+pub fn reason_of(take status: Int) -> Str {
+    if status == 200 {
+        return "OK";
+    }
+    if status == 201 {
+        return "Created";
+    }
+    if status == 204 {
+        return "No Content";
+    }
+    if status == 301 {
+        return "Moved Permanently";
+    }
+    if status == 302 {
+        return "Found";
+    }
+    if status == 303 {
+        return "See Other";
+    }
+    if status == 304 {
+        return "Not Modified";
+    }
+    if status == 307 {
+        return "Temporary Redirect";
+    }
+    if status == 308 {
+        return "Permanent Redirect";
+    }
+    if status == 400 {
+        return "Bad Request";
+    }
+    if status == 401 {
+        return "Unauthorized";
+    }
+    if status == 403 {
+        return "Forbidden";
+    }
+    if status == 404 {
+        return "Not Found";
+    }
+    if status == 405 {
+        return "Method Not Allowed";
+    }
+    if status == 408 {
+        return "Request Timeout";
+    }
+    if status == 413 {
+        return "Content Too Large";
+    }
+    if status == 429 {
+        return "Too Many Requests";
+    }
+    if status == 431 {
+        return "Request Header Fields Too Large";
+    }
+    if status == 500 {
+        return "Internal Server Error";
+    }
+    if status == 501 {
+        return "Not Implemented";
+    }
+    if status == 503 {
+        return "Service Unavailable";
+    }
+    "Unknown"
+}
+
+/// A request: `method target HTTP/1.1`, `Host`, the caller's pre-rendered
+/// `extra` header lines (from `header_line`), `Content-Length` when there
+/// is a body or the method usually carries one, the blank line, the body.
+///
+/// # Example
+/// ```tuo
+/// var extra = std::string::empty();
+/// http::message::header_line(extra, "Accept", "application/json");
+/// let req = http::message::request("GET", "/health", "api.example.net", std::string::as_str(extra), "");
+/// ```
+pub fn request(in method: Str, in target: Str, in host: Str, in extra: Str, in body: Str) -> String {
+    var out = std::string::empty();
+    std::str::push(out, method);
+    std::str::push(out, " ");
+    std::str::push(out, target);
+    std::str::push(out, " HTTP/1.1\r\n");
+    header_line(out, "Host", host);
+    std::str::push(out, extra);
+    let n = std::str::len(body);
+    if n > 0 || method == "POST" || method == "PUT" || method == "PATCH" {
+        std::str::push(out, "Content-Length: ");
+        std::str::push_int(out, n);
+        std::str::push(out, "\r\n");
+    }
+    std::str::push(out, "\r\n");
+    std::str::push(out, body);
+    out
+}
+
+/// A response with `Content-Length` framing: status line with the standard
+/// reason, the caller's `extra` header lines, `Content-Length`, blank line,
+/// body.
+///
+/// # Example
+/// ```tuo
+/// let res = http::message::response(200, "Content-Type: text/plain\r\n", "hello");
+/// ```
+pub fn response(take status: Int, in extra: Str, in body: Str) -> String {
+    var out = std::string::empty();
+    std::str::push(out, "HTTP/1.1 ");
+    std::str::push_int(out, status);
+    std::str::push(out, " ");
+    std::str::push(out, reason_of(status));
+    std::str::push(out, "\r\n");
+    std::str::push(out, extra);
+    std::str::push(out, "Content-Length: ");
+    std::str::push_int(out, std::str::len(body));
+    std::str::push(out, "\r\n\r\n");
+    std::str::push(out, body);
+    out
+}
+
+/// A response with chunked framing, `body` sent in chunks of `chunk_size`.
+///
+/// # Example
+/// ```tuo
+/// let res = http::message::chunked_response(200, "", "hello", 3);
+/// ```
+pub fn chunked_response(take status: Int, in extra: Str, in body: Str, take chunk_size: Int) -> String {
+    var out = std::string::empty();
+    std::str::push(out, "HTTP/1.1 ");
+    std::str::push_int(out, status);
+    std::str::push(out, " ");
+    std::str::push(out, reason_of(status));
+    std::str::push(out, "\r\n");
+    std::str::push(out, extra);
+    std::str::push(out, "Transfer-Encoding: chunked\r\n\r\n");
+    let chunks = chunked(body, chunk_size);
+    std::str::push(out, std::string::as_str(chunks));
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Spec helpers.
+// ----------------------------------------------------------------------------
+
+fn ok_of(in raw: Str, take response: Bool) -> Bool {
+    let h = parse_head(raw, response);
+    h.ok
+}
+
+fn status_of(in raw: Str) -> Int {
+    let h = parse_head(raw, true);
+    h.status
+}
+
+fn reason_text(in raw: Str) -> String {
+    let h = parse_head(raw, true);
+    h.reason
+}
+
+fn method_text(in raw: Str) -> String {
+    let h = parse_head(raw, false);
+    h.method
+}
+
+fn target_text(in raw: Str) -> String {
+    let h = parse_head(raw, false);
+    h.target
+}
+
+fn minor_of(in raw: Str, take response: Bool) -> Int {
+    let h = parse_head(raw, response);
+    h.version_minor
+}
+
+fn end_of(in raw: Str, take response: Bool) -> Int {
+    let h = parse_head(raw, response);
+    h.end
+}
+
+fn count_of(in raw: Str, take response: Bool) -> Int {
+    header_count(parse_head(raw, response))
+}
+
+fn header_text(in raw: Str, take response: Bool, in name: Str) -> String {
+    header(parse_head(raw, response), name)
+}
+
+fn rule_of(in raw: Str, take response: Bool, take head_request: Bool) -> Int {
+    body_rule(parse_head(raw, response), head_request)
+}
+
+fn cl_of(in raw: Str, take response: Bool) -> Int {
+    content_length(parse_head(raw, response))
+}
+
+fn close_of(in raw: Str, take response: Bool) -> Bool {
+    wants_close(parse_head(raw, response))
+}
+
+fn body_len(in raw: Str, take response: Bool) -> Int {
+    std::string::len(body(raw, response, false))
+}
+
+fn body_prefix(in raw: Str, take response: Bool, take n: Int) -> String {
+    let b = body(raw, response, false);
+    slice(std::string::as_str(b), 0, n)
+}
+
+fn line_with(in name: Str, in value: Str) -> String {
+    var out = std::string::empty();
+    header_line(out, name, value);
+    out
+}
+
+fn simple_get() -> Str {
+    "GET /health HTTP/1.1\r\nHost: api.local\r\nAccept: */*\r\n\r\n"
+}
+
+fn post_with_body() -> Str {
+    "POST /echo HTTP/1.1\r\nHost: api.local\r\nContent-Length: 5\r\n\r\nhello"
+}
+
+fn smuggle_shape() -> Str {
+    "POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+}
+
+spec parse_head {
+    // Requests.
+    then ok_of(simple_get(), false);
+    then std::string::as_str(method_text(simple_get())) == "GET";
+    then std::string::as_str(target_text(simple_get())) == "/health";
+    then minor_of(simple_get(), false) == 1;
+    then end_of(simple_get(), false) == 54;
+    then count_of(simple_get(), false) == 2;
+    then std::string::as_str(header_text(simple_get(), false, "host")) == "api.local";
+    then std::string::as_str(header_text(simple_get(), false, "ACCEPT")) == "*/*";
+    then std::string::as_str(header_text(simple_get(), false, "X-Missing")) == "";
+    then minor_of("GET / HTTP/1.0\r\n\r\n", false) == 0;
+    // Responses, from bytes real servers sent.
+    then ok_of(http::fixture::example_com(), true);
+    then status_of(http::fixture::example_com()) == 200;
+    then std::string::as_str(reason_text(http::fixture::example_com())) == "OK";
+    then count_of(http::fixture::example_com(), true) == 11;
+    then std::string::as_str(header_text(http::fixture::example_com(), true, "content-type")) == "text/html";
+    then std::string::as_str(header_text(http::fixture::example_com(), true, "Server")) == "cloudflare";
+    then end_of(http::fixture::example_com(), true) == 296;
+    then status_of(http::fixture::httpbin_redirect()) == 302;
+    then std::string::as_str(reason_text(http::fixture::httpbin_redirect())) == "FOUND";
+    then std::string::as_str(header_text(http::fixture::httpbin_redirect(), true, "Location")) == "/get";
+    then status_of(http::fixture::httpbin_post()) == 200;
+    then std::string::as_str(header_text(http::fixture::httpbin_post(), true, "Content-Length")) == "437";
+    // Optional whitespace around a value is trimmed; the value keeps its
+    // inner spaces.
+    then std::string::as_str(header_text("GET / HTTP/1.1\r\nX-A:   a b  \r\n\r\n", false, "x-a")) == "a b";
+    // A status line with an empty reason phrase is legal.
+    then ok_of("HTTP/1.1 204 \r\n\r\n", true);
+    then ok_of("HTTP/1.1 204\r\n\r\n", true);
+    // Refused: no version (HTTP/0.9), an unknown version, a target with a
+    // space, whitespace before the colon (RFC 9112 §5.1), a non-token name,
+    // a line without a colon, a status that is not three digits, an
+    // incomplete head.
+    then ok_of("GET /\r\n\r\n", false) == false;
+    then ok_of("GET / HTTP/2.0\r\n\r\n", false) == false;
+    then ok_of("GET /a b HTTP/1.1\r\n\r\n", false) == false;
+    then ok_of("GET / HTTP/1.1\r\nHost : a\r\n\r\n", false) == false;
+    then ok_of("GET / HTTP/1.1\r\nBad Name: a\r\n\r\n", false) == false;
+    then ok_of("GET / HTTP/1.1\r\nnocolon\r\n\r\n", false) == false;
+    then ok_of("HTTP/1.1 20 OK\r\n\r\n", true) == false;
+    then ok_of("HTTP/1.1 OK\r\n\r\n", true) == false;
+    then ok_of("GET / HTTP/1.1\r\nHost: a\r\n", false) == false;
+    then ok_of("", false) == false;
+}
+
+spec head_needed {
+    then head_needed("") == 1;
+    then head_needed("GET / HTTP/1.1\r\nHost: x\r\n") == 1;
+    then head_needed("GET / HTTP/1.1\r\nHost: x\r\n\r\n") == 0;
+    then head_needed(http::fixture::example_com()) == 0;
+    then blank_line_at("HTTP/1.1 200 OK\r\n\r\nbody") == 15;
+    then blank_line_at("HTTP/1.1 200 OK\r\n") == 0 - 1;
+}
+
+spec content_length {
+    then cl_of(post_with_body(), false) == 5;
+    then cl_of(simple_get(), false) == 0 - 1;
+    then cl_of(http::fixture::httpbin_post(), true) == 437;
+    then cl_of("GET / HTTP/1.1\r\nContent-Length: abc\r\n\r\n", false) == 0 - 2;
+    then cl_of("GET / HTTP/1.1\r\nContent-Length: -1\r\n\r\n", false) == 0 - 2;
+    // Two that agree are one; two that disagree are a smuggling vector.
+    then cl_of("GET / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n", false) == 5;
+    then cl_of("GET / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n", false) == 0 - 2;
+}
+
+spec body_rule {
+    // Step 1: no body for HEAD responses and 1xx/204/304.
+    then rule_of("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", true, true) == rule_none();
+    then rule_of("HTTP/1.1 204 No Content\r\n\r\n", true, false) == rule_none();
+    then rule_of("HTTP/1.1 304 Not Modified\r\nContent-Length: 5\r\n\r\n", true, false) == rule_none();
+    then rule_of("HTTP/1.1 100 Continue\r\n\r\n", true, false) == rule_none();
+    // Step 2: chunked, from real servers; a foreign coding; the smuggling
+    // shape in a request.
+    then rule_of(http::fixture::example_com(), true, false) == rule_chunked();
+    then rule_of(http::fixture::httpbin_chunked(), true, false) == rule_chunked();
+    then rule_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", true, false) == rule_chunked();
+    then rule_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n", true, false) == rule_until_close();
+    then rule_of("POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n", false, false) == rule_invalid();
+    then rule_of(smuggle_shape(), false, false) == rule_invalid();
+    // Step 3: a length; an invalid one.
+    then rule_of(post_with_body(), false, false) == rule_length();
+    then rule_of(http::fixture::httpbin_post(), true, false) == rule_length();
+    then rule_of(http::fixture::httpbin_redirect(), true, false) == rule_length();
+    then rule_of("GET / HTTP/1.1\r\nContent-Length: x\r\n\r\n", false, false) == rule_invalid();
+    // Step 4: a request has none; a response runs to the close.
+    then rule_of(simple_get(), false, false) == rule_none();
+    then rule_of("HTTP/1.1 200 OK\r\n\r\n", true, false) == rule_until_close();
+    then rule_of("garbage", false, false) == rule_invalid();
+}
+
+spec is_chunked {
+    then list_has("gzip, chunked", "chunked");
+    then list_has("keep-alive", "Keep-Alive");
+    then list_has("keep-alive, Upgrade", "upgrade");
+    then list_has("keepalive", "keep-alive") == false;
+    then list_has("", "close") == false;
+}
+
+spec wants_close {
+    then close_of(http::fixture::example_com(), true);
+    then close_of(simple_get(), false) == false;
+    then close_of("GET / HTTP/1.1\r\nConnection: close\r\n\r\n", false);
+    then close_of("GET / HTTP/1.1\r\nConnection: Keep-Alive, close\r\n\r\n", false);
+    then close_of("GET / HTTP/1.0\r\n\r\n", false);
+    then close_of("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", false) == false;
+}
+
+spec chunked_end {
+    then chunked_end("5\r\nhello\r\n0\r\n\r\n", 0) == 15;
+    // Extensions after `;` and a trailer block are consumed.
+    then chunked_end("5;ext=1\r\nhello\r\n0\r\nX-Trailer: v\r\n\r\n", 0) == 35;
+    then chunked_end("A\r\n0123456789\r\n0\r\n\r\n", 0) == 20;
+    then chunked_end("a\r\n0123456789\r\n0\r\n\r\n", 0) == 20;
+    // Incomplete: the size line, the data, the terminator, the trailer.
+    then chunked_end("5", 0) == 0 - 3;
+    then chunked_end("5\r\nhel", 0) == 0 - 6;
+    then chunked_end("5\r\nhello\r\n", 0) == 0 - 3;
+    then chunked_end("5\r\nhello\r\n0\r\n", 0) == 0 - 3;
+    // Malformed: not hex, data not followed by CRLF.
+    then chunked_end("zz\r\n", 0) == 0 - 1;
+    then chunked_end("5\r\nhelloXX0\r\n\r\n", 0) == 0 - 1;
+    then std::string::as_str(dechunk("5\r\nhello\r\n0\r\n\r\n", 0)) == "hello";
+    then std::string::as_str(dechunk("3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n", 0)) == "hello";
+    then std::string::as_str(chunked("hello", 3)) == "3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n";
+    then std::string::as_str(chunked("", 3)) == "0\r\n\r\n";
+    then std::string::as_str(dechunk(std::string::as_str(chunked("0123456789abcdefghij", 16)), 0)) == "0123456789abcdefghij";
+    then hex_prefix("22f") == 559;
+    then hex_prefix("5;name=value") == 5;
+    then hex_prefix("") == 0 - 1;
+    then hex_prefix("g") == 0 - 1;
+}
+
+spec needed {
+    // A request with no body completes at the blank line.
+    then needed(simple_get(), false, false) == 0;
+    then needed("GET / HTTP/1.1\r\nHost: x\r\n", false, false) == 1;
+    // A length: exactly the bytes still missing.
+    then needed("POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n", false, false) == 5;
+    then needed("POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel", false, false) == 2;
+    then needed(post_with_body(), false, false) == 0;
+    then needed(http::fixture::httpbin_post(), true, false) == 0;
+    then needed(http::fixture::httpbin_redirect(), true, false) == 0;
+    then needed(std::string::as_str(slice(http::fixture::httpbin_post(), 0, 300)), true, false) == 362;
+    // Chunked: the real Cloudflare and gunicorn bodies, whole and cut.
+    then needed(http::fixture::example_com(), true, false) == 0;
+    then needed(http::fixture::httpbin_chunked(), true, false) == 0;
+    then needed(std::string::as_str(slice(http::fixture::example_com(), 0, 400)), true, false) == 462;
+    then needed(std::string::as_str(slice(http::fixture::example_com(), 0, 862)), true, false) == 1;
+    // Until close, and never.
+    then needed("HTTP/1.1 200 OK\r\n\r\nsome", true, false) == until_close();
+    then needed(smuggle_shape(), false, false) == 0 - 1;
+    then needed("GARBAGE\r\n\r\n", false, false) == 0 - 1;
+    then needed("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n", true, true) == 0;
+}
+
+spec message_end {
+    then message_end(simple_get(), false, false) == 54;
+    then message_end(post_with_body(), false, false) == 64;
+    then message_end(http::fixture::example_com(), true, false) == 867;
+    then message_end(http::fixture::httpbin_chunked(), true, false) == 727;
+    then message_end(http::fixture::httpbin_post(), true, false) == 662;
+    then message_end("HTTP/1.1 200 OK\r\n\r\nsome", true, false) == 23;
+    then message_end("POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhel", false, false) == 0 - 1;
+    // Two pipelined requests: the first ends where the second begins.
+    then message_end("GET /a HTTP/1.1\r\nHost: x\r\n\r\nGET /b HTTP/1.1\r\nHost: x\r\n\r\n", false, false) == 28;
+}
+
+spec body {
+    then std::string::as_str(body(post_with_body(), false, false)) == "hello";
+    then std::string::as_str(body(simple_get(), false, false)) == "";
+    // Cloudflare's chunked page, dechunked: 559 bytes of HTML.
+    then body_len(http::fixture::example_com(), true) == 559;
+    then std::string::as_str(body_prefix(http::fixture::example_com(), true, 15)) == "<!doctype html>";
+    // gunicorn's two chunks, joined.
+    then std::string::as_str(body_prefix(http::fixture::httpbin_chunked(), true, 8)) == "{\"url\": ";
+    then body_len(http::fixture::httpbin_post(), true) == 437;
+    then std::string::as_str(body_prefix(http::fixture::httpbin_post(), true, 14)) == "{\n  \"args\": {}";
+    then body_len(http::fixture::httpbin_redirect(), true) == 0;
+    then std::string::as_str(body("HTTP/1.1 200 OK\r\n\r\nsome", true, false)) == "some";
+}
+
+spec header_line {
+    then std::string::as_str(line_with("Content-Type", "text/html")) == "Content-Type: text/html\r\n";
+    // Injection is refused, not escaped: nothing is written.
+    then std::string::as_str(line_with("X-A", "v\r\nSet-Cookie: a=b")) == "";
+    then std::string::as_str(line_with("X-A", "v\nSet-Cookie: a=b")) == "";
+    then std::string::as_str(line_with("Bad Name", "v")) == "";
+    then std::string::as_str(line_with("", "v")) == "";
+    then is_header_safe("plain");
+    then is_header_safe("a\0b") == false;
+}
+
+spec request {
+    then std::string::as_str(request("GET", "/health", "api.local", "", "")) == "GET /health HTTP/1.1\r\nHost: api.local\r\n\r\n";
+    then std::string::as_str(request("POST", "/echo", "api.local", "Content-Type: text/plain\r\n", "hello")) == "POST /echo HTTP/1.1\r\nHost: api.local\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\nhello";
+    // A POST with no body still says so.
+    then std::string::as_str(request("POST", "/x", "h", "", "")) == "POST /x HTTP/1.1\r\nHost: h\r\nContent-Length: 0\r\n\r\n";
+    // What we build, we parse.
+    then needed(std::string::as_str(request("POST", "/echo", "api.local", "", "hello")), false, false) == 0;
+    then std::string::as_str(body(std::string::as_str(request("POST", "/echo", "api.local", "", "hello")), false, false)) == "hello";
+}
+
+spec response {
+    then std::string::as_str(response(200, "", "hello")) == "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+    then std::string::as_str(response(404, "Content-Type: text/plain\r\n", "")) == "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 0\r\n\r\n";
+    then std::string::as_str(chunked_response(200, "", "hello", 3)) == "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nhel\r\n2\r\nlo\r\n0\r\n\r\n";
+    then needed(std::string::as_str(chunked_response(200, "", "hello", 3)), true, false) == 0;
+    then std::string::as_str(body(std::string::as_str(chunked_response(200, "", "hello", 3)), true, false)) == "hello";
+    then reason_of(200) == "OK";
+    then reason_of(431) == "Request Header Fields Too Large";
+    then reason_of(299) == "Unknown";
+}
+
+spec eq_ignore_case {
+    then eq_ignore_case("Content-Length", "content-length");
+    then eq_ignore_case("a", "b") == false;
+    then eq_ignore_case("ab", "a") == false;
+    then decimal("437") == 437;
+    then decimal("") == 0 - 1;
+    then decimal("4x") == 0 - 1;
+    then is_token_byte(45);
+    then is_token_byte(58) == false;
+    then is_token_byte(32) == false;
+}
