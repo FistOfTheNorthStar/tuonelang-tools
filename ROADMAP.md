@@ -22,8 +22,9 @@ SHA-256/HMAC/PBKDF2, `std::bignum`, `std::json`, `std::fs`, `std::sync`,
 | this repo, `dns` | `socket.getaddrinfo` | stub resolver over UDP; 82 specs; resolves real names |
 | this repo, `argon2` | `passlib[argon2]` | Argon2id/i/d + BLAKE2b + PHC strings; 125 specs; verifies the backend's own hashes |
 | this repo, `redis` | `redis` | RESP2 client, the backend's commands, `redis://` URLs; 40 specs; 35 live checks against Redis 7 |
+| this repo, `http` | `httpx`, `requests`, `uvicorn` | HTTP/1.1 framing, client with redirects, keep-alive server; 107 specs; 29 live checks |
 
-All five prove the thesis: the *engine* of a Python library is pure logic, and pure
+All six prove the thesis: the *engine* of a Python library is pure logic, and pure
 logic is what tuonelang specs pin best.
 
 ---
@@ -54,12 +55,16 @@ over UDP, with a wire-format parser that specs cleanly. Done first as a
 warm-up — it was the shortest path to a real win, and it surfaced a runtime
 bug (`udp_bind` on loopback) that ADR-0017 had to be amended for.
 
-### 3. HTTP/1.1 client + server — replaces `httpx`, `requests`, `uvicorn`, `gunicorn`
+### 3. HTTP/1.1 client + server — replaces `httpx`, `requests`, `uvicorn`, `gunicorn` — ✅ done
 
-`examples/http-service` already serves itself over a live loopback socket, so
-the socket half is proven. What is needed is the full protocol: chunked transfer
-encoding, keep-alive, header parsing, redirects, timeouts, connection pooling.
-Pair it with TLS and the whole outbound-integration surface (Stripe, R2, Sentry)
+`examples/http-service` had already served itself over a live loopback
+socket, so the socket half was proven. The port adds the protocol: RFC 9112
+body framing (with the smuggling shapes refused), chunked transfer encoding
+both ways, keep-alive on the server, header parsing with injection refused
+on the way out, redirects with the RFC's method changes, bounded timeouts,
+and name resolution through `dns`. Client-side connection pooling is the
+one item left; `http::message::message_end` is what it loops on. Pair it
+with TLS and the whole outbound-integration surface (Stripe, R2, Sentry)
 becomes reachable.
 
 ### 4. FastAPI-equivalent routing + validation — replaces `fastapi` + `pydantic`
@@ -131,8 +136,8 @@ Be honest about these rather than half-porting them.
 1. ✅ **DNS** — small, unblocks name resolution, proves the UDP primitives.
 2. ✅ **Argon2** — small, self-contained, RFC test vectors, real security value.
 3. ✅ **Redis client** — the transport `tuolang-celery` needs to talk to a real broker.
-4. **HTTP/1.1** — the backbone of everything outbound and inbound. **Next.**
-5. **TLS 1.3** — the big one; unlocks every external integration at once.
+4. ✅ **HTTP/1.1** — the backbone of everything outbound and inbound.
+5. **TLS 1.3** — the big one; unlocks every external integration at once. **Next.**
 6. **Router + validation**, then **query layer** — the application framework.
 
 Tiers 2 and 3 fall out largely for free once 4 and 5 exist.

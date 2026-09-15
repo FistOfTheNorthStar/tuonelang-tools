@@ -5,18 +5,21 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Three ports so far:
+Four ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
 | **`dns`** — a stub resolver on the v0 UDP primitives | `socket.getaddrinfo` | 82 specs, and a live lookup against a public server |
 | **`argon2`** — Argon2id/i/d, BLAKE2b, and the PHC string format | `passlib[argon2]` | 125 specs, RFC 9106's vectors, and a hash the Python backend itself wrote |
 | **`redis`** — a RESP2 client, the commands Celery and slowapi use, `redis://` URLs | `redis` (under `celery[redis]` and `slowapi`) | 40 specs against bytes a Redis 7 server sent, and a 35-check live oracle |
+| **`http`** — HTTP/1.1 framing, a client with redirects, a keep-alive server | `httpx`, `requests`, `uvicorn` (behind Caddy) | 107 specs against bytes Cloudflare and gunicorn sent, an 18-check loopback oracle, an 11-check live one |
 
 ```bash
-./run-tests.sh          # front end, 247 specs, formatting, the native Argon2 oracle
-./run-tests.sh --live   # also resolve real names over UDP, and drive the Redis client
-                        # against shallowflaws's docker compose redis on 127.0.0.1:6380
+./run-tests.sh          # front end, 354 specs, formatting, the native Argon2 oracle,
+                        # and the HTTP server and client proving each other over loopback
+./run-tests.sh --live   # also resolve real names over UDP, fetch from public HTTP servers,
+                        # and drive the Redis client against shallowflaws's docker compose
+                        # redis on 127.0.0.1:6380
 ```
 
 Both ports are pure tuonelang over the v0 core, with the catalog modules
@@ -192,6 +195,90 @@ envelope on top of it belongs with `tuolang-celery`.
 
 ---
 
+## `http` — the wire under everything
+
+In production `shallowflaws` is uvicorn on port 8000 behind Caddy, which
+terminates TLS and forwards plain HTTP/1.1 — so a plain HTTP/1.1 server is
+exactly the production shape, and a plain client is the layer TLS will sit
+on. This port is both, over one pure message layer: `http::message` frames
+and parses, `http::url` takes URLs apart, `http::client` resolves names
+through this crate's own `dns::resolver` and follows redirects, and
+`http::server` accepts, reads, hands the request to a handler, and keeps
+the connection alive for the next one.
+
+### Status
+
+| Layer | State |
+|---|---|
+| `http::message` — start lines, headers, RFC 9112 §6.3 body framing, chunked, building | ✅ proven against server bytes |
+| `http::url` — `http://host[:port]/path?query`, percent-encoding, `urlencode` | ✅ proven |
+| `http::client` — resolve, connect, one request, read to the parser's word, redirects | ✅ 11 live checks through DNS |
+| `http::server` — accept, read, handle, keep-alive, 400/408/413 on its own | ✅ 18 loopback checks, served and fetched in one process |
+
+### What the specs pin that a comment cannot
+
+**Which of four framings applies.** RFC 9112 §6.3 decides a body's length
+by an ordered list — no body for `HEAD`/1xx/204/304, then
+`Transfer-Encoding`, then `Content-Length`, then "until close" for a
+response and "none" for a request. `http::message::body_rule` is that list
+and each step is spec'd, including the two that matter for security: a
+request carrying **both** `Transfer-Encoding` and `Content-Length` is
+invalid (the request-smuggling shape), and two `Content-Length` values that
+disagree are invalid. The server answers both with `400` before any handler
+runs; the loopback oracle sends the smuggling shape and checks.
+
+**The parser says how much to read.** As with `redis::resp`,
+`http::message::needed` is pure and returns `0`, `-1`, "until close", or a
+lower bound on the bytes still missing — exact for a `Content-Length` body
+and for each chunk. Both effect layers loop on that number and contain no
+framing logic; a chunked Cloudflare page cut at byte 400 is spec'd to need
+exactly 462 more.
+
+**A header cannot be injected.** `http::message::header_line` refuses —
+writes nothing for — a name that is not a token or a value containing
+`\r` or `\n`, so a user-controlled string cannot end the header block or
+add a `Set-Cookie` of its own. The spec asserts the empty result.
+
+**Redirects change the method the way the RFC says.** `303` always becomes
+`GET`; `301`/`302` do for `POST`; `307`/`308` never. A `Location` that is a
+path is resolved against the origin; a relative one, or an `https://` one,
+stops the chain with the last response in hand. A redirect loop ends after
+`max_redirects` with the last `302`, not a hang.
+
+### The two oracles
+
+`examples/http.tuo` listens on an ephemeral loopback port, forks a server
+and a client with `std::sync::par_map`, and joins them: a 200 000-byte body
+each way, a chunked response dechunked, `302` and `303` followed, two
+pipelined requests on one kept-alive connection answered in order, a
+`Connection: close` honoured, a malformed request line and the smuggling
+shape both `400`. It needs no network and `run-tests.sh` runs it by
+default. `examples/http_live.tuo` resolves `example.com` through
+`dns::resolver`, fetches it, follows httpbin's redirect, posts JSON to it,
+and confirms `https://` and an unresolvable name fail cleanly.
+
+### What is deliberately not here
+
+No TLS: `https://` parses and is refused. One request per client
+connection — the server keeps connections alive, the client does not pool
+them, and `http::message::message_end` is what a pool would loop on. One
+connection at a time on the server; `par_map` could fork accepted
+connections but cannot share a listener's state without an effect. No
+HTTP/2, no `Expect: 100-continue`, no compression, no `Upgrade`. The
+`router` and validation layers the roadmap lists next sit on top of
+`http::server`'s handler, which receives the raw request and returns the
+raw response.
+
+### A compiler finding
+
+Writing the loopback oracle surfaced a code-generation refusal: a
+temporary owned value in the right operand of `&&` or `||` fails MIR
+verification natively while `tuo check` accepts it. The reduction, the
+table of what does and does not trigger it, and the one-line workaround
+are in [`docs/COMPILER-FINDING.md`](docs/COMPILER-FINDING.md).
+
+---
+
 ## `dns` — name resolution
 
 The resolver ADR-0017 says belongs *in tuonelang* on the UDP primitives,
@@ -307,14 +394,25 @@ src/redis/url.tuo        redis:// and rediss:// URLs
 src/redis/client.tuo     the effect boundary: open, send, read one reply, close
 examples/redis.tuo       the live oracle (needs the docker compose redis on 6380)
 
+src/http/message.tuo     HTTP/1.1: start lines, headers, body framing, chunked, building
+src/http/fixture.tuo     responses Cloudflare and gunicorn sent, byte for byte
+src/http/url.tuo         http:// URLs, percent-encoding, urlencode
+src/http/client.tuo      resolve through dns, connect, one request, redirects
+src/http/server.tuo      accept, read under the parser's direction, handle, keep alive
+examples/http.tuo        the loopback oracle: server and client in one process
+examples/http_live.tuo   the live oracle: public servers through dns::resolver
+
+docs/COMPILER-FINDING.md the && / || temporary that native codegen refuses
+
 docs/RUNTIME-FINDING.md  the udp_bind finding, and its resolution
 ```
 
 `src/std_bits.tuo`, `src/std_str.tuo`, `src/std_net.tuo`, `src/std_crypto.tuo`,
-and `src/std_ct.tuo` are **verbatim copies** of the catalog modules in
+`src/std_ct.tuo`, and `src/std_sync.tuo` are **verbatim copies** of the catalog modules in
 `crates/tuo-stdlib/src/std/`, vendored because v0 has no registry and passed
 as compiler inputs — exactly as `examples/postgres-auth` documents. They are
 byte-identical; edit the catalog, not these, and they are excluded from
 `fmt --check` for that reason. `std_crypto` is here for SHA-256 (the
 backend's pre-hash), Base64, hex, and the constant-time `verify`; `std_ct`
-is what that `verify` is built on.
+is what that `verify` is built on; `std_sync` is `par_map`, which the HTTP
+loopback oracle forks its server and client with.
