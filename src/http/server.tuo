@@ -1,0 +1,188 @@
+// http::server — the effect boundary for inbound requests.
+//
+// In production `shallowflaws` is served by uvicorn on port 8000 behind
+// Caddy, which terminates TLS and forwards plain HTTP/1.1. This module is
+// the uvicorn half of that: accept a connection, read one request under
+// `http::message::needed`'s direction, hand the raw request to a handler,
+// write what the handler returns, and — unless either side said
+// `Connection: close` — read the next request on the same connection.
+//
+// THE HANDLER IS A FUNCTION VALUE, `fn(in String) -> String`: the raw
+// request in, a complete raw response out. It is called only with a request
+// `http::message::parse_head` accepted and whose body arrived in full, so
+// it can parse without checking; it builds its answer with
+// `http::message::response`. v0 function values capture nothing, which is
+// the right constraint for a handler: everything it knows comes in through
+// the request.
+//
+// WHAT THE SERVER REFUSES ON ITS OWN, before the handler sees anything:
+// a head that is not HTTP/1.x, or exceeds `max_head_bytes`, or carries the
+// smuggling shape (`400`); a body larger than `max_body_bytes` (`413`); a
+// peer that starts a request and stops (`408`). A peer that connects and
+// sends nothing, or closes, is dropped without a response. Every wait is
+// bounded by `timeout_ms`, so a silent peer holds the server for that long
+// and no longer — one connection at a time, which is the concurrency model
+// this port has, and a documented limit.
+//
+// Effectful, so no specs (`R0007`); pinned by `examples/http.tuo`, which
+// serves and fetches in one process.
+
+module http::server;
+
+/// The largest request body the server will read.
+///
+/// # Example
+/// ```tuo
+/// let n = http::server::max_body_bytes(); // 1048576
+/// ```
+pub fn max_body_bytes() -> Int {
+    1048576
+}
+
+/// The timeout `serve` uses for accepting and for each read when a caller
+/// has no better idea.
+///
+/// # Example
+/// ```tuo
+/// let ms = http::server::default_timeout_ms(); // 5000
+/// ```
+pub fn default_timeout_ms() -> Int {
+    5000
+}
+
+/// What `read_request` found: `status` 0 with the raw request, a status to
+/// answer with and close (400, 408, 413), or `-1` for a connection to drop
+/// silently.
+struct Inbound {
+    status: Int,
+    raw: String,
+}
+
+/// EFFECT: read exactly one request from `fd`.
+///
+/// # Example
+/// ```tuo
+/// let inbound = http::server::read_request(fd, 5000);
+/// ```
+pub fn read_request(take fd: Int, take timeout_ms: Int) -> Inbound {
+    var buf = std::string::empty();
+    var need = http::message::needed(std::string::as_str(buf), false, false);
+    while need != 0 {
+        if need < 0 {
+            return Inbound { status: 400, raw: std::string::empty() };
+        }
+        if std::string::len(buf) + need > http::message::max_head_bytes() + max_body_bytes() {
+            return Inbound { status: 413, raw: std::string::empty() };
+        }
+        var i = 0;
+        while i < need {
+            let b = std::net::read_byte_timeout(fd, timeout_ms);
+            if b < 0 {
+                // A timeout after some bytes is a stalled request; before
+                // any, an idle connection. Closed or errored: drop.
+                if b == 0 - 3 && std::string::len(buf) > 0 {
+                    return Inbound { status: 408, raw: std::string::empty() };
+                }
+                return Inbound { status: 0 - 1, raw: std::string::empty() };
+            }
+            std::string::push_byte(buf, b);
+            i = i + 1;
+        }
+        need = http::message::needed(std::string::as_str(buf), false, false);
+    }
+    Inbound { status: 0, raw: buf }
+}
+
+/// The response the server sends for a request it refused itself.
+///
+/// # Example
+/// ```tuo
+/// let r = http::server::refusal(400); // "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n..."
+/// ```
+pub fn refusal(take status: Int) -> String {
+    http::message::response(status, "Connection: close\r\nContent-Type: text/plain\r\n", http::message::reason_of(status))
+}
+
+/// Whether a raw response the handler built asks for the connection to
+/// close.
+///
+/// # Example
+/// ```tuo
+/// let bye = http::server::response_closes(raw);
+/// ```
+pub fn response_closes(in raw: String) -> Bool {
+    let h = http::message::parse_head(std::string::as_str(raw), true);
+    if !h.ok {
+        return true;
+    }
+    http::message::wants_close(h)
+}
+
+/// EFFECT: serve requests on one accepted connection until it closes, the
+/// peer or handler asks to, or a request is refused. Returns the number of
+/// requests the handler answered. Closes `fd`.
+///
+/// # Example
+/// ```tuo
+/// let n = http::server::serve_connection(fd, handle, 5000);
+/// ```
+pub fn serve_connection(take fd: Int, take handler: fn(in String) -> String, take timeout_ms: Int) -> Int {
+    var served = 0;
+    var open = true;
+    while open {
+        let inbound = read_request(fd, timeout_ms);
+        if inbound.status < 0 {
+            open = false;
+        } else {
+            if inbound.status > 0 {
+                let _ = std::rt::write_string(fd, refusal(inbound.status));
+                open = false;
+            } else {
+                let head = http::message::parse_head(std::string::as_str(inbound.raw), false);
+                let response = handler(inbound.raw);
+                if std::rt::write_string(fd, response) < 0 {
+                    open = false;
+                } else {
+                    served = served + 1;
+                    if http::message::wants_close(head) || response_closes(response) {
+                        open = false;
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::net::close(fd);
+    served
+}
+
+/// EFFECT: accept up to `max_connections` connections on `listener` (a
+/// descriptor from `std::net::listen`), serving each to completion in
+/// turn, and return the total number of requests answered. Stops early
+/// when no connection arrives within `timeout_ms`, so a caller is never
+/// held forever. Does not close `listener`.
+///
+/// # Example
+/// ```tuo
+/// let listener = std::net::listen(8000);
+/// let answered = http::server::serve(listener, handle, 100, 5000);
+/// ```
+pub fn serve(take listener: Int, take handler: fn(in String) -> String, take max_connections: Int, take timeout_ms: Int) -> Int {
+    var answered = 0;
+    var connections = 0;
+    while connections < max_connections {
+        let fd = std::net::accept_timeout(listener, timeout_ms);
+        if fd < 0 {
+            return answered;
+        }
+        answered = answered + serve_connection(fd, handler, timeout_ms);
+        connections = connections + 1;
+    }
+    answered
+}
+
+spec refusal {
+    then std::string::as_str(refusal(400)) == "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: 11\r\n\r\nBad Request";
+    then response_closes(refusal(413));
+    then response_closes(http::message::response(200, "", "ok")) == false;
+    then response_closes(std::string::from_str("garbage"));
+}

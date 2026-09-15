@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # run-tests.sh — the validation suite for tuonelang-python-tools.
 #
-#   ./run-tests.sh          front end, specs, formatting, and the native
-#                           Argon2 oracle (no network)
+#   ./run-tests.sh          front end, specs, formatting, the native Argon2
+#                           oracle, and the HTTP loopback oracle (no network)
 #   ./run-tests.sh --live   also resolve real names against a public DNS
-#                           server, and drive the Redis client against the
-#                           docker compose redis on 127.0.0.1:6380
+#                           server, fetch from public HTTP servers, and drive
+#                           the Redis client against the docker compose redis
+#                           on 127.0.0.1:6380
 #
 # TUO may be set to a `tuo` binary; otherwise the one on PATH is used.
 #
@@ -39,6 +40,11 @@ ARGON2_SRC=(src/argon2/word.tuo src/argon2/blake2b.tuo src/argon2/hprime.tuo
             src/std_crypto.tuo src/std_ct.tuo src/std_bits.tuo src/std_str.tuo)
 REDIS_SRC=(src/redis/resp.tuo src/redis/command.tuo src/redis/url.tuo
            src/redis/client.tuo src/std_str.tuo src/std_net.tuo)
+HTTP_SRC=(src/http/message.tuo src/http/fixture.tuo src/http/url.tuo
+          src/http/client.tuo src/http/server.tuo
+          src/dns/wire.tuo src/dns/name.tuo src/dns/message.tuo src/dns/record.tuo
+          src/dns/resolver.tuo
+          src/std_str.tuo src/std_net.tuo src/std_bits.tuo src/std_sync.tuo)
 
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
@@ -62,11 +68,17 @@ step "Redis: front end (check)"
 step "Redis: specs (verify)"
 "$TUO" verify "${REDIS_SRC[@]}"; check $? "redis verify"
 
+step "HTTP: front end (check)"
+"$TUO" check "${HTTP_SRC[@]}" examples/http.tuo examples/http_live.tuo; check $? "http check"
+
+step "HTTP: specs (verify)"
+"$TUO" verify "${HTTP_SRC[@]}"; check $? "http verify"
+
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
 # to `crates/tuo-stdlib/src/std/`.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.
@@ -80,6 +92,17 @@ else
   check 1 "argon2 oracle"
 fi
 
+# The HTTP server and client prove each other over loopback, in one process.
+step "HTTP: loopback oracle (server and client in one process)"
+"$TUO" run examples/http.tuo "${HTTP_SRC[@]}"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  check 0 "http oracle (all checks agreed)"
+else
+  echo "http oracle exited $rc — that many checks disagreed"
+  check 1 "http oracle"
+fi
+
 if [ "$live" -eq 1 ]; then
   step "DNS: live — resolve real names"
   "$TUO" run examples/resolve.tuo "${DNS_SRC[@]}"
@@ -89,6 +112,16 @@ if [ "$live" -eq 1 ]; then
   else
     echo "resolve exited $rc — see docs/RUNTIME-FINDING.md"
     check 1 "resolve"
+  fi
+
+  step "HTTP: live — public servers through dns::resolver"
+  "$TUO" run examples/http_live.tuo "${HTTP_SRC[@]}"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    check 0 "http live (all checks agreed)"
+  else
+    echo "http live exited $rc — that many checks disagreed"
+    check 1 "http live"
   fi
 
   # The Redis oracle needs shallowflaws's docker compose redis on 127.0.0.1:6380.

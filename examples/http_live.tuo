@@ -1,0 +1,66 @@
+// examples/http_live — the client against public servers, through DNS.
+//
+// `examples/http.tuo` proves the client and server agree with each other.
+// This one proves the client agrees with the internet: names are resolved
+// by this crate's own `dns::resolver`, and the responses come from the
+// same servers whose bytes `http::fixture` holds.
+//
+//     tuo run examples/http_live.tuo src/http/*.tuo src/dns/*.tuo src/std_str.tuo src/std_net.tuo src/std_bits.tuo src/std_sync.tuo
+//
+// It needs UDP to 1.1.1.1:53 and TCP to port 80. It prints one line per
+// check and exits with the number that failed.
+
+module http_live;
+
+fn timeout() -> Int {
+    10000
+}
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn main() -> Int {
+    var failed = 0;
+    let t = timeout();
+
+    let address = http::client::resolve_host("example.com", http::client::default_resolver(), t);
+    failed = failed + report("example.com resolves through dns::resolver", std::string::len(address) > 0);
+
+    let r1 = http::client::get("http://example.com/", t);
+    failed = failed + report("GET http://example.com/ is 200", r1.ok && r1.status == 200);
+    failed = failed + report("its body says Example Domain", std::str::contains(std::string::as_str(r1.body), "Example Domain"));
+    failed = failed + report("its Content-Type is text/html", std::str::starts_with(std::string::as_str(http::client::header(r1, "Content-Type")), "text/html"));
+
+    let r2 = http::client::get("http://httpbin.org/redirect-to?url=/get", t);
+    failed = failed + report("httpbin's 302 to /get is followed to a 200", r2.ok && r2.status == 200);
+    failed = failed + report("the followed response is the JSON of /get", std::str::contains(std::string::as_str(r2.body), "\"url\""));
+
+    let r3 = http::client::post("http://httpbin.org/post", "application/json", "{\"a\":1,\"b\":2}", t);
+    failed = failed + report("POST http://httpbin.org/post is 200", r3.ok && r3.status == 200);
+    failed = failed + report("httpbin parsed the JSON body it was sent", std::str::contains(std::string::as_str(r3.body), "\"a\": 1"));
+
+    let r4 = http::client::get("http://httpbin.org/status/404", t);
+    failed = failed + report("GET /status/404 is a 404 response, not a failure", r4.ok && r4.status == 404);
+
+    let r5 = http::client::get("https://example.com/", t);
+    failed = failed + report("https:// is refused (no TLS in v0)", !r5.ok);
+
+    let r6 = http::client::get("http://this-name-should-not-exist-tuonelang.example.com/", t);
+    failed = failed + report("a name that does not resolve is a failure, not a hang", !r6.ok);
+
+    failed
+}
