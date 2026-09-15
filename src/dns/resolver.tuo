@@ -180,10 +180,11 @@ pub fn classify(in msg: Str, take sent_id: Int) -> Int {
 /// EFFECT: resolve `name` to an IPv4 address by asking the resolver at
 /// `server`, waiting at most `timeout_ms` in total.
 ///
-/// Returns the outcome code; the address itself is read with
-/// [`resolve_address`], since v0 has no tuple return and a `Result[String, Int]`
-/// would still need the caller to hold both. The two calls send two queries, so
-/// [`lookup`] below is the one a program should use.
+/// Returns the outcome code only. A program that wants the address calls
+/// [`lookup`] below, which sends the same single query and reads the first
+/// `A` record out of the reply; the two are separate because v0 has no
+/// tuple return, and a `Result[String, Int]` would still need the caller to
+/// hold both.
 ///
 /// Effectful, so no spec (`R0007`) — the judgement it applies is spec'd in
 /// [`classify`], and the whole path is exercised by `examples/resolve.tuo`
@@ -244,9 +245,29 @@ pub fn query_once(take sock: Int, in server: Str, in name: Str, take timeout_ms:
 /// // let rc = dns::resolver::receive_answer(sock, 4660, 2000);
 /// ```
 pub fn receive_answer(take sock: Int, take sent_id: Int, take timeout_ms: Int) -> Int {
+    let reply = receive_reply(sock, sent_id, timeout_ms);
+    if std::string::len(reply) == 0 {
+        return err_timeout();
+    }
+    classify(std::string::as_str(reply), sent_id)
+}
+
+/// EFFECT: the datagram behind [`receive_answer`] — the first reply whose id
+/// matches `sent_id`, as raw bytes, or an empty `String` when the wait ends
+/// without one (timeout, host error, or [`max_replies`] strangers).
+///
+/// A datagram that is not ours — a late reply to an earlier query, or an
+/// injected forgery — is dropped and the wait resumed, rather than failing the
+/// lookup. Otherwise anyone able to send one packet could cancel any query.
+///
+/// # Example
+/// ```tuo
+/// // let reply = dns::resolver::receive_reply(sock, 4660, 2000);
+/// ```
+pub fn receive_reply(take sock: Int, take sent_id: Int, take timeout_ms: Int) -> String {
     var tries = 0;
-    var outcome = err_timeout();
     var settled = false;
+    var matched = std::string::empty();
     while tries < max_replies() && !settled {
         let len = std::net::udp_recv(sock, timeout_ms);
         if len < 0 {
@@ -262,20 +283,74 @@ pub fn receive_answer(take sock: Int, take sent_id: Int, take timeout_ms: Int) -
                 }
                 i = i + 1;
             }
-            let verdict = classify(std::string::as_str(buf), sent_id);
             // A reply for a different id is someone else's; keep waiting.
             let got_id = match dns::message::id(std::string::as_str(buf)) {
                 Some { value } => value,
                 None => 0 - 1,
             };
             if got_id == sent_id {
-                outcome = verdict;
+                matched = std::string::from_str(std::string::as_str(buf));
                 settled = true;
             }
         }
         tries = tries + 1;
     }
-    outcome
+    matched
+}
+
+/// EFFECT: resolve `name` to its first IPv4 address by asking the resolver
+/// at `server`, or an empty `String` when the outcome is anything but
+/// [`ok`] — the name does not exist, has no `A` record, the reply was
+/// truncated, or nothing came back in `timeout_ms`.
+///
+/// One query, one socket, closed on every path. This is what a client that
+/// needs to *connect* calls; [`resolve`] is for one that needs to know why
+/// it could not.
+///
+/// # Example
+/// ```tuo
+/// // let address = dns::resolver::lookup("1.1.1.1", "example.com", 2000); // "93.184.216.34" or ""
+/// ```
+pub fn lookup(in server: Str, in name: Str, take timeout_ms: Int) -> String {
+    let sock = std::net::udp_bind(0);
+    if sock < 0 {
+        return std::string::empty();
+    }
+    let address = lookup_once(sock, server, name, timeout_ms);
+    let _ = std::net::close(sock);
+    address
+}
+
+/// EFFECT: the body of [`lookup`], on an already-bound socket.
+///
+/// # Example
+/// ```tuo
+/// // let address = dns::resolver::lookup_once(sock, "1.1.1.1", "example.com", 2000);
+/// ```
+pub fn lookup_once(take sock: Int, in server: Str, in name: Str, take timeout_ms: Int) -> String {
+    let id = message_id();
+    let query = match dns::message::build_query(id, name, dns::message::type_a()) {
+        Some { value } => value,
+        None => std::string::empty(),
+    };
+    let bytes = std::string::as_str(query);
+    if std::str::len(bytes) == 0 {
+        return std::string::empty();
+    }
+    if std::net::udp_send(sock, server, dns_port(), bytes) < 0 {
+        return std::string::empty();
+    }
+    let reply = receive_reply(sock, id, timeout_ms);
+    if std::string::len(reply) == 0 {
+        return std::string::empty();
+    }
+    if classify(std::string::as_str(reply), id) != ok() {
+        return std::string::empty();
+    }
+    match dns::record::first_ipv4(std::string::as_str(reply)) {
+        Some { value } => value,
+        None => std::string::empty(),
+    }
 }
 
 /// The most datagrams [`receive_answer`] will consider before giving up.
