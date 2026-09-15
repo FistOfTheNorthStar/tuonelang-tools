@@ -9,6 +9,13 @@
 // redirect, do it again — a bounded number of times, with the method
 // changes RFC 9110 §15.4 prescribes.
 //
+// `https://` IS SERVED BY `tls::client`, WITH A PINNED KEY. There is no
+// certificate-chain validation in this crate, so a TLS request needs the
+// server's Ed25519 public key from the caller (`fetch_pinned`,
+// `get_pinned`); `get` and `post` refuse `https://` outright rather than
+// connect unverified. The bytes then cross the session instead of the
+// socket, and the same `http::message::needed` loop frames them.
+//
 // ONE REQUEST PER CONNECTION. Every request is sent with `Connection:
 // close`, so the response either has a length, is chunked, or runs to the
 // close the server has promised — and a pooled connection can never be
@@ -249,6 +256,47 @@ pub fn exchange(take fd: Int, in request: String, take head_request: Bool, take 
     parse_response(raw, head_request)
 }
 
+/// EFFECT: `read_response`, but the bytes come from a TLS session. The
+/// session's end — close_notify, or a record that fails to authenticate —
+/// is the close that an until-close response runs to.
+///
+/// # Example
+/// ```tuo
+/// let raw = http::client::read_response_tls(session, false, 10000);
+/// ```
+pub fn read_response_tls(mut session: tls::client::Session, take head_request: Bool, take timeout_ms: Int) -> String {
+    var buf = std::string::empty();
+    var need = http::message::needed(std::string::as_str(buf), true, head_request);
+    while need != 0 {
+        if need == 0 - 1 {
+            return std::string::empty();
+        }
+        if need == http::message::until_close() {
+            var reading = true;
+            while reading {
+                let b = tls::client::read_byte(session, timeout_ms);
+                if b < 0 {
+                    reading = false;
+                } else {
+                    std::string::push_byte(buf, b);
+                }
+            }
+            return buf;
+        }
+        var i = 0;
+        while i < need {
+            let b = tls::client::read_byte(session, timeout_ms);
+            if b < 0 {
+                return std::string::empty();
+            }
+            std::string::push_byte(buf, b);
+            i = i + 1;
+        }
+        need = http::message::needed(std::string::as_str(buf), true, head_request);
+    }
+    buf
+}
+
 /// EFFECT: the address to connect to for `host`: the literal, `127.0.0.1`
 /// for `localhost`, or what `resolver` answers — empty when it answers
 /// nothing.
@@ -268,14 +316,31 @@ pub fn resolve_host(in host: Str, in resolver: Str, take timeout_ms: Int) -> Str
 /// EFFECT: one request to `url_text`, no redirects followed. `extra` is
 /// pre-rendered header lines (see `http::message::header_line`); `Host`,
 /// `User-Agent`, `Connection: close`, and `Content-Length` are added.
+/// `https://` is refused: see `fetch_once_pinned`.
 ///
 /// # Example
 /// ```tuo
 /// let r = http::client::fetch_once("GET", "http://example.com/", "", "", 10000, "1.1.1.1");
 /// ```
 pub fn fetch_once(in method: Str, in url_text: Str, in extra: Str, in body: Str, take timeout_ms: Int, in resolver: Str) -> Response {
+    fetch_once_pinned(method, url_text, extra, body, timeout_ms, resolver, std::array::empty())
+}
+
+/// EFFECT: `fetch_once` for either scheme. An `https://` URL is served by
+/// a TLS 1.3 session that trusts only a certificate whose Ed25519 key is
+/// `pinned`; with no pin an `https://` request is refused before
+/// connecting. SNI names the host unless it is an address.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::fetch_once_pinned("GET", "https://localhost:4433/", "", "", 10000, "1.1.1.1", pin);
+/// ```
+pub fn fetch_once_pinned(in method: Str, in url_text: Str, in extra: Str, in body: Str, take timeout_ms: Int, in resolver: Str, in pinned: Array[Int]) -> Response {
     let u = http::url::parse(url_text);
-    if !u.ok || u.https {
+    if !u.ok {
+        return failed();
+    }
+    if u.https && std::array::len(pinned) != 32 {
         return failed();
     }
     let address = resolve_host(std::string::as_str(u.host), resolver, timeout_ms);
@@ -291,27 +356,61 @@ pub fn fetch_once(in method: Str, in url_text: Str, in extra: Str, in body: Str,
     http::message::header_line(headers, "Connection", "close");
     let hh = http::url::host_header(u);
     let request = http::message::request(method, std::string::as_str(u.target), std::string::as_str(hh), std::string::as_str(headers), body);
-    let r = exchange(fd, request, method == "HEAD", timeout_ms);
+    if !u.https {
+        let r = exchange(fd, request, method == "HEAD", timeout_ms);
+        let _ = std::net::close(fd);
+        return r;
+    }
+    let sni = if http::url::is_ipv4_literal(std::string::as_str(u.host)) {
+        std::string::empty()
+    } else {
+        std::string::from_str(std::string::as_str(u.host))
+    };
+    var session = tls::client::handshake(fd, std::string::as_str(sni), pinned, timeout_ms);
+    if !session.ok {
+        let _ = std::net::close(fd);
+        return failed();
+    }
+    if tls::client::write_all(session, std::string::as_str(request)) < 0 {
+        let _ = std::net::close(fd);
+        return failed();
+    }
+    let raw = read_response_tls(session, method == "HEAD", timeout_ms);
+    let _ = tls::client::close(session);
     let _ = std::net::close(fd);
-    r
+    if std::string::len(raw) == 0 {
+        return failed();
+    }
+    parse_response(raw, method == "HEAD")
 }
 
 /// EFFECT: `fetch_once`, following up to `max_redirects` redirects. The
 /// last response is returned when the chain is longer, when a `Location`
-/// cannot be followed (relative, or `https://`), or when it is not a
-/// redirect at all.
+/// cannot be followed (relative, or `https://` without a pin), or when it
+/// is not a redirect at all.
 ///
 /// # Example
 /// ```tuo
 /// let r = http::client::fetch("GET", "http://httpbin.org/redirect-to?url=/get", "", "", 10000, "1.1.1.1");
 /// ```
 pub fn fetch(in method: Str, in url_text: Str, in extra: Str, in body: Str, take timeout_ms: Int, in resolver: Str) -> Response {
+    fetch_pinned(method, url_text, extra, body, timeout_ms, resolver, std::array::empty())
+}
+
+/// EFFECT: `fetch_once_pinned`, following redirects, with `pinned`
+/// trusted for every `https://` hop.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::fetch_pinned("GET", "https://localhost:4433/", "", "", 10000, "1.1.1.1", pin);
+/// ```
+pub fn fetch_pinned(in method: Str, in url_text: Str, in extra: Str, in body: Str, take timeout_ms: Int, in resolver: Str, in pinned: Array[Int]) -> Response {
     var current_method = std::string::from_str(method);
     var current_url = std::string::from_str(url_text);
     var current_body = std::string::from_str(body);
     var hops = 0;
     while hops <= max_redirects() {
-        let r = fetch_once(std::string::as_str(current_method), std::string::as_str(current_url), extra, std::string::as_str(current_body), timeout_ms, resolver);
+        let r = fetch_once_pinned(std::string::as_str(current_method), std::string::as_str(current_url), extra, std::string::as_str(current_body), timeout_ms, resolver, pinned);
         if !r.ok || !is_redirect(r.status) || hops == max_redirects() {
             return r;
         }
@@ -351,6 +450,17 @@ pub fn post(in url_text: Str, in content_type: Str, in body: Str, take timeout_m
     var extra = std::string::empty();
     http::message::header_line(extra, "Content-Type", content_type);
     fetch("POST", url_text, std::string::as_str(extra), body, timeout_ms, default_resolver())
+}
+
+/// EFFECT: `GET url` over `http://` or `https://`, trusting only the
+/// Ed25519 key `pinned` for TLS, following redirects.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::get_pinned("https://localhost:4433/", pin, 10000);
+/// ```
+pub fn get_pinned(in url_text: Str, in pinned: Array[Int], take timeout_ms: Int) -> Response {
+    fetch_pinned("GET", url_text, "", "", timeout_ms, default_resolver(), pinned)
 }
 
 spec is_redirect {
