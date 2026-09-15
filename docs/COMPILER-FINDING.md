@@ -1,7 +1,11 @@
 # Finding: a temporary in the right operand of `&&` / `||` fails MIR verification
 
-**Status:** open — needs a fix in the `tuonelang` repo (`tuo-mir` lowering),
-not this one. Worked around in this crate by binding the value first.
+**Status:** resolved upstream — tuonelang commit `3a06c2b` (PR #61, merged
+2026-09-15) found and fixed the same bug independently: `short_circuit`
+lowered its conditional operand with a bare `self.expr()` instead of the
+`scoped_value` snapshot/restore every other branching construct uses. The
+reproduction below builds with a `tuo` from `f424add`, and the workaround
+in `examples/http.tuo` is now only a comment's worth of history.
 **Found by:** writing `examples/http.tuo`, whose client checks read a
 response header inside a `&&` chain.
 **Severity:** any program with the shape below is refused by `tuo build` /

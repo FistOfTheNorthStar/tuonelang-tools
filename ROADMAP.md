@@ -23,8 +23,9 @@ SHA-256/HMAC/PBKDF2, `std::bignum`, `std::json`, `std::fs`, `std::sync`,
 | this repo, `argon2` | `passlib[argon2]` | Argon2id/i/d + BLAKE2b + PHC strings; 125 specs; verifies the backend's own hashes |
 | this repo, `redis` | `redis` | RESP2 client, the backend's commands, `redis://` URLs; 40 specs; 35 live checks against Redis 7 |
 | this repo, `http` | `httpx`, `requests`, `uvicorn` | HTTP/1.1 framing, client with redirects, keep-alive server; 107 specs; 29 live checks |
+| this repo, `tls` | `ssl` (client side, pinned keys) | TLS 1.3 client on the catalog's stack; RFC 8448 reproduced; handshakes with `std::tls` and OpenSSL |
 
-All six prove the thesis: the *engine* of a Python library is pure logic, and pure
+All seven prove the thesis: the *engine* of a Python library is pure logic, and pure
 logic is what tuonelang specs pin best.
 
 ---
@@ -33,18 +34,21 @@ logic is what tuonelang specs pin best.
 
 Nothing else ships without these. Each is a hard blocker for the request path.
 
-### 1. TLS 1.3 — replaces the `ssl` module (blocks `httpx`, `stripe`, `boto3`, `redis` over TLS)
+### 1. TLS 1.3 — replaces the `ssl` module (blocks `httpx`, `stripe`, `boto3`, `redis` over TLS) — ◐ client done, chain validation next
 
 **The single highest-value port, and the one everything external waits on.**
-Today the workspace refuses TLS deliberately (ADR-0017) because it would need a
-crypto dependency. But `std::bignum` already ships modular arithmetic, and
-`std::crypto` already ships SHA-256/HMAC with RFC test vectors — the two hard
-halves of a handshake.
+On 2026-09-15 the tuonelang catalog landed X25519, ChaCha20-Poly1305,
+Ed25519, HKDF, DER, and a TLS 1.3 *server* verified against OpenSSL. This
+repo added the *client* the same day: `https://` now works in `http::client`
+against any server on that profile, with the certificate's Ed25519 key
+pinned by the caller.
 
-What is still missing: X25519, AES-GCM or ChaCha20-Poly1305, P-256 ECDSA
-verification, and X.509 certificate parsing. Certificate chain validation is
-where the real bugs live, and it is *exactly* the kind of pure, spec-shaped
-logic tuonelang is good at pinning.
+What is still missing is what public servers need: P-256 ECDSA (and RSA)
+signature verification, X.509 chain building with names and validity
+dates, and a root store. Certificate chain validation is where the real
+bugs live, and it is *exactly* the kind of pure, spec-shaped logic
+tuonelang is good at pinning. Until it lands, `get` refuses `https://`
+rather than offer an unverified mode.
 
 ### 2. DNS resolution — replaces `socket.getaddrinfo` — ✅ done
 
@@ -137,7 +141,9 @@ Be honest about these rather than half-porting them.
 2. ✅ **Argon2** — small, self-contained, RFC test vectors, real security value.
 3. ✅ **Redis client** — the transport `tuolang-celery` needs to talk to a real broker.
 4. ✅ **HTTP/1.1** — the backbone of everything outbound and inbound.
-5. **TLS 1.3** — the big one; unlocks every external integration at once. **Next.**
+5. ◐ **TLS 1.3** — the client is done on the catalog's profile; **next** is
+   P-256 ECDSA and X.509 chain validation, which is what makes it reach
+   Stripe, R2, and Sentry.
 6. **Router + validation**, then **query layer** — the application framework.
 
 Tiers 2 and 3 fall out largely for free once 4 and 5 exist.

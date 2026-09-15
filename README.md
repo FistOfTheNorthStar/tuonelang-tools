@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Four ports so far:
+Five ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -13,13 +13,14 @@ Four ports so far:
 | **`argon2`** — Argon2id/i/d, BLAKE2b, and the PHC string format | `passlib[argon2]` | 125 specs, RFC 9106's vectors, and a hash the Python backend itself wrote |
 | **`redis`** — a RESP2 client, the commands Celery and slowapi use, `redis://` URLs | `redis` (under `celery[redis]` and `slowapi`) | 40 specs against bytes a Redis 7 server sent, and a 35-check live oracle |
 | **`http`** — HTTP/1.1 framing, a client with redirects, a keep-alive server | `httpx`, `requests`, `uvicorn` (behind Caddy) | 107 specs against bytes Cloudflare and gunicorn sent, an 18-check loopback oracle, an 11-check live one |
+| **`tls`** — a TLS 1.3 client on the catalog's `std::tls`, and `https://` in the HTTP client | the `ssl` module, for the profile the catalog speaks | RFC 8448's trace reproduced from the client's side, a 12-check loopback oracle against `std::tls`, a 4-check handshake with OpenSSL |
 
 ```bash
-./run-tests.sh          # front end, 354 specs, formatting, the native Argon2 oracle,
-                        # and the HTTP server and client proving each other over loopback
+./run-tests.sh          # front end, the specs, formatting, the native Argon2 oracle, and
+                        # the HTTP and TLS loopback oracles (no network)
 ./run-tests.sh --live   # also resolve real names over UDP, fetch from public HTTP servers,
-                        # and drive the Redis client against shallowflaws's docker compose
-                        # redis on 127.0.0.1:6380
+                        # complete a TLS 1.3 handshake with openssl s_server, and drive the
+                        # Redis client against shallowflaws's docker compose redis on 6380
 ```
 
 Both ports are pure tuonelang over the v0 core, with the catalog modules
@@ -195,6 +196,80 @@ envelope on top of it belongs with `tuolang-celery`.
 
 ---
 
+## `tls` — the client half of TLS 1.3
+
+The tuonelang catalog landed a TLS 1.3 *server* stack on 2026-09-15 —
+X25519, ChaCha20-Poly1305, Ed25519 certificates, verified live against an
+OpenSSL client — and every primitive under it. What it did not have was a
+client, which is the half the roadmap needs: it is what `https://` in
+`http::client` runs on, and the layer under every outbound integration.
+This port is that client, built on the catalog's record protection, key
+schedule, and DER decoder, with the handshake logic pure and the socket
+sequence a thin loop over it.
+
+### Status
+
+| Layer | State |
+|---|---|
+| `tls::handshake` — ClientHello, ServerHello, the server's flight, the key schedule, the three checks | ✅ proven; RFC 8448 reproduced from the client's side |
+| `tls::client` — the session: handshake over a socket, records to bytes, tickets skipped | ✅ 12 loopback checks against `std::tls`, 4 against OpenSSL 3.6 |
+| `http::client::get_pinned` — `https://` with a pinned Ed25519 key | ✅ both oracles fetch over it |
+
+### What the specs pin that a comment cannot
+
+**The key schedule is the RFC's, from the client's chair.** RFC 8448
+prints every secret of one handshake. From its ECDHE result and its
+messages, the specs derive the same handshake secrets, the same IVs, the
+same application secrets, and — byte for byte — the client's Finished. The
+RFC's cipher is AES-GCM and its certificate RSA, so the record keys and the
+signature are not comparable; every hash, secret, IV, and MAC is, and every
+one is asserted. The X25519 step that produces the ECDHE result exceeds the
+spec sandbox's fuel and is asserted natively by the loopback oracle instead.
+
+**Our ClientHello is one the server accepts.** The catalog's own
+`hello_acceptable`, `hello_offers_suite`, `hello_offers_tls13`, and
+`hello_key_share` — the server-side readers an OpenSSL client has satisfied
+— are run over the hello this client builds, and its ServerHello reply is
+parsed back and accepted. A HelloRetryRequest is recognised by its random
+and refused rather than mistaken for a second hello.
+
+**Three checks, each spec'd to fail.** The certificate's key must be the
+pinned one, compared in constant time and never matched by an empty pin;
+the CertificateVerify must sign the transcript through the Certificate;
+the Finished must MAC the transcript through the CertificateVerify. Each
+has a spec that passes on the right input and a spec that fails on the
+wrong transcript, the wrong data, or a non-Ed25519 certificate; the
+Ed25519 verification itself, another curve operation past the fuel, is
+asserted natively with a real signature by the test key and a wrong key's.
+
+### The two oracles
+
+`examples/tls.tuo` forks a server on the catalog's `std::tls` and a client
+on `http::client::get_pinned` in one process and joins them: a full
+handshake, an HTTPS request answered through the record layer, the same
+server refused under a wrong pin before any Finished is sent, and
+`https://` without a pin refused without connecting. `examples/tls_openssl.tuo`
+does the same against `openssl s_server` started by `run-tests.sh --live`
+with the test certificate in `examples/tls-test/`: OpenSSL's status page
+comes back naming `TLS_CHACHA20_POLY1305_SHA256`, after the session
+tickets it sends first are read and discarded.
+
+### What is deliberately not here
+
+**Trust is a pinned key, and that is the whole limitation.** `std::der`
+decodes a certificate; nothing validates a chain, checks a name, or reads a
+validity date, so the caller supplies the Ed25519 key it expects. Public
+servers present ECDSA P-256 or RSA certificates this crate cannot verify,
+which is why `get` still refuses `https://`: an "accept anything" mode is
+not offered. Closing that gap — P-256 ECDSA over `std::bignum`, X.509 chain
+building, a root store — is the roadmap's next item. Also absent by
+decision: HelloRetryRequest, resumption, 0-RTT, key updates, client
+certificates, and any suite but the catalog's. And the catalog's own
+caveat carries over: `std::bignum` is variable-time, so the client's X25519
+step leaks timing on its ephemeral key.
+
+---
+
 ## `http` — the wire under everything
 
 In production `shallowflaws` is uvicorn on port 8000 behind Caddy, which
@@ -269,13 +344,13 @@ HTTP/2, no `Expect: 100-continue`, no compression, no `Upgrade`. The
 `http::server`'s handler, which receives the raw request and returns the
 raw response.
 
-### A compiler finding
+### A compiler finding, since fixed
 
 Writing the loopback oracle surfaced a code-generation refusal: a
-temporary owned value in the right operand of `&&` or `||` fails MIR
-verification natively while `tuo check` accepts it. The reduction, the
-table of what does and does not trigger it, and the one-line workaround
-are in [`docs/COMPILER-FINDING.md`](docs/COMPILER-FINDING.md).
+temporary owned value in the right operand of `&&` or `||` failed MIR
+verification natively while `tuo check` accepted it. The same bug was
+found and fixed independently in tuonelang the same day; the reduction and
+its resolution are in [`docs/COMPILER-FINDING.md`](docs/COMPILER-FINDING.md).
 
 ---
 
@@ -402,13 +477,22 @@ src/http/server.tuo      accept, read under the parser's direction, handle, keep
 examples/http.tuo        the loopback oracle: server and client in one process
 examples/http_live.tuo   the live oracle: public servers through dns::resolver
 
-docs/COMPILER-FINDING.md the && / || temporary that native codegen refuses
+src/tls/handshake.tuo    the client's half of the handshake, as pure data
+src/tls/client.tuo       the session: handshake over a socket, bytes over records
+src/tls/fixture.tuo      RFC 8448's trace, and the test certificate and its key
+examples/tls.tuo         the loopback oracle: this client against std::tls
+examples/tls_openssl.tuo the interop oracle: this client against openssl s_server
+examples/tls-test/       the test certificate as PEM, for openssl s_server
+
+docs/COMPILER-FINDING.md the && / || temporary native codegen refused (fixed upstream)
 
 docs/RUNTIME-FINDING.md  the udp_bind finding, and its resolution
 ```
 
 `src/std_bits.tuo`, `src/std_str.tuo`, `src/std_net.tuo`, `src/std_crypto.tuo`,
-`src/std_ct.tuo`, and `src/std_sync.tuo` are **verbatim copies** of the catalog modules in
+`src/std_ct.tuo`, `src/std_sync.tuo`, and — for the TLS client — `std_tls`,
+`std_hkdf`, `std_chacha`, `std_x25519`, `std_ed25519`, `std_der`,
+`std_sha512`, and `std_bignum` are **verbatim copies** of the catalog modules in
 `crates/tuo-stdlib/src/std/`, vendored because v0 has no registry and passed
 as compiler inputs — exactly as `examples/postgres-auth` documents. They are
 byte-identical; edit the catalog, not these, and they are excluded from
