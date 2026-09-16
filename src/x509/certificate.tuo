@@ -1,0 +1,707 @@
+// x509::certificate — the fields of an X.509 v3 certificate a TLS client
+// needs, decoded from DER (RFC 5280 §4).
+//
+// `std::der` reads a subject key out of a certificate; nothing more,
+// because the catalog's server never validates one. A client must. This
+// module reads everything a chain walk consumes — issuer and subject,
+// validity, the key and its algorithm, the signature and its algorithm,
+// and the four extensions that decide trust: basic constraints, key
+// usage, subject alternative names, and extended key usage.
+//
+// TOTAL ON HOSTILE INPUT, like `std::der`: every field is bounds-checked
+// through `std::der`'s headers, and any malformation yields `ok` false
+// rather than a trap, since these bytes arrive before anything is
+// authenticated.
+//
+// CRITICAL MEANS CRITICAL. RFC 5280 §4.2: a certificate with a critical
+// extension the validator does not understand must be rejected. So it is:
+// an unknown critical extension, or a critical name-constraints
+// extension (which this module does not yet enforce), makes the
+// certificate not `ok`. Ignoring it would be accepting a constraint the
+// issuer insisted on without honouring it.
+//
+// WHAT IS READ AND WHAT IS NOT. Names are kept as the raw DER of the Name
+// (issuer matches subject by byte equality, which RFC 5280 §7.1 permits
+// and every public CA satisfies). The serial, unique ids, policies, CRL
+// and OCSP pointers, and SCTs are skipped. Only DNS names are read from
+// the alternative names; a certificate without them names no host, since
+// the Common Name fallback has been retired everywhere that matters.
+
+module x509::certificate;
+
+/// What a subject public key is. `key_none` is unsupported or absent.
+pub struct Certificate {
+    ok: Bool,
+    version: Int,
+    tbs: Array[Int],
+    signature: Array[Int],
+    signature_algorithm: Int,
+    issuer: Array[Int],
+    subject: Array[Int],
+    not_before: Int,
+    not_after: Int,
+    key_kind: Int,
+    public_key: Array[Int],
+    is_ca: Bool,
+    path_len: Int,
+    key_usage: Int,
+    has_ext_key_usage: Bool,
+    server_auth: Bool,
+    dns_names: Array[String],
+}
+
+// --- Key kinds and signature algorithms, as small integers ------------------
+
+/// An unsupported or absent key.
+///
+/// # Example
+/// ```tuo
+/// let k = x509::certificate::key_none(); // 0
+/// ```
+pub fn key_none() -> Int {
+    0
+}
+
+/// An Ed25519 key: `public_key` is the 32-byte point.
+///
+/// # Example
+/// ```tuo
+/// let k = x509::certificate::key_ed25519(); // 1
+/// ```
+pub fn key_ed25519() -> Int {
+    1
+}
+
+/// A P-256 key: `public_key` is the 65-byte uncompressed point.
+///
+/// # Example
+/// ```tuo
+/// let k = x509::certificate::key_p256(); // 2
+/// ```
+pub fn key_p256() -> Int {
+    2
+}
+
+/// A P-384 key: `public_key` is the 97-byte uncompressed point.
+///
+/// # Example
+/// ```tuo
+/// let k = x509::certificate::key_p384(); // 3
+/// ```
+pub fn key_p384() -> Int {
+    3
+}
+
+/// An RSA key: `public_key` is the DER `RSAPublicKey`.
+///
+/// # Example
+/// ```tuo
+/// let k = x509::certificate::key_rsa(); // 4
+/// ```
+pub fn key_rsa() -> Int {
+    4
+}
+
+/// An unsupported signature algorithm.
+///
+/// # Example
+/// ```tuo
+/// let s = x509::certificate::sig_none(); // 0
+/// ```
+pub fn sig_none() -> Int {
+    0
+}
+
+/// Ed25519 (RFC 8410).
+///
+/// # Example
+/// ```tuo
+/// let s = x509::certificate::sig_ed25519(); // 1
+/// ```
+pub fn sig_ed25519() -> Int {
+    1
+}
+
+/// ecdsa-with-SHA256.
+///
+/// # Example
+/// ```tuo
+/// let s = x509::certificate::sig_ecdsa_sha256(); // 2
+/// ```
+pub fn sig_ecdsa_sha256() -> Int {
+    2
+}
+
+/// ecdsa-with-SHA384.
+///
+/// # Example
+/// ```tuo
+/// let s = x509::certificate::sig_ecdsa_sha384(); // 3
+/// ```
+pub fn sig_ecdsa_sha384() -> Int {
+    3
+}
+
+/// ecdsa-with-SHA512.
+///
+/// # Example
+/// ```tuo
+/// let s = x509::certificate::sig_ecdsa_sha512(); // 4
+/// ```
+pub fn sig_ecdsa_sha512() -> Int {
+    4
+}
+
+/// sha256WithRSAEncryption.
+///
+/// # Example
+/// ```tuo
+/// let s = x509::certificate::sig_rsa_sha256(); // 5
+/// ```
+pub fn sig_rsa_sha256() -> Int {
+    5
+}
+
+/// sha384WithRSAEncryption.
+///
+/// # Example
+/// ```tuo
+/// let s = x509::certificate::sig_rsa_sha384(); // 6
+/// ```
+pub fn sig_rsa_sha384() -> Int {
+    6
+}
+
+/// sha512WithRSAEncryption.
+///
+/// # Example
+/// ```tuo
+/// let s = x509::certificate::sig_rsa_sha512(); // 7
+/// ```
+pub fn sig_rsa_sha512() -> Int {
+    7
+}
+
+/// The key-usage bit for digitalSignature, in `key_usage`.
+///
+/// # Example
+/// ```tuo
+/// let signs = (c.key_usage & x509::certificate::usage_digital_signature()) != 0;
+/// ```
+pub fn usage_digital_signature() -> Int {
+    128
+}
+
+/// The key-usage bit for keyCertSign, in `key_usage`.
+///
+/// # Example
+/// ```tuo
+/// let issues = (c.key_usage & x509::certificate::usage_key_cert_sign()) != 0;
+/// ```
+pub fn usage_key_cert_sign() -> Int {
+    4
+}
+
+/// A certificate that failed to decode.
+///
+/// # Example
+/// ```tuo
+/// let c = x509::certificate::bad();
+/// ```
+pub fn bad() -> Certificate {
+    Certificate { ok: false, version: 0, tbs: std::array::empty(), signature: std::array::empty(), signature_algorithm: 0, issuer: std::array::empty(), subject: std::array::empty(), not_before: 0, not_after: 0, key_kind: 0, public_key: std::array::empty(), is_ca: false, path_len: 0 - 1, key_usage: 0 - 1, has_ext_key_usage: false, server_auth: false, dns_names: std::array::empty() }
+}
+
+// --- OIDs -------------------------------------------------------------------
+
+/// Whether the element at child `index` of the SEQUENCE at `at` is the
+/// OID spelled by `hex`.
+fn child_oid_is(in bytes: Array[Int], take at: Int, take index: Int, in hex: Str) -> Bool {
+    let parent = std::der::read_header(bytes, at);
+    let h = std::der::child_at(bytes, parent, index);
+    if !std::der::header_ok(h) || h.tag != std::der::tag_oid() {
+        return false;
+    }
+    std::der::value_equals(bytes, h, ec::field::hex_bytes(hex))
+}
+
+/// The signature algorithm code of the AlgorithmIdentifier at `at`.
+fn signature_algorithm_at(in bytes: Array[Int], take at: Int) -> Int {
+    if child_oid_is(bytes, at, 0, "2a864886f70d01010b") {
+        return sig_rsa_sha256();
+    }
+    if child_oid_is(bytes, at, 0, "2a8648ce3d040302") {
+        return sig_ecdsa_sha256();
+    }
+    if child_oid_is(bytes, at, 0, "2a8648ce3d040303") {
+        return sig_ecdsa_sha384();
+    }
+    if child_oid_is(bytes, at, 0, "2a864886f70d01010c") {
+        return sig_rsa_sha384();
+    }
+    if child_oid_is(bytes, at, 0, "2a864886f70d01010d") {
+        return sig_rsa_sha512();
+    }
+    if child_oid_is(bytes, at, 0, "2a8648ce3d040304") {
+        return sig_ecdsa_sha512();
+    }
+    if child_oid_is(bytes, at, 0, "2b6570") {
+        return sig_ed25519();
+    }
+    sig_none()
+}
+
+/// The key kind of the subjectPublicKeyInfo's AlgorithmIdentifier at `at`.
+fn key_kind_at(in bytes: Array[Int], take at: Int) -> Int {
+    if child_oid_is(bytes, at, 0, "2a864886f70d010101") {
+        return key_rsa();
+    }
+    if child_oid_is(bytes, at, 0, "2a8648ce3d0201") {
+        if child_oid_is(bytes, at, 1, "2a8648ce3d030107") {
+            return key_p256();
+        }
+        if child_oid_is(bytes, at, 1, "2b81040022") {
+            return key_p384();
+        }
+        return key_none();
+    }
+    if child_oid_is(bytes, at, 0, "2b6570") {
+        return key_ed25519();
+    }
+    key_none()
+}
+
+/// The offset of an element's tag byte, from its header's `content_start`
+/// and `length`: the length of the length is what `read_header` consumed,
+/// re-derived from the length value.
+fn start_of(take content_start: Int, take length: Int) -> Int {
+    if length < 128 {
+        return content_start - 2;
+    }
+    if length < 256 {
+        return content_start - 3;
+    }
+    if length < 65536 {
+        return content_start - 4;
+    }
+    content_start - 5
+}
+
+/// The IA5String bytes of a dNSName as a `String`, if every byte is
+/// printable ASCII.
+fn dns_name_of(in value: Array[Int]) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::array::len(value) {
+        let b = std::array::get(value, i);
+        if b < 33 || b > 126 {
+            return std::string::empty();
+        }
+        std::string::push_byte(out, b);
+        i = i + 1;
+    }
+    out
+}
+
+/// Decode a DER certificate.
+///
+/// # Example
+/// ```tuo
+/// let c = x509::certificate::parse(der);
+/// ```
+pub fn parse(in bytes: Array[Int]) -> Certificate {
+    let cert = std::der::read_header(bytes, 0);
+    if !std::der::header_ok(cert) || cert.tag != std::der::tag_sequence() || std::der::end_of(cert) != std::array::len(bytes) {
+        return bad();
+    }
+    if std::der::child_count(bytes, cert) != 3 {
+        return bad();
+    }
+    let tbs = std::der::child_at(bytes, cert, 0);
+    let outer_alg = std::der::child_at(bytes, cert, 1);
+    let sig_bits = std::der::child_at(bytes, cert, 2);
+    if !std::der::header_ok(tbs) || tbs.tag != std::der::tag_sequence() {
+        return bad();
+    }
+    if !std::der::header_ok(outer_alg) || outer_alg.tag != std::der::tag_sequence() {
+        return bad();
+    }
+    if !std::der::header_ok(sig_bits) || sig_bits.tag != std::der::tag_bit_string() {
+        return bad();
+    }
+    let signature = std::der::bit_string_bytes(bytes, sig_bits);
+    if std::array::len(signature) == 0 {
+        return bad();
+    }
+    let signature_algorithm = signature_algorithm_at(bytes, start_of(outer_alg.content_start, outer_alg.length));
+
+    // The TBS: an optional [0] version shifts every later field by one.
+    let first = std::der::child_at(bytes, tbs, 0);
+    if !std::der::header_ok(first) {
+        return bad();
+    }
+    var version = 1;
+    var base = 0;
+    if first.tag == 160 {
+        let v = std::der::child_at(bytes, first, 0);
+        if !std::der::header_ok(v) || v.tag != std::der::tag_integer() || v.length != 1 {
+            return bad();
+        }
+        version = std::array::get(std::der::value_of(bytes, v), 0) + 1;
+        if version < 1 || version > 3 {
+            return bad();
+        }
+        base = 1;
+    }
+    let serial = std::der::child_at(bytes, tbs, base);
+    if !std::der::header_ok(serial) || serial.tag != std::der::tag_integer() {
+        return bad();
+    }
+    let tbs_alg = std::der::child_at(bytes, tbs, base + 1);
+    if !std::der::header_ok(tbs_alg) || tbs_alg.tag != std::der::tag_sequence() {
+        return bad();
+    }
+    // RFC 5280 §4.1.2.3: the inner and outer algorithms must agree.
+    if signature_algorithm_at(bytes, start_of(tbs_alg.content_start, tbs_alg.length)) != signature_algorithm {
+        return bad();
+    }
+    let issuer = std::der::child_at(bytes, tbs, base + 2);
+    let validity = std::der::child_at(bytes, tbs, base + 3);
+    let subject = std::der::child_at(bytes, tbs, base + 4);
+    let spki = std::der::child_at(bytes, tbs, base + 5);
+    if !std::der::header_ok(issuer) || issuer.tag != std::der::tag_sequence() {
+        return bad();
+    }
+    if !std::der::header_ok(validity) || validity.tag != std::der::tag_sequence() {
+        return bad();
+    }
+    if !std::der::header_ok(subject) || subject.tag != std::der::tag_sequence() {
+        return bad();
+    }
+    if !std::der::header_ok(spki) || spki.tag != std::der::tag_sequence() {
+        return bad();
+    }
+    let nb = std::der::child_at(bytes, validity, 0);
+    let na = std::der::child_at(bytes, validity, 1);
+    if !std::der::header_ok(nb) || !std::der::header_ok(na) {
+        return bad();
+    }
+    let not_before = x509::time::decode(std::der::value_of(bytes, nb), nb.tag);
+    let not_after = x509::time::decode(std::der::value_of(bytes, na), na.tag);
+    if not_before < 0 || not_after < 0 {
+        return bad();
+    }
+    let key_alg = std::der::child_at(bytes, spki, 0);
+    let key_bits = std::der::child_at(bytes, spki, 1);
+    if !std::der::header_ok(key_alg) || key_alg.tag != std::der::tag_sequence() {
+        return bad();
+    }
+    if !std::der::header_ok(key_bits) || key_bits.tag != std::der::tag_bit_string() {
+        return bad();
+    }
+    var key_kind = key_kind_at(bytes, start_of(key_alg.content_start, key_alg.length));
+    let public_key = std::der::bit_string_bytes(bytes, key_bits);
+    if key_kind == key_ed25519() && std::array::len(public_key) != 32 {
+        key_kind = key_none();
+    }
+    if key_kind == key_p256() && std::array::len(public_key) != 65 {
+        key_kind = key_none();
+    }
+    if key_kind == key_p384() && std::array::len(public_key) != 97 {
+        key_kind = key_none();
+    }
+
+    // Extensions: the [3] child, if any, after the SPKI.
+    var is_ca = false;
+    var path_len = 0 - 1;
+    var key_usage = 0 - 1;
+    var has_ext_key_usage = false;
+    var server_auth = false;
+    var dns_names = std::array::empty();
+    var seen_basic = 0;
+    var seen_usage = 0;
+    var seen_san = 0;
+    var seen_eku = 0;
+    let count = std::der::child_count(bytes, tbs);
+    var index = base + 6;
+    while index < count {
+        let wrapper = std::der::child_at(bytes, tbs, index);
+        if !std::der::header_ok(wrapper) {
+            return bad();
+        }
+        if wrapper.tag == 163 {
+            if version != 3 {
+                return bad();
+            }
+            let list = std::der::child_at(bytes, wrapper, 0);
+            if !std::der::header_ok(list) || list.tag != std::der::tag_sequence() {
+                return bad();
+            }
+            let n = std::der::child_count(bytes, list);
+            var e = 0;
+            while e < n {
+                let ext = std::der::child_at(bytes, list, e);
+                if !std::der::header_ok(ext) || ext.tag != std::der::tag_sequence() {
+                    return bad();
+                }
+                let oid = std::der::child_at(bytes, ext, 0);
+                var second = std::der::child_at(bytes, ext, 1);
+                var critical = false;
+                if !std::der::header_ok(oid) || oid.tag != std::der::tag_oid() || !std::der::header_ok(second) {
+                    return bad();
+                }
+                if second.tag == 1 {
+                    critical = std::array::get(std::der::value_of(bytes, second), 0) != 0;
+                    second = std::der::child_at(bytes, ext, 2);
+                    if !std::der::header_ok(second) {
+                        return bad();
+                    }
+                }
+                if second.tag != std::der::tag_octet_string() {
+                    return bad();
+                }
+                let value = std::der::value_of(bytes, second);
+                let inner = std::der::read_header(value, 0);
+                if std::der::value_equals(bytes, oid, ec::field::hex_bytes("551d13")) {
+                    // basicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, pathLenConstraint INTEGER OPTIONAL }
+                    seen_basic = seen_basic + 1;
+                    if !std::der::header_ok(inner) || inner.tag != std::der::tag_sequence() {
+                        return bad();
+                    }
+                    var at = 0;
+                    let c0 = std::der::child_at(value, inner, 0);
+                    if std::der::header_ok(c0) && c0.tag == 1 {
+                        is_ca = std::array::get(std::der::value_of(value, c0), 0) != 0;
+                        at = 1;
+                    }
+                    let c1 = std::der::child_at(value, inner, at);
+                    if std::der::header_ok(c1) && c1.tag == std::der::tag_integer() {
+                        let pl = std::der::value_of(value, c1);
+                        if std::array::len(pl) == 1 && is_ca {
+                            path_len = std::array::get(pl, 0);
+                        }
+                    }
+                } else if std::der::value_equals(bytes, oid, ec::field::hex_bytes("551d0f")) {
+                    // keyUsage ::= BIT STRING; the first content byte counts unused bits.
+                    seen_usage = seen_usage + 1;
+                    if !std::der::header_ok(inner) || inner.tag != std::der::tag_bit_string() || inner.length < 1 {
+                        return bad();
+                    }
+                    key_usage = if inner.length >= 2 {
+                        std::array::get(value, inner.content_start + 1)
+                    } else {
+                        0
+                    };
+                } else if std::der::value_equals(bytes, oid, ec::field::hex_bytes("551d11")) {
+                    // subjectAltName ::= SEQUENCE OF GeneralName; dNSName is [2] IMPLICIT IA5String.
+                    seen_san = seen_san + 1;
+                    if !std::der::header_ok(inner) || inner.tag != std::der::tag_sequence() {
+                        return bad();
+                    }
+                    let names = std::der::child_count(value, inner);
+                    var g = 0;
+                    while g < names {
+                        let name = std::der::child_at(value, inner, g);
+                        if !std::der::header_ok(name) {
+                            return bad();
+                        }
+                        if name.tag == 130 {
+                            let text = dns_name_of(std::der::value_of(value, name));
+                            if std::string::len(text) > 0 {
+                                std::array::push(dns_names, text);
+                            } else {
+                                let _ = text;
+                            }
+                        }
+                        g = g + 1;
+                    }
+                } else if std::der::value_equals(bytes, oid, ec::field::hex_bytes("551d25")) {
+                    // extKeyUsage ::= SEQUENCE OF OID
+                    seen_eku = seen_eku + 1;
+                    has_ext_key_usage = true;
+                    if !std::der::header_ok(inner) || inner.tag != std::der::tag_sequence() {
+                        return bad();
+                    }
+                    let purposes = std::der::child_count(value, inner);
+                    var p = 0;
+                    while p < purposes {
+                        let purpose = std::der::child_at(value, inner, p);
+                        if std::der::header_ok(purpose) && std::der::value_equals(value, purpose, ec::field::hex_bytes("2b06010505070301")) {
+                            server_auth = true;
+                        }
+                        p = p + 1;
+                    }
+                } else if std::der::value_equals(bytes, oid, ec::field::hex_bytes("551d1e")) {
+                    // nameConstraints: not enforced here, so it must not be critical.
+                    if critical {
+                        return bad();
+                    }
+                } else if std::der::value_equals(bytes, oid, ec::field::hex_bytes("551d20")) {
+                // certificatePolicies: read by policy validators, which this is not.
+                } else if critical {
+                    return bad();
+                }
+                e = e + 1;
+            }
+        }
+        index = index + 1;
+    }
+    if seen_basic > 1 || seen_usage > 1 || seen_san > 1 || seen_eku > 1 {
+        return bad();
+    }
+    Certificate { ok: true, version: version, tbs: std::der::certificate_tbs(bytes), signature: signature, signature_algorithm: signature_algorithm, issuer: std::der::value_of(bytes, issuer), subject: std::der::value_of(bytes, subject), not_before: not_before, not_after: not_after, key_kind: key_kind, public_key: public_key, is_ca: is_ca, path_len: path_len, key_usage: key_usage, has_ext_key_usage: has_ext_key_usage, server_auth: server_auth, dns_names: dns_names }
+}
+
+/// Whether two byte arrays are identical.
+///
+/// # Example
+/// ```tuo
+/// let issued = x509::certificate::same_bytes(child.issuer, parent.subject);
+/// ```
+pub fn same_bytes(in a: Array[Int], in b: Array[Int]) -> Bool {
+    let n = std::array::len(a);
+    if n != std::array::len(b) {
+        return false;
+    }
+    var i = 0;
+    while i < n {
+        if std::array::get(a, i) != std::array::get(b, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// Whether `now` lies within the certificate's validity.
+///
+/// # Example
+/// ```tuo
+/// let current = x509::certificate::valid_at(c, now);
+/// ```
+pub fn valid_at(in c: Certificate, take now: Int) -> Bool {
+    c.ok && now >= c.not_before && now <= c.not_after
+}
+
+/// Whether the certificate is self-issued: issuer equals subject.
+///
+/// # Example
+/// ```tuo
+/// let root_shaped = x509::certificate::self_issued(c);
+/// ```
+pub fn self_issued(in c: Certificate) -> Bool {
+    same_bytes(c.issuer, c.subject)
+}
+
+// ----------------------------------------------------------------------------
+// Specs: the test PKIs and real certificates in `x509::fixture`.
+// ----------------------------------------------------------------------------
+
+fn cert(in hex: Str) -> Certificate {
+    parse(ec::field::hex_bytes(hex))
+}
+
+fn name_at(in c: Certificate, take i: Int) -> String {
+    std::string::from_str(std::string::as_str(std::array::get(c.dns_names, i)))
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+fn truncated(in hex: Str, take keep: Int) -> Array[Int] {
+    let all = ec::field::hex_bytes(hex);
+    var out = std::array::empty();
+    var i = 0;
+    while i < keep && i < std::array::len(all) {
+        std::array::push(out, std::array::get(all, i));
+        i = i + 1;
+    }
+    out
+}
+
+spec parse {
+    let leaf = cert(x509::fixture::rsa_leaf());
+    then leaf.ok;
+    then leaf.version == 3;
+    then leaf.key_kind == key_rsa();
+    then leaf.signature_algorithm == sig_rsa_sha256();
+    then !leaf.is_ca;
+    then leaf.path_len == 0 - 1;
+    then (leaf.key_usage & usage_digital_signature()) != 0;
+    then (leaf.key_usage & usage_key_cert_sign()) == 0;
+    then leaf.has_ext_key_usage;
+    then leaf.server_auth;
+    then std::array::len(leaf.dns_names) == 3;
+    then text_is(name_at(leaf, 0), "localhost");
+    then text_is(name_at(leaf, 1), "example.test");
+    then text_is(name_at(leaf, 2), "*.wild.test");
+    then leaf.not_before == 1788220800;
+    then leaf.not_after == 2398377600;
+    then std::array::len(leaf.signature) == 128;
+    then std::array::get(leaf.tbs, 0) == 48;
+    then !self_issued(leaf);
+    then valid_at(leaf, 1800000000);
+    then !valid_at(leaf, 1788220799);
+    then !valid_at(leaf, 2398377601);
+
+    let mid = cert(x509::fixture::rsa_int());
+    then mid.ok;
+    then mid.is_ca;
+    then mid.path_len == 0;
+    then (mid.key_usage & usage_key_cert_sign()) != 0;
+    then !mid.has_ext_key_usage;
+    then std::array::len(mid.dns_names) == 0;
+    then same_bytes(leaf.issuer, mid.subject);
+    then !same_bytes(leaf.subject, mid.subject);
+
+    let root = cert(x509::fixture::rsa_root());
+    then root.ok;
+    then root.is_ca;
+    then root.path_len == 0 - 1;
+    then self_issued(root);
+    then same_bytes(mid.issuer, root.subject);
+    then root.not_before == 1767225600;
+
+    let ec_leaf = cert(x509::fixture::ec_leaf());
+    then ec_leaf.ok;
+    then ec_leaf.key_kind == key_p256();
+    then std::array::len(ec_leaf.public_key) == 65;
+    then std::array::get(ec_leaf.public_key, 0) == 4;
+    then ec_leaf.signature_algorithm == sig_ecdsa_sha384();
+    let ec_root = cert(x509::fixture::ec_root());
+    then ec_root.key_kind == key_p384();
+    then std::array::len(ec_root.public_key) == 97;
+
+    let cf = cert(x509::fixture::api_cloudflare_com_0());
+    then cf.ok;
+    then cf.key_kind == key_p256();
+    then cf.signature_algorithm == sig_ecdsa_sha256();
+    then text_is(name_at(cf, 0), "api.cloudflare.com");
+    then text_is(x509::time::render(cf.not_before), "2026-08-13T22:31:21Z");
+    then text_is(x509::time::render(cf.not_after), "2026-11-11T23:31:01Z");
+    then cf.server_auth;
+
+    let sentry = cert(x509::fixture::sentry_io_0());
+    then sentry.ok;
+    then sentry.key_kind == key_rsa();
+    then sentry.signature_algorithm == sig_rsa_sha256();
+    then std::array::len(sentry.dns_names) == 2;
+    then text_is(name_at(sentry, 1), "*.sentry.io");
+
+    let x2 = cert(x509::fixture::www_cloudflare_com_3());
+    then x2.ok;
+    then x2.key_kind == key_p384();
+    then x2.signature_algorithm == sig_rsa_sha256();
+    then x2.is_ca;
+    then !self_issued(x2);
+}
+
+spec bad {
+    then !bad().ok;
+    then !parse(std::array::empty()).ok;
+    then !parse(truncated(x509::fixture::rsa_leaf(), 300)).ok;
+    then !parse(truncated(x509::fixture::rsa_leaf(), 4)).ok;
+    then !parse(ec::field::hex_bytes("3000")).ok;
+    then !valid_at(bad(), 0);
+}

@@ -1,0 +1,302 @@
+// x509::time — certificate validity instants as Unix seconds.
+//
+// A certificate's `notBefore` and `notAfter` are UTCTime (`YYMMDDHHMMSSZ`,
+// two-digit year) or GeneralizedTime (`YYYYMMDDHHMMSSZ`) in DER's one
+// permitted form: seconds present, no fractions, `Z` and nothing else
+// (RFC 5280 §4.1.2.5). Both decode here to seconds since 1970-01-01T00:00Z,
+// which is what a caller compares its clock against.
+//
+// The calendar arithmetic is Howard Hinnant's `days_from_civil` and its
+// inverse, which are exact for every proleptic Gregorian date — including
+// the 2038 boundary, which a 64-bit `Int` does not notice.
+
+module x509::time;
+
+/// The DER tag for UTCTime.
+///
+/// # Example
+/// ```tuo
+/// let t = x509::time::tag_utc(); // 23
+/// ```
+pub fn tag_utc() -> Int {
+    23
+}
+
+/// The DER tag for GeneralizedTime.
+///
+/// # Example
+/// ```tuo
+/// let t = x509::time::tag_generalized(); // 24
+/// ```
+pub fn tag_generalized() -> Int {
+    24
+}
+
+/// Days since 1970-01-01 of the proleptic Gregorian date `y-m-d`.
+///
+/// # Example
+/// ```tuo
+/// let d = x509::time::days_from_civil(1970, 1, 2); // 1
+/// ```
+pub fn days_from_civil(take year: Int, take month: Int, take day: Int) -> Int {
+    let y = if month <= 2 {
+        year - 1
+    } else {
+        year
+    };
+    let era = (if y >= 0 {
+        y
+    } else {
+        y - 399
+    }) / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 {
+        month - 3
+    } else {
+        month + 9
+    };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// How many days `month` of `year` has.
+///
+/// # Example
+/// ```tuo
+/// let n = x509::time::days_in_month(2000, 2); // 29
+/// ```
+pub fn days_in_month(take year: Int, take month: Int) -> Int {
+    if month == 2 {
+        let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+        return if leap {
+            29
+        } else {
+            28
+        };
+    }
+    if month == 4 || month == 6 || month == 9 || month == 11 {
+        return 30;
+    }
+    31
+}
+
+/// Unix seconds of a UTC calendar time, or -1 when any field is out of
+/// range.
+///
+/// # Example
+/// ```tuo
+/// let t = x509::time::unix_seconds(2026, 9, 1, 0, 0, 0); // 1788220800
+/// ```
+pub fn unix_seconds(take year: Int, take month: Int, take day: Int, take hour: Int, take minute: Int, take second: Int) -> Int {
+    if year < 0 || year > 9999 || month < 1 || month > 12 {
+        return 0 - 1;
+    }
+    if day < 1 || day > days_in_month(year, month) {
+        return 0 - 1;
+    }
+    if hour < 0 || hour > 23 || minute < 0 || minute > 59 || second < 0 || second > 59 {
+        return 0 - 1;
+    }
+    days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second
+}
+
+/// The two-digit decimal at `at` in `bytes`, or -1.
+fn two_digits(in bytes: Array[Int], take at: Int) -> Int {
+    if at + 1 >= std::array::len(bytes) {
+        return 0 - 1;
+    }
+    let a = std::array::get(bytes, at);
+    let b = std::array::get(bytes, at + 1);
+    if a < 48 || a > 57 || b < 48 || b > 57 {
+        return 0 - 1;
+    }
+    (a - 48) * 10 + (b - 48)
+}
+
+/// Decode a DER time value of tag `tag` (`tag_utc` or `tag_generalized`)
+/// to Unix seconds, or -1 for anything but the one form RFC 5280 allows.
+/// UTCTime years 50–99 are 1950–1999 and 00–49 are 2000–2049.
+///
+/// # Example
+/// ```tuo
+/// let t = x509::time::decode(value, x509::time::tag_utc());
+/// ```
+pub fn decode(in value: Array[Int], take tag: Int) -> Int {
+    var year = 0;
+    var at = 0;
+    if tag == tag_utc() {
+        if std::array::len(value) != 13 {
+            return 0 - 1;
+        }
+        let yy = two_digits(value, 0);
+        if yy < 0 {
+            return 0 - 1;
+        }
+        year = if yy >= 50 {
+            1900 + yy
+        } else {
+            2000 + yy
+        };
+        at = 2;
+    } else if tag == tag_generalized() {
+        if std::array::len(value) != 15 {
+            return 0 - 1;
+        }
+        let hi = two_digits(value, 0);
+        let lo = two_digits(value, 2);
+        if hi < 0 || lo < 0 {
+            return 0 - 1;
+        }
+        year = hi * 100 + lo;
+        at = 4;
+    } else {
+        return 0 - 1;
+    }
+    if std::array::get(value, at + 10) != 90 {
+        return 0 - 1;
+    }
+    let month = two_digits(value, at);
+    let day = two_digits(value, at + 2);
+    let hour = two_digits(value, at + 4);
+    let minute = two_digits(value, at + 6);
+    let second = two_digits(value, at + 8);
+    if month < 0 || day < 0 || hour < 0 || minute < 0 || second < 0 {
+        return 0 - 1;
+    }
+    unix_seconds(year, month, day, hour, minute, second)
+}
+
+fn push_digits(mut out: String, take value: Int, take width: Int) {
+    var digits = std::array::empty();
+    var v = value;
+    var w = 0;
+    while w < width {
+        std::array::push(digits, v % 10);
+        v = v / 10;
+        w = w + 1;
+    }
+    var i = width - 1;
+    while i >= 0 {
+        std::string::push_byte(out, 48 + std::array::get(digits, i));
+        i = i - 1;
+    }
+}
+
+/// `unix` rendered as `YYYY-MM-DDTHH:MM:SSZ`, for messages and oracles.
+///
+/// # Example
+/// ```tuo
+/// let s = x509::time::render(1788220800); // "2026-09-01T00:00:00Z"
+/// ```
+pub fn render(take unix: Int) -> String {
+    var days = unix / 86400;
+    var rest = unix % 86400;
+    if rest < 0 {
+        rest = rest + 86400;
+        days = days - 1;
+    }
+    // civil_from_days
+    let z = days + 719468;
+    let era = (if z >= 0 {
+        z
+    } else {
+        z - 146096
+    }) / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 {
+        mp + 3
+    } else {
+        mp - 9
+    };
+    let year = yoe + era * 400 + (if month <= 2 {
+        1
+    } else {
+        0
+    });
+    var out = std::string::empty();
+    push_digits(out, year, 4);
+    std::string::push_byte(out, 45);
+    push_digits(out, month, 2);
+    std::string::push_byte(out, 45);
+    push_digits(out, day, 2);
+    std::string::push_byte(out, 84);
+    push_digits(out, rest / 3600, 2);
+    std::string::push_byte(out, 58);
+    push_digits(out, (rest / 60) % 60, 2);
+    std::string::push_byte(out, 58);
+    push_digits(out, rest % 60, 2);
+    std::string::push_byte(out, 90);
+    out
+}
+
+// --- Specs: values computed with Python's datetime -----------------------------
+
+fn ascii(in text: Str) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < std::str::len(text) {
+        std::array::push(out, std::str::byte_at(text, i));
+        i = i + 1;
+    }
+    out
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+spec days_from_civil {
+    then days_from_civil(1970, 1, 1) == 0;
+    then days_from_civil(1970, 1, 2) == 1;
+    then days_from_civil(1969, 12, 31) == 0 - 1;
+    then days_from_civil(2000, 3, 1) == 11017;
+    then days_from_civil(2026, 9, 1) == 20697;
+}
+
+spec days_in_month {
+    then days_in_month(2000, 2) == 29;
+    then days_in_month(1900, 2) == 28;
+    then days_in_month(2024, 2) == 29;
+    then days_in_month(2026, 2) == 28;
+    then days_in_month(2026, 4) == 30;
+    then days_in_month(2026, 12) == 31;
+}
+
+spec unix_seconds {
+    then unix_seconds(2026, 9, 1, 0, 0, 0) == 1788220800;
+    then unix_seconds(1999, 12, 31, 23, 59, 59) == 946684799;
+    then unix_seconds(2000, 2, 29, 12, 0, 0) == 951825600;
+    then unix_seconds(2038, 1, 19, 3, 14, 7) == 2147483647;
+    then unix_seconds(2046, 1, 1, 0, 0, 0) == 2398377600;
+    then unix_seconds(2026, 2, 29, 0, 0, 0) == 0 - 1;
+    then unix_seconds(2026, 13, 1, 0, 0, 0) == 0 - 1;
+    then unix_seconds(2026, 1, 1, 24, 0, 0) == 0 - 1;
+    then unix_seconds(2026, 1, 1, 0, 60, 0) == 0 - 1;
+}
+
+spec decode {
+    then decode(ascii("260901000000Z"), tag_utc()) == 1788220800;
+    then decode(ascii("991231235959Z"), tag_utc()) == 946684799;
+    then decode(ascii("20000229120000Z"), tag_generalized()) == 951825600;
+    then decode(ascii("20460101000000Z"), tag_generalized()) == 2398377600;
+    then decode(ascii("20260901000000Z"), tag_utc()) == 0 - 1;
+    then decode(ascii("260901000000"), tag_utc()) == 0 - 1;
+    then decode(ascii("2609010000000"), tag_utc()) == 0 - 1;
+    then decode(ascii("26090100000aZ"), tag_utc()) == 0 - 1;
+    then decode(ascii("260901000000Z"), 12) == 0 - 1;
+    then decode(std::array::empty(), tag_generalized()) == 0 - 1;
+}
+
+spec render {
+    then text_is(render(1788220800), "2026-09-01T00:00:00Z");
+    then text_is(render(946684799), "1999-12-31T23:59:59Z");
+    then text_is(render(951825600), "2000-02-29T12:00:00Z");
+    then text_is(render(2147483647), "2038-01-19T03:14:07Z");
+    then text_is(render(0), "1970-01-01T00:00:00Z");
+    then text_is(render(0 - 1), "1969-12-31T23:59:59Z");
+}

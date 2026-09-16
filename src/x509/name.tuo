@@ -1,0 +1,164 @@
+// x509::name — does a certificate's DNS name cover the host we dialled?
+//
+// RFC 6125 §6.4.3, in the strict reading browsers converged on: names
+// compare case-insensitively; a wildcard is the whole leftmost label or
+// nothing (`*.example.com`, never `w*.example.com` or `*example.com`);
+// it matches exactly one label (`a.example.com`, not `example.com` and not
+// `a.b.example.com`); and it needs at least two labels after it, so
+// `*.com` covers nothing. A trailing dot on the host is dropped. Nothing
+// else is accepted: an IP address is never matched against a DNS name.
+
+module x509::name;
+
+/// `text` with ASCII letters lowercased and one trailing dot removed.
+///
+/// # Example
+/// ```tuo
+/// let h = x509::name::canonical("Example.COM."); // "example.com"
+/// ```
+pub fn canonical(in text: Str) -> String {
+    var out = std::string::empty();
+    var n = std::str::len(text);
+    if n > 0 && std::str::byte_at(text, n - 1) == 46 {
+        n = n - 1;
+    }
+    var i = 0;
+    while i < n {
+        var b = std::str::byte_at(text, i);
+        if b >= 65 && b <= 90 {
+            b = b + 32;
+        }
+        std::string::push_byte(out, b);
+        i = i + 1;
+    }
+    out
+}
+
+/// How many dots `text` contains.
+fn dots(in text: String) -> Int {
+    var count = 0;
+    var i = 0;
+    while i < std::string::len(text) {
+        if std::string::byte_at(text, i) == 46 {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    count
+}
+
+/// Whether `text` ends with `suffix`.
+fn ends_with(in text: String, in suffix: String, take from: Int) -> Bool {
+    let n = std::string::len(text);
+    let m = std::string::len(suffix) - from;
+    if m > n {
+        return false;
+    }
+    var i = 0;
+    while i < m {
+        if std::string::byte_at(text, n - m + i) != std::string::byte_at(suffix, from + i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// Whether the certificate name `pattern` covers `host`.
+///
+/// # Example
+/// ```tuo
+/// let ok = x509::name::matches("*.sentry.io", "o1.sentry.io"); // true
+/// ```
+pub fn matches(in pattern: Str, in host: Str) -> Bool {
+    let p = canonical(pattern);
+    let h = canonical(host);
+    if std::string::len(p) == 0 || std::string::len(h) == 0 {
+        return false;
+    }
+    // A wildcard anywhere but as the whole first label is refused.
+    var star = 0 - 1;
+    var i = 0;
+    while i < std::string::len(p) {
+        if std::string::byte_at(p, i) == 42 {
+            if star >= 0 {
+                return false;
+            }
+            star = i;
+        }
+        i = i + 1;
+    }
+    if star < 0 {
+        return std::string::as_str(p) == std::string::as_str(h);
+    }
+    if star != 0 || std::string::len(p) < 2 || std::string::byte_at(p, 1) != 46 {
+        return false;
+    }
+    // "*.rest": rest needs two labels; host needs exactly one more.
+    if dots(p) < 2 {
+        return false;
+    }
+    if dots(h) != dots(p) {
+        return false;
+    }
+    // The host's first label must be non-empty, and the remainder must be
+    // exactly ".rest".
+    if std::string::byte_at(h, 0) == 46 {
+        return false;
+    }
+    ends_with(h, p, 1)
+}
+
+/// Whether any of `names` covers `host`.
+///
+/// # Example
+/// ```tuo
+/// let ok = x509::name::any_matches(cert.dns_names, "sentry.io");
+/// ```
+pub fn any_matches(in names: Array[String], in host: Str) -> Bool {
+    var i = 0;
+    while i < std::array::len(names) {
+        if matches(std::string::as_str(std::array::get(names, i)), host) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+spec canonical {
+    then std::string::as_str(canonical("Example.COM.")) == "example.com";
+    then std::string::as_str(canonical("")) == "";
+    then std::string::as_str(canonical(".")) == "";
+    then std::string::as_str(canonical("*.Wild.TEST")) == "*.wild.test";
+}
+
+spec matches {
+    then matches("example.com", "EXAMPLE.com");
+    then matches("example.com", "example.com.");
+    then !matches("example.com", "www.example.com");
+    then !matches("example.com", "");
+    then !matches("", "example.com");
+    then matches("*.sentry.io", "o1.sentry.io");
+    then matches("*.sentry.io", "O1.SENTRY.IO");
+    then !matches("*.sentry.io", "sentry.io");
+    then !matches("*.sentry.io", "a.b.sentry.io");
+    then !matches("*.sentry.io", ".sentry.io");
+    then !matches("*.io", "sentry.io");
+    then !matches("w*.example.com", "www.example.com");
+    then !matches("*example.com", "www.example.com");
+    then !matches("www.*.com", "www.example.com");
+    then !matches("*.*.com", "a.b.com");
+    then !matches("*.sentry.io", "o1.sentry.com");
+    then !matches("*.sentry.io", "xsentry.io");
+}
+
+spec any_matches {
+    var names = std::array::empty();
+    std::array::push(names, std::string::from_str("localhost"));
+    std::array::push(names, std::string::from_str("*.wild.test"));
+    then any_matches(names, "localhost");
+    then any_matches(names, "a.wild.test");
+    then !any_matches(names, "wild.test");
+    then !any_matches(std::array::empty(), "localhost");
+}
