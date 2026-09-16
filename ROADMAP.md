@@ -23,9 +23,10 @@ SHA-256/HMAC/PBKDF2, `std::bignum`, `std::json`, `std::fs`, `std::sync`,
 | this repo, `argon2` | `passlib[argon2]` | Argon2id/i/d + BLAKE2b + PHC strings; 125 specs; verifies the backend's own hashes |
 | this repo, `redis` | `redis` | RESP2 client, the backend's commands, `redis://` URLs; 40 specs; 35 live checks against Redis 7 |
 | this repo, `http` | `httpx`, `requests`, `uvicorn` | HTTP/1.1 framing, client with redirects, keep-alive server; 107 specs; 29 live checks |
-| this repo, `tls` | `ssl` (client side, pinned keys) | TLS 1.3 client on the catalog's stack; RFC 8448 reproduced; handshakes with `std::tls` and OpenSSL |
+| this repo, `tls` | `ssl` (client side) | TLS 1.3 client on the catalog's stack; RFC 8448 reproduced; handshakes with `std::tls` and OpenSSL; `https://` to Stripe, Sentry, Cloudflare |
+| this repo, `x509` + `ec` + `rsa` | the trust half of `ssl`, `certifi` | X.509 parsing and chain validation, a root store, ECDSA P-256/P-384, RSA v1.5/PSS; 380 specs; real chains validated |
 
-All seven prove the thesis: the *engine* of a Python library is pure logic, and pure
+All eight prove the thesis: the *engine* of a Python library is pure logic, and pure
 logic is what tuonelang specs pin best.
 
 ---
@@ -34,21 +35,25 @@ logic is what tuonelang specs pin best.
 
 Nothing else ships without these. Each is a hard blocker for the request path.
 
-### 1. TLS 1.3 — replaces the `ssl` module (blocks `httpx`, `stripe`, `boto3`, `redis` over TLS) — ◐ client done, chain validation next
+### 1. TLS 1.3 — replaces the `ssl` module (blocks `httpx`, `stripe`, `boto3`, `redis` over TLS) — ✅ done
 
 **The single highest-value port, and the one everything external waits on.**
 On 2026-09-15 the tuonelang catalog landed X25519, ChaCha20-Poly1305,
 Ed25519, HKDF, DER, and a TLS 1.3 *server* verified against OpenSSL. This
-repo added the *client* the same day: `https://` now works in `http::client`
-against any server on that profile, with the certificate's Ed25519 key
-pinned by the caller.
+repo added the *client* the same day, and on 2026-09-16 the trust layer
+public servers need: ECDSA on P-256 and P-384, RSA PKCS#1 v1.5 and PSS,
+X.509 parsing with names, dates, and the constraint extensions, a
+depth-first chain walk, and 17 roots from the Mozilla bundle.
+`http::client::get` of an `https://` URL reaches `api.stripe.com`,
+`sentry.io`, and Cloudflare, with every chain validated — and the walk
+is spec'd to fail for every reason RFC 5280 names, which is where the
+real bugs live. One runtime gap surfaced: there is no wall clock, so the
+time comes from an SNTP query (`tls::clock`) until the catalog grows one.
 
-What is still missing is what public servers need: P-256 ECDSA (and RSA)
-signature verification, X.509 chain building with names and validity
-dates, and a root store. Certificate chain validation is where the real
-bugs live, and it is *exactly* the kind of pure, spec-shaped logic
-tuonelang is good at pinning. Until it lands, `get` refuses `https://`
-rather than offer an unverified mode.
+Left for later, each a small increment: `rediss://` in the Redis client
+(the session is there; the URL flag is refused today), name constraints,
+revocation, Certificate Transparency, AES-GCM and P-256 key exchange for
+servers that refuse ChaCha20 or X25519 (none tried do).
 
 ### 2. DNS resolution — replaces `socket.getaddrinfo` — ✅ done
 
@@ -108,7 +113,7 @@ Achievable on v0 as it stands, in rough order of value-per-effort.
 |---|---|---|
 | **Redis client** — ✅ done | `redis` | RESP2 over TCP, spec'd against bytes a real server sent; the transport `tuolang-celery` lacked, which still models the broker in memory until its message envelope is written over this client. |
 | **Structured logging + Sentry** | `sentry-sdk` | Needs only JSON + HTTP. Error capture, breadcrumbs, envelope format. |
-| **JWT / JOSE** | (part of your auth) | HMAC-SHA256 already exists — HS256 is nearly free today. RS256 waits on TLS-era RSA. |
+| **JWT / JOSE** | (part of your auth) | HMAC-SHA256 already exists — HS256 is nearly free today. RS256 verification is `rsa::verify` now; signing waits on a constant-time bignum. |
 | **S3 client** | `boto3` | You only use Cloudflare R2. SigV4 signing is pure HMAC-SHA256 — already available. A tiny, targeted client beats all of boto3. |
 | **Template engine** | `jinja2` + `markupsafe` | Parser + renderer; escaping is a correctness property that specs pin beautifully. |
 | **Config / env loading** | `pydantic-settings`, `python-dotenv` | Nearly trivial; `.env` parsing + typed struct binding. |
@@ -141,10 +146,10 @@ Be honest about these rather than half-porting them.
 2. ✅ **Argon2** — small, self-contained, RFC test vectors, real security value.
 3. ✅ **Redis client** — the transport `tuolang-celery` needs to talk to a real broker.
 4. ✅ **HTTP/1.1** — the backbone of everything outbound and inbound.
-5. ◐ **TLS 1.3** — the client is done on the catalog's profile; **next** is
-   P-256 ECDSA and X.509 chain validation, which is what makes it reach
-   Stripe, R2, and Sentry.
-6. **Router + validation**, then **query layer** — the application framework.
+5. ✅ **TLS 1.3** — the client, and the chain validation that makes it
+   reach Stripe, R2, and Sentry.
+6. **Router + validation**, then **query layer** — the application framework
+   — **next**.
 
 Tiers 2 and 3 fall out largely for free once 4 and 5 exist.
 

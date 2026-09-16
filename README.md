@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Five ports so far:
+Six ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -13,13 +13,15 @@ Five ports so far:
 | **`argon2`** — Argon2id/i/d, BLAKE2b, and the PHC string format | `passlib[argon2]` | 125 specs, RFC 9106's vectors, and a hash the Python backend itself wrote |
 | **`redis`** — a RESP2 client, the commands Celery and slowapi use, `redis://` URLs | `redis` (under `celery[redis]` and `slowapi`) | 40 specs against bytes a Redis 7 server sent, and a 35-check live oracle |
 | **`http`** — HTTP/1.1 framing, a client with redirects, a keep-alive server | `httpx`, `requests`, `uvicorn` (behind Caddy) | 107 specs against bytes Cloudflare and gunicorn sent, an 18-check loopback oracle, an 11-check live one |
-| **`tls`** — a TLS 1.3 client on the catalog's `std::tls`, and `https://` in the HTTP client | the `ssl` module, for the profile the catalog speaks | RFC 8448's trace reproduced from the client's side, a 12-check loopback oracle against `std::tls`, a 4-check handshake with OpenSSL |
+| **`tls`** — a TLS 1.3 client on the catalog's `std::tls`, and `https://` in the HTTP client | the `ssl` module | RFC 8448's trace reproduced from the client's side, a 12-check loopback oracle against `std::tls`, an 8-check interop oracle against three OpenSSL servers, and live `https://` to Stripe, Sentry, and Cloudflare |
+| **`x509`**, **`ec`**, **`rsa`** — certificate parsing, chain validation, a root store, ECDSA on P-256/P-384, RSA PKCS#1 v1.5 and PSS, SHA-384 | the `ssl` module's trust half (`certifi`, `cryptography`'s verifier) | 380 specs (RFC 6979 and a test PKI natively), a 27-check oracle over chains captured from Cloudflare, Sentry, and Stripe |
 
 ```bash
-./run-tests.sh          # front end, the specs, formatting, the native Argon2 oracle, and
-                        # the HTTP and TLS loopback oracles (no network)
+./run-tests.sh          # front end, the specs, formatting, the native Argon2 and X.509
+                        # oracles, and the HTTP and TLS loopback oracles (no network)
 ./run-tests.sh --live   # also resolve real names over UDP, fetch from public HTTP servers,
-                        # complete a TLS 1.3 handshake with openssl s_server, and drive the
+                        # complete TLS 1.3 handshakes with three openssl s_server instances,
+                        # fetch https:// from Stripe, Sentry, and Cloudflare, and drive the
                         # Redis client against shallowflaws's docker compose redis on 6380
 ```
 
@@ -181,11 +183,11 @@ across several reads, a value containing `\r\n`, the empty value
 distinguished from a fallback, a `BRPOP` that times out and one that
 returns, a `WRONGTYPE` error that leaves the connection usable, a
 `MULTI`/`EXEC` transaction, and `open_url` on the compose URL — and
-refusing `rediss://`, since v0 has no TLS.
+refusing `rediss://` — the TLS session exists now, and wiring it in is a small follow-up.
 
 ### What is deliberately not here
 
-No TLS: `rediss://` parses and is refused at `open_url`. No name
+`rediss://` parses and is refused at `open_url` (the TLS session is there; the flag is not wired yet). No name
 resolution in the client: `std::net::connect` takes a numeric address, and
 joining `dns::resolver` to it is a small future change. No RESP3 or
 `HELLO`; Redis 7 speaks RESP2 by default and the backend's libraries use
@@ -196,7 +198,7 @@ envelope on top of it belongs with `tuolang-celery`.
 
 ---
 
-## `tls` — the client half of TLS 1.3
+## `tls` — a TLS 1.3 client that reaches the public web
 
 The tuonelang catalog landed a TLS 1.3 *server* stack on 2026-09-15 —
 X25519, ChaCha20-Poly1305, Ed25519 certificates, verified live against an
@@ -205,15 +207,23 @@ client, which is the half the roadmap needs: it is what `https://` in
 `http::client` runs on, and the layer under every outbound integration.
 This port is that client, built on the catalog's record protection, key
 schedule, and DER decoder, with the handshake logic pure and the socket
-sequence a thin loop over it.
+sequence a thin loop over it — and, since 2026-09-16, the trust layer
+under it: `x509` parses and validates chains against a root store, `ec`
+and `rsa` verify the signatures public CAs actually make. `get` of an
+`https://` URL now reaches Stripe, Sentry, and Cloudflare.
 
 ### Status
 
 | Layer | State |
 |---|---|
-| `tls::handshake` — ClientHello, ServerHello, the server's flight, the key schedule, the three checks | ✅ proven; RFC 8448 reproduced from the client's side |
-| `tls::client` — the session: handshake over a socket, records to bytes, tickets skipped | ✅ 12 loopback checks against `std::tls`, 4 against OpenSSL 3.6 |
-| `http::client::get_pinned` — `https://` with a pinned Ed25519 key | ✅ both oracles fetch over it |
+| `tls::handshake` — ClientHello, ServerHello, the server's flight, the key schedule, the three checks, `Trust` | ✅ proven; RFC 8448 reproduced from the client's side, its RSA-PSS CertificateVerify verified |
+| `tls::client` — the session: handshake over a socket, records to bytes, tickets skipped | ✅ 12 loopback checks against `std::tls`, 8 against OpenSSL 3.6 |
+| `tls::clock` — the time of day, over SNTP, since the runtime's clock is monotonic only | ✅ decode spec'd; live against `time.cloudflare.com` |
+| `x509::certificate`, `x509::chain`, `x509::name`, `x509::time` — parse, walk, match, date | ✅ 190 specs on a test PKI and real certificates |
+| `x509::roots` — 17 roots from the Mozilla bundle `certifi` ships | ✅ every entry spec'd to be a self-issued CA |
+| `ec::field`, `ec::curve`, `ec::p256`, `ec::p384`, `ec::ecdsa` — Barrett arithmetic, Jacobian group law, ECDSA | ✅ 120 specs on small moduli and a 19-point curve; RFC 6979 natively |
+| `rsa::verify`, `crypto::sha384` — PKCS#1 v1.5, RSASSA-PSS, MGF1, SHA-384 | ✅ 30 specs on OpenSSL signatures and FIPS digests |
+| `http::client::get` — `https://` validated against the root store | ✅ live to `api.stripe.com`, `sentry.io`, `api.cloudflare.com`, `www.cloudflare.com` |
 
 ### What the specs pin that a comment cannot
 
@@ -221,10 +231,11 @@ sequence a thin loop over it.
 prints every secret of one handshake. From its ECDHE result and its
 messages, the specs derive the same handshake secrets, the same IVs, the
 same application secrets, and — byte for byte — the client's Finished. The
-RFC's cipher is AES-GCM and its certificate RSA, so the record keys and the
-signature are not comparable; every hash, secret, IV, and MAC is, and every
-one is asserted. The X25519 step that produces the ECDHE result exceeds the
-spec sandbox's fuel and is asserted natively by the loopback oracle instead.
+RFC's cipher is AES-GCM, so the record keys are not comparable; every
+hash, secret, IV, and MAC is, and every one is asserted. Its
+CertificateVerify is `rsa_pss_rsae_sha256` under a 1024-bit key, and
+that now verifies too, inside the sandbox. The X25519 step exceeds the
+sandbox's fuel and is asserted natively by the loopback oracle instead.
 
 **Our ClientHello is one the server accepts.** The catalog's own
 `hello_acceptable`, `hello_offers_suite`, `hello_offers_tls13`, and
@@ -233,40 +244,93 @@ spec sandbox's fuel and is asserted natively by the loopback oracle instead.
 parsed back and accepted. A HelloRetryRequest is recognised by its random
 and refused rather than mistaken for a second hello.
 
-**Three checks, each spec'd to fail.** The certificate's key must be the
-pinned one, compared in constant time and never matched by an empty pin;
-the CertificateVerify must sign the transcript through the Certificate;
+**Three checks, each spec'd to fail.** The certificates must satisfy the
+`Trust` — a pinned Ed25519 key compared in constant time and never
+matched by an empty pin, or a chain `x509::chain` validates; the
+CertificateVerify must sign the transcript through the Certificate with
+the leaf's key, under a scheme that fits it (Ed25519, ECDSA on the key's
+own curve, or RSA-PSS — never PKCS#1 v1.5, which TLS 1.3 forbids there);
 the Finished must MAC the transcript through the CertificateVerify. Each
-has a spec that passes on the right input and a spec that fails on the
-wrong transcript, the wrong data, or a non-Ed25519 certificate; the
-Ed25519 verification itself, another curve operation past the fuel, is
-asserted natively with a real signature by the test key and a wrong key's.
+has a spec that passes on the right input and one that fails on the
+wrong transcript, data, scheme, or key.
 
-### The two oracles
+**A chain validates for the reasons RFC 5280 gives, and fails for each
+one.** `x509::chain::validate` returns a verdict, and the specs walk an
+RSA-1024 test PKI through every one: ok for `localhost`, `EXAMPLE.test`,
+and `a.wild.test`; name mismatch for `wild.test` (a wildcard matches one
+label, never zero) and `example.com`; not current before `notBefore` and
+after `notAfter`; untrusted under the wrong root, with no root, without
+the intermediate, and with one signature byte flipped; no leaf for an
+empty or malformed list. The walk is depth-first over the bag the server
+sent, so a cross-signed bag with two routes to two roots is handled by
+trying both — `api.stripe.com` sends five certificates that way and
+validates — and honours `CA:TRUE`, `keyCertSign`, and `pathlen`.
+
+**A certificate is read strictly.** Unknown critical extensions reject
+it, as §4.2 says they must, and so does a critical name-constraints
+extension this crate does not yet enforce; a duplicate extension, a
+mismatch between the inner and outer signature algorithms, a version
+that cannot carry extensions, and every truncation are `ok` false, never
+a trap. Only DNS names are read from the alternative names, and a
+certificate without them names no host: the Common Name fallback is not
+offered.
+
+**The arithmetic is checked where a person can check it.** `ec::field`'s
+Barrett constants and reductions are asserted limb by limb for one-,
+two-, and three-limb moduli against Python's integers; Knuth's Algorithm
+D divides multi-limb numbers with the quotients Python gives; the group
+law runs on the 19-point curve `y² = x³ + 2x + 2` over F₁₇, every
+multiple of whose generator is listed in the spec, and an ECDSA
+signature on it (d = 7, k = 3, e = 10 → (10, 14)) verifies and its six
+corruptions do not. P-256's and P-384's parameters are pinned by their
+Barrett constants and by `2G`, compared in Jacobian form because one
+inversion on P-384 is past the fuel.
+
+### The oracles
 
 `examples/tls.tuo` forks a server on the catalog's `std::tls` and a client
 on `http::client::get_pinned` in one process and joins them: a full
 handshake, an HTTPS request answered through the record layer, the same
-server refused under a wrong pin before any Finished is sent, and
-`https://` without a pin refused without connecting. `examples/tls_openssl.tuo`
-does the same against `openssl s_server` started by `run-tests.sh --live`
-with the test certificate in `examples/tls-test/`: OpenSSL's status page
-comes back naming `TLS_CHACHA20_POLY1305_SHA256`, after the session
-tickets it sends first are read and discarded.
+server refused under a wrong pin before any Finished is sent.
+`examples/x509.tuo` runs natively what the sandbox cannot: RFC 6979's
+P-256/SHA-256 and P-384/SHA-384 signatures verify and their swaps do
+not; the P-256-under-P-384 and RSA-2048 test PKIs validate and fail for
+the wrong host, time, and root; and chains captured from
+`api.cloudflare.com`, `www.cloudflare.com`, `sentry.io`,
+`api.stripe.com`, and `r2.cloudflarestorage.com` on 2026-09-15 validate
+against `x509::roots` at that date — the R2 leaf, which had expired six
+days earlier, is refused as not current and accepted a fortnight before.
+`examples/tls_openssl.tuo` fetches from three `openssl s_server`
+instances `run-tests.sh --live` starts: the pinned Ed25519 certificate,
+the P-256 chain (an ECDSA CertificateVerify from an independent
+implementation), and the RSA-2048 chain (RSA-PSS), each validated against
+the test root in `examples/tls-test/` and refused under the wrong one.
+`examples/https_live.tuo` is the point of it all: the time from
+`time.cloudflare.com` over SNTP, then `GET https://api.stripe.com/v1/charges`
+(401, as it should be without a key), `https://sentry.io/`,
+`https://api.cloudflare.com/client/v4/`, and `https://www.cloudflare.com/`,
+each chain validated against the root store, plus a public server
+refused under a pin and under an empty store.
 
 ### What is deliberately not here
 
-**Trust is a pinned key, and that is the whole limitation.** `std::der`
-decodes a certificate; nothing validates a chain, checks a name, or reads a
-validity date, so the caller supplies the Ed25519 key it expects. Public
-servers present ECDSA P-256 or RSA certificates this crate cannot verify,
-which is why `get` still refuses `https://`: an "accept anything" mode is
-not offered. Closing that gap — P-256 ECDSA over `std::bignum`, X.509 chain
-building, a root store — is the roadmap's next item. Also absent by
-decision: HelloRetryRequest, resumption, 0-RTT, key updates, client
-certificates, and any suite but the catalog's. And the catalog's own
-caveat carries over: `std::bignum` is variable-time, so the client's X25519
-step leaks timing on its ephemeral key.
+**There is no unverified mode.** `https://` needs a pin, or roots and a
+time; with neither, or when the SNTP query fails, the request is refused
+before connecting. **The time comes from the network** because
+`std::rt::now_nanos` is monotonic with an arbitrary epoch and the runtime
+has no wall clock; a process that knows the time passes it to
+`tls::handshake::trust_roots` directly. **Not enforced:** name
+constraints (critical ones reject the certificate), policies, revocation
+(CRL, OCSP), Certificate Transparency, IP-address names. **Not spoken:**
+HelloRetryRequest, resumption, 0-RTT, key updates, client certificates,
+any key exchange but X25519, any suite but ChaCha20-Poly1305 — every
+public server tried accepts that pair, and a server that does not is
+refused at the ServerHello. **The root store is 17 roots, not 140:** the
+ones the backend's integrations chain to plus the other large public
+CAs; adding one is one base64 line. And the catalog's own caveat carries
+over: `std::bignum` is variable-time, so the client's X25519 step leaks
+timing on its ephemeral key. Signature *verification* is variable-time
+by design, and there is no signing function in `ec` or `rsa` at all.
 
 ---
 
@@ -316,8 +380,8 @@ add a `Set-Cookie` of its own. The spec asserts the empty result.
 
 **Redirects change the method the way the RFC says.** `303` always becomes
 `GET`; `301`/`302` do for `POST`; `307`/`308` never. A `Location` that is a
-path is resolved against the origin; a relative one, or an `https://` one,
-stops the chain with the last response in hand. A redirect loop ends after
+path is resolved against the origin; a relative one stops the chain with
+the last response in hand. A redirect loop ends after
 `max_redirects` with the last `302`, not a hang.
 
 ### The two oracles
@@ -330,11 +394,11 @@ pipelined requests on one kept-alive connection answered in order, a
 shape both `400`. It needs no network and `run-tests.sh` runs it by
 default. `examples/http_live.tuo` resolves `example.com` through
 `dns::resolver`, fetches it, follows httpbin's redirect, posts JSON to it,
-and confirms `https://` and an unresolvable name fail cleanly.
+and confirms an unresolvable name fails cleanly.
 
 ### What is deliberately not here
 
-No TLS: `https://` parses and is refused. One request per client
+One request per client
 connection — the server keeps connections alive, the client does not pool
 them, and `http::message::message_end` is what a pool would loop on. One
 connection at a time on the server; `par_map` could fork accepted
@@ -477,14 +541,32 @@ src/http/server.tuo      accept, read under the parser's direction, handle, keep
 examples/http.tuo        the loopback oracle: server and client in one process
 examples/http_live.tuo   the live oracle: public servers through dns::resolver
 
-src/tls/handshake.tuo    the client's half of the handshake, as pure data
+src/tls/handshake.tuo    the client's half of the handshake, as pure data; Trust
 src/tls/client.tuo       the session: handshake over a socket, bytes over records
+src/tls/clock.tuo        the time of day over SNTP
 src/tls/fixture.tuo      RFC 8448's trace, and the test certificate and its key
 examples/tls.tuo         the loopback oracle: this client against std::tls
-examples/tls_openssl.tuo the interop oracle: this client against openssl s_server
-examples/tls-test/       the test certificate as PEM, for openssl s_server
+examples/tls_openssl.tuo the interop oracle: this client against three openssl s_servers
+examples/https_live.tuo  the live oracle: https:// to Stripe, Sentry, Cloudflare
+examples/tls-test/       the test certificates and chains as PEM, for openssl s_server
+
+src/x509/certificate.tuo the fields of a certificate a client needs, read strictly
+src/x509/chain.tuo       flat certificate lists, and the walk to a root
+src/x509/name.tuo        DNS name matching, wildcards as RFC 6125 allows
+src/x509/time.tuo        UTCTime and GeneralizedTime to Unix seconds
+src/x509/roots.tuo       17 roots from the Mozilla bundle
+src/x509/fixture.tuo     three test PKIs and five captured public chains
+src/ec/field.tuo         Barrett reduction, Knuth division, pow, invert
+src/ec/curve.tuo         Jacobian group law, spec'd on a 19-point curve
+src/ec/p256.tuo          NIST P-256
+src/ec/p384.tuo          NIST P-384
+src/ec/ecdsa.tuo         ECDSA verification, strict DER signatures
+src/rsa/verify.tuo       PKCS#1 v1.5 and RSASSA-PSS verification
+src/crypto/sha384.tuo    SHA-384 on std::sha512's parts
+examples/x509.tuo        the native oracle: RFC 6979, the test PKIs, captured chains
 
 docs/COMPILER-FINDING.md the && / || temporary native codegen refused (fixed upstream)
+docs/COMPILER-FINDING-2.md a local shadowing a module path drops the function silently
 
 docs/RUNTIME-FINDING.md  the udp_bind finding, and its resolution
 ```
