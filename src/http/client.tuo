@@ -9,12 +9,15 @@
 // redirect, do it again — a bounded number of times, with the method
 // changes RFC 9110 §15.4 prescribes.
 //
-// `https://` IS SERVED BY `tls::client`, WITH A PINNED KEY. There is no
-// certificate-chain validation in this crate, so a TLS request needs the
-// server's Ed25519 public key from the caller (`fetch_pinned`,
-// `get_pinned`); `get` and `post` refuse `https://` outright rather than
-// connect unverified. The bytes then cross the session instead of the
-// socket, and the same `http::message::needed` loop frames them.
+// `https://` IS SERVED BY `tls::client`, TRUSTING A CHAIN OR A PIN. By
+// default the server's certificates are validated by `x509::chain`
+// against the public roots in `x509::roots`, for the URL's host, at the
+// time `tls::clock` learns from an SNTP server (the runtime has no wall
+// clock). A caller with a private CA passes its own roots
+// (`get_with_roots`); one that knows the server's Ed25519 key pins it
+// (`get_pinned`). There is no unverified mode. The bytes then cross the
+// session instead of the socket, and the same `http::message::needed`
+// loop frames them.
 //
 // ONE REQUEST PER CONNECTION. Every request is sent with `Connection:
 // close`, so the response either has a length, is chunked, or runs to the
@@ -23,9 +26,10 @@
 // deliberate omission; `http::message::message_end` is what a pool would
 // loop on, and the server side does keep connections alive.
 //
-// FAILURE IS A RESPONSE WITH `ok` FALSE and status 0. A malformed URL, an
-// `https://` one (no TLS in v0), a name that does not resolve, a refused
-// connection, a timeout, or a response the parser rejects all produce it.
+// FAILURE IS A RESPONSE WITH `ok` FALSE and status 0. A malformed URL, a
+// name that does not resolve, a refused connection, a timeout, a
+// certificate chain that does not validate, no time from the SNTP
+// server, or a response the parser rejects all produce it.
 // A `404` is a successful exchange and has `ok` true.
 //
 // Effectful, so no specs on the socket paths (`R0007`); pinned by
@@ -316,7 +320,7 @@ pub fn resolve_host(in host: Str, in resolver: Str, take timeout_ms: Int) -> Str
 /// EFFECT: one request to `url_text`, no redirects followed. `extra` is
 /// pre-rendered header lines (see `http::message::header_line`); `Host`,
 /// `User-Agent`, `Connection: close`, and `Content-Length` are added.
-/// `https://` is refused: see `fetch_once_pinned`.
+/// `https://` trusts the public root store: see `fetch_once_trusting`.
 ///
 /// # Example
 /// ```tuo
@@ -326,22 +330,54 @@ pub fn fetch_once(in method: Str, in url_text: Str, in extra: Str, in body: Str,
     fetch_once_pinned(method, url_text, extra, body, timeout_ms, resolver, std::array::empty())
 }
 
-/// EFFECT: `fetch_once` for either scheme. An `https://` URL is served by
-/// a TLS 1.3 session that trusts only a certificate whose Ed25519 key is
-/// `pinned`; with no pin an `https://` request is refused before
-/// connecting. SNI names the host unless it is an address.
+/// EFFECT: `fetch_once` for either scheme, trusting `pinned` when it is
+/// a 32-byte Ed25519 key and otherwise the public root store.
 ///
 /// # Example
 /// ```tuo
 /// let r = http::client::fetch_once_pinned("GET", "https://localhost:4433/", "", "", 10000, "1.1.1.1", pin);
 /// ```
 pub fn fetch_once_pinned(in method: Str, in url_text: Str, in extra: Str, in body: Str, take timeout_ms: Int, in resolver: Str, in pinned: Array[Int]) -> Response {
+    let roots = if std::array::len(pinned) == 32 {
+        std::array::empty()
+    } else {
+        x509::roots::store()
+    };
+    fetch_once_trusting(method, url_text, extra, body, timeout_ms, resolver, pinned, roots)
+}
+
+/// EFFECT: `fetch_once` for either scheme. An `https://` URL is served by
+/// a TLS 1.3 session that trusts a certificate whose Ed25519 key is
+/// `pinned` when that is 32 bytes, and otherwise a chain to a root in
+/// `roots` that names the URL's host and is valid now — "now" being what
+/// `tls::clock` learns from its SNTP server, since the runtime has no
+/// wall clock. With neither a pin nor roots, or with no time, or for an
+/// address rather than a name, the request is refused before connecting.
+/// SNI names the host.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::fetch_once_trusting("GET", "https://sentry.io/", "", "", 10000, "1.1.1.1", std::array::empty(), x509::roots::store());
+/// ```
+pub fn fetch_once_trusting(in method: Str, in url_text: Str, in extra: Str, in body: Str, take timeout_ms: Int, in resolver: Str, in pinned: Array[Int], in roots: Array[Int]) -> Response {
     let u = http::url::parse(url_text);
     if !u.ok {
         return failed();
     }
-    if u.https && std::array::len(pinned) != 32 {
-        return failed();
+    var trust = tls::handshake::pin(std::array::empty());
+    if u.https {
+        if std::array::len(pinned) == 32 {
+            trust = tls::handshake::pin(pinned);
+        } else {
+            if std::array::len(roots) == 0 || http::url::is_ipv4_literal(std::string::as_str(u.host)) {
+                return failed();
+            }
+            let now = tls::clock::now_unix(tls::clock::default_server(), timeout_ms);
+            if now == 0 {
+                return failed();
+            }
+            trust = tls::handshake::trust_roots(roots, std::string::as_str(u.host), now);
+        }
     }
     let address = resolve_host(std::string::as_str(u.host), resolver, timeout_ms);
     if std::string::len(address) == 0 {
@@ -366,7 +402,7 @@ pub fn fetch_once_pinned(in method: Str, in url_text: Str, in extra: Str, in bod
     } else {
         std::string::from_str(std::string::as_str(u.host))
     };
-    var session = tls::client::handshake(fd, std::string::as_str(sni), pinned, timeout_ms);
+    var session = tls::client::handshake(fd, std::string::as_str(sni), trust, timeout_ms);
     if !session.ok {
         let _ = std::net::close(fd);
         return failed();
@@ -386,8 +422,7 @@ pub fn fetch_once_pinned(in method: Str, in url_text: Str, in extra: Str, in bod
 
 /// EFFECT: `fetch_once`, following up to `max_redirects` redirects. The
 /// last response is returned when the chain is longer, when a `Location`
-/// cannot be followed (relative, or `https://` without a pin), or when it
-/// is not a redirect at all.
+/// cannot be followed, or when it is not a redirect at all.
 ///
 /// # Example
 /// ```tuo
@@ -397,8 +432,8 @@ pub fn fetch(in method: Str, in url_text: Str, in extra: Str, in body: Str, take
     fetch_pinned(method, url_text, extra, body, timeout_ms, resolver, std::array::empty())
 }
 
-/// EFFECT: `fetch_once_pinned`, following redirects, with `pinned`
-/// trusted for every `https://` hop.
+/// EFFECT: `fetch_once_pinned`, following redirects, with `pinned` (or,
+/// without one, the public root store) trusted for every `https://` hop.
 ///
 /// # Example
 /// ```tuo
@@ -429,11 +464,12 @@ pub fn fetch_pinned(in method: Str, in url_text: Str, in extra: Str, in body: St
     failed()
 }
 
-/// EFFECT: `GET url`, following redirects, with the defaults.
+/// EFFECT: `GET url`, following redirects, with the defaults: `http://`
+/// or `https://`, the latter validated against `x509::roots`.
 ///
 /// # Example
 /// ```tuo
-/// let r = http::client::get("http://example.com/", 10000);
+/// let r = http::client::get("https://sentry.io/", 10000);
 /// ```
 pub fn get(in url_text: Str, take timeout_ms: Int) -> Response {
     fetch("GET", url_text, "", "", timeout_ms, default_resolver())
@@ -461,6 +497,18 @@ pub fn post(in url_text: Str, in content_type: Str, in body: Str, take timeout_m
 /// ```
 pub fn get_pinned(in url_text: Str, in pinned: Array[Int], take timeout_ms: Int) -> Response {
     fetch_pinned("GET", url_text, "", "", timeout_ms, default_resolver(), pinned)
+}
+
+/// EFFECT: `GET url` over `https://` trusting chains to `roots` rather
+/// than the public store — for a private CA, or an oracle with a test
+/// root. No redirects.
+///
+/// # Example
+/// ```tuo
+/// let r = http::client::get_with_roots("https://localhost:4434/", test_roots, 10000);
+/// ```
+pub fn get_with_roots(in url_text: Str, in roots: Array[Int], take timeout_ms: Int) -> Response {
+    fetch_once_trusting("GET", url_text, "", "", timeout_ms, default_resolver(), std::array::empty(), roots)
 }
 
 spec is_redirect {

@@ -8,7 +8,7 @@
 // one side sends close_notify.
 //
 // EVERY CHECK IS FATAL AND SILENT ON THE WIRE. A server whose Finished does
-// not verify, whose certificate is not the pinned key, or whose
+// not verify, whose certificates the `Trust` does not accept, or whose
 // CertificateVerify does not sign the transcript gets no application data
 // and no explanation: the session is `ok` false, and the caller closes the
 // socket. RFC 8446 has alerts for each case, but a client that explains
@@ -21,9 +21,8 @@
 // Finished is record 0 under the handshake key, the first application
 // record is record 0 under the application key.
 //
-// WHAT IS NOT HERE: HelloRetryRequest, resumption, 0-RTT, key updates,
-// client certificates, and any certificate check beyond the pinned key.
-// Each is refused rather than faked. Post-handshake NewSessionTicket
+// WHAT IS NOT HERE: HelloRetryRequest, resumption, 0-RTT, key updates, and
+// client certificates. Each is refused rather than faked. Post-handshake NewSessionTicket
 // records — which OpenSSL sends by default — are read and discarded.
 //
 // Effectful, so no specs on the socket paths (`R0007`); pinned by
@@ -138,12 +137,12 @@ fn opened(in key: Array[Int], in iv: Array[Int], take sequence: Int, in record: 
 ///
 /// # Example
 /// ```tuo
-/// let session = tls::client::handshake(fd, "localhost", pinned_key, 10000);
+/// let session = tls::client::handshake(fd, "localhost", tls::handshake::pin(key), 10000);
 /// ```
-pub fn handshake(take socket: Int, in server_name: Str, in pinned: Array[Int], take timeout_ms: Int) -> Session {
+pub fn handshake(take socket: Int, in server_name: Str, in trust: tls::handshake::Trust, take timeout_ms: Int) -> Session {
     let private = std::crypto::nonce(32);
     let random = std::crypto::nonce(32);
-    handshake_with(socket, server_name, pinned, private, random, timeout_ms)
+    handshake_with(socket, server_name, trust, private, random, timeout_ms)
 }
 
 /// EFFECT: `handshake` with the client's ephemeral private key and random
@@ -151,9 +150,9 @@ pub fn handshake(take socket: Int, in server_name: Str, in pinned: Array[Int], t
 ///
 /// # Example
 /// ```tuo
-/// let session = tls::client::handshake_with(fd, "localhost", pinned_key, private, random, 10000);
+/// let session = tls::client::handshake_with(fd, "localhost", trust, private, random, 10000);
 /// ```
-pub fn handshake_with(take socket: Int, in server_name: Str, in pinned: Array[Int], in private: Array[Int], in random: Array[Int], take timeout_ms: Int) -> Session {
+pub fn handshake_with(take socket: Int, in server_name: Str, in trust: tls::handshake::Trust, in private: Array[Int], in random: Array[Int], take timeout_ms: Int) -> Session {
     // 1. ClientHello, in the clear.
     let share = std::x25519::public_key(private);
     let hello = tls::handshake::client_hello(random, share, server_name);
@@ -213,17 +212,20 @@ pub fn handshake_with(take socket: Int, in server_name: Str, in pinned: Array[In
         return failed(socket);
     }
 
-    // 5. What the client verifies: the key is the pinned one, the
-    //    CertificateVerify signs the transcript through the Certificate, and
+    // 5. What the client verifies: the certificates satisfy the trust
+    //    (a pinned key, or a chain to a root), the CertificateVerify signs
+    //    the transcript through the Certificate with the leaf's key, and
     //    the Finished MACs the transcript through the CertificateVerify.
-    let der = tls::handshake::certificate_der(flight.certificate);
-    if !tls::handshake::key_matches(der, pinned) {
+    let list = tls::handshake::certificate_list(flight.certificate);
+    if !tls::handshake::trusted(trust, list) {
         return failed(socket);
     }
+    let der = x509::chain::entry_at(list, 0);
     let _ = std::tls::push_bytes(transcript, flight.encrypted_extensions);
     let _ = std::tls::push_bytes(transcript, flight.certificate);
     let certificate_hash = tls::handshake::transcript_hash(transcript);
-    if !tls::handshake::signature_valid(der, certificate_hash, tls::handshake::certificate_verify_signature(flight.certificate_verify)) {
+    let scheme = tls::handshake::certificate_verify_scheme(flight.certificate_verify);
+    if !tls::handshake::signature_valid(der, certificate_hash, scheme, tls::handshake::certificate_verify_signature(flight.certificate_verify)) {
         return failed(socket);
     }
     let _ = std::tls::push_bytes(transcript, flight.certificate_verify);
