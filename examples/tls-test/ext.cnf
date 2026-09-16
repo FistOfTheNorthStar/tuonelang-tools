@@ -1,0 +1,13 @@
+[ca]
+basicConstraints=critical,CA:TRUE,pathlen:0
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+[root]
+basicConstraints=critical,CA:TRUE
+keyUsage=critical,keyCertSign,cRLSign
+subjectKeyIdentifier=hash
+[leaf]
+basicConstraints=CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:localhost,DNS:example.test,DNS:*.wild.test
