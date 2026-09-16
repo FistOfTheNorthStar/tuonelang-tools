@@ -220,7 +220,7 @@ and `rsa` verify the signatures public CAs actually make. `get` of an
 | `tls::client` — the session: handshake over a socket, records to bytes, tickets skipped | ✅ 12 loopback checks against `std::tls`, 8 against OpenSSL 3.6 |
 | `tls::clock` — the time of day, over SNTP, since the runtime's clock is monotonic only | ✅ decode spec'd; live against `time.cloudflare.com` |
 | `x509::certificate`, `x509::chain`, `x509::name`, `x509::time` — parse, walk, match, date | ✅ 190 specs on a test PKI and real certificates |
-| `x509::roots` — 17 roots from the Mozilla bundle `certifi` ships | ✅ every entry spec'd to be a self-issued CA |
+| `x509::roots` — 19 roots from the Mozilla bundle `certifi` ships | ✅ every entry spec'd to be a self-issued CA |
 | `ec::field`, `ec::curve`, `ec::p256`, `ec::p384`, `ec::ecdsa` — Barrett arithmetic, Jacobian group law, ECDSA | ✅ 120 specs on small moduli and a 19-point curve; RFC 6979 natively |
 | `rsa::verify`, `crypto::sha384` — PKCS#1 v1.5, RSASSA-PSS, MGF1, SHA-384 | ✅ 30 specs on OpenSSL signatures and FIPS digests |
 | `http::client::get` — `https://` validated against the root store | ✅ live to `api.stripe.com`, `sentry.io`, `api.cloudflare.com`, `www.cloudflare.com` |
@@ -325,7 +325,7 @@ constraints (critical ones reject the certificate), policies, revocation
 HelloRetryRequest, resumption, 0-RTT, key updates, client certificates,
 any key exchange but X25519, any suite but ChaCha20-Poly1305 — every
 public server tried accepts that pair, and a server that does not is
-refused at the ServerHello. **The root store is 17 roots, not 140:** the
+refused at the ServerHello. **The root store is 19 roots, not 140:** the
 ones the backend's integrations chain to plus the other large public
 CAs; adding one is one base64 line. And the catalog's own caveat carries
 over: `std::bignum` is variable-time, so the client's X25519 step leaks
@@ -394,7 +394,8 @@ pipelined requests on one kept-alive connection answered in order, a
 shape both `400`. It needs no network and `run-tests.sh` runs it by
 default. `examples/http_live.tuo` resolves `example.com` through
 `dns::resolver`, fetches it, follows httpbin's redirect, posts JSON to it,
-and confirms an unresolvable name fails cleanly.
+confirms an unresolvable name fails cleanly, and fetches `https://example.com/`
+through the root store.
 
 ### What is deliberately not here
 
@@ -554,7 +555,7 @@ src/x509/certificate.tuo the fields of a certificate a client needs, read strict
 src/x509/chain.tuo       flat certificate lists, and the walk to a root
 src/x509/name.tuo        DNS name matching, wildcards as RFC 6125 allows
 src/x509/time.tuo        UTCTime and GeneralizedTime to Unix seconds
-src/x509/roots.tuo       17 roots from the Mozilla bundle
+src/x509/roots.tuo       19 roots from the Mozilla bundle
 src/x509/fixture.tuo     three test PKIs and five captured public chains
 src/ec/field.tuo         Barrett reduction, Knuth division, pow, invert
 src/ec/curve.tuo         Jacobian group law, spec'd on a 19-point curve

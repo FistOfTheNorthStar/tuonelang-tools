@@ -57,7 +57,7 @@ fn main() -> Int {
     failed = failed + report("GET /status/404 is a 404 response, not a failure", r4.ok && r4.status == 404);
 
     let r5 = http::client::get("https://example.com/", t);
-    failed = failed + report("https:// is refused (no TLS in v0)", !r5.ok);
+    failed = failed + report("GET https://example.com/ is 200 through the root store", r5.ok && r5.status == 200);
 
     let r6 = http::client::get("http://this-name-should-not-exist-tuonelang.example.com/", t);
     failed = failed + report("a name that does not resolve is a failure, not a hang", !r6.ok);

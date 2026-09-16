@@ -43,7 +43,7 @@ Ed25519, HKDF, DER, and a TLS 1.3 *server* verified against OpenSSL. This
 repo added the *client* the same day, and on 2026-09-16 the trust layer
 public servers need: ECDSA on P-256 and P-384, RSA PKCS#1 v1.5 and PSS,
 X.509 parsing with names, dates, and the constraint extensions, a
-depth-first chain walk, and 17 roots from the Mozilla bundle.
+depth-first chain walk, and 19 roots from the Mozilla bundle.
 `http::client::get` of an `https://` URL reaches `api.stripe.com`,
 `sentry.io`, and Cloudflare, with every chain validated — and the walk
 is spec'd to fail for every reason RFC 5280 names, which is where the
