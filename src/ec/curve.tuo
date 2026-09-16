@@ -1,0 +1,397 @@
+// ec::curve — short Weierstrass curves in Jacobian coordinates.
+//
+// A curve `y² = x³ + ax + b` over a prime field, with a base point of
+// prime order `n`. The group law is written once, generically, and the
+// NIST curves in `ec::p256` and `ec::p384` are parameter sets for it — so
+// the specs here run on a 17-element curve every step of which a person
+// can check by hand, and the real curves are pinned natively by
+// `examples/x509.tuo` against RFC 6979's published signatures.
+//
+// JACOBIAN COORDINATES, so that adding and doubling need no field
+// inversion; a point `(X, Y, Z)` means the affine `(X/Z², Y/Z³)`, and the
+// point at infinity is `Z = 0`. One inversion at the end (`normalize`)
+// yields the affine result. The formulas are the textbook ones for a
+// general `a`; the `a = -3` shortcuts are deliberately not taken, so the
+// tiny curve in the specs (`a = 2`) exercises exactly the code the real
+// curves run.
+//
+// NOT CONSTANT TIME. The scalar multiplications branch on scalar bits.
+// That is fine here and only here: every scalar this module ever sees is
+// public — the `u1`, `u2` of a signature *verification*. There is no
+// signing path in this crate.
+
+module ec::curve;
+
+/// A curve over `p` with base point `(gx, gy)` of prime order `n`.
+/// `bits` is the bit length of `n` and `width` the byte length of a
+/// coordinate.
+pub struct Curve {
+    p: ec::field::Modulus,
+    a: Array[Int],
+    b: Array[Int],
+    n: ec::field::Modulus,
+    gx: Array[Int],
+    gy: Array[Int],
+    bits: Int,
+    width: Int,
+}
+
+/// A point in Jacobian coordinates; `z` zero is the point at infinity.
+pub struct Point {
+    x: Array[Int],
+    y: Array[Int],
+    z: Array[Int],
+}
+
+/// Assemble a curve from its parameters.
+///
+/// # Example
+/// ```tuo
+/// let c = ec::curve::curve(p, a, b, n, gx, gy);
+/// ```
+pub fn curve(in p: Array[Int], in a: Array[Int], in b: Array[Int], in n: Array[Int], in gx: Array[Int], in gy: Array[Int]) -> Curve {
+    let pm = ec::field::modulus(p);
+    let nm = ec::field::modulus(n);
+    let bits = std::bignum::bit_length(n);
+    let width = (std::bignum::bit_length(p) + 7) / 8;
+    let ra = ec::field::reduce(a, pm);
+    let rb = ec::field::reduce(b, pm);
+    let rgx = ec::field::reduce(gx, pm);
+    let rgy = ec::field::reduce(gy, pm);
+    Curve { p: pm, a: ra, b: rb, n: nm, gx: rgx, gy: rgy, bits: bits, width: width }
+}
+
+/// The point at infinity.
+///
+/// # Example
+/// ```tuo
+/// let o = ec::curve::infinity();
+/// ```
+pub fn infinity() -> Point {
+    Point { x: std::array::empty(), y: std::array::empty(), z: std::array::empty() }
+}
+
+/// Whether `p` is the point at infinity.
+///
+/// # Example
+/// ```tuo
+/// if ec::curve::is_infinity(r) { /* … */ }
+/// ```
+pub fn is_infinity(in p: Point) -> Bool {
+    std::bignum::is_zero(p.z)
+}
+
+/// The affine point `(x, y)`, as a Jacobian point with `z = 1`.
+///
+/// # Example
+/// ```tuo
+/// let g = ec::curve::affine(gx, gy, c);
+/// ```
+pub fn affine(in x: Array[Int], in y: Array[Int], in c: Curve) -> Point {
+    Point { x: ec::field::reduce(x, c.p), y: ec::field::reduce(y, c.p), z: std::bignum::from_int(1) }
+}
+
+/// The base point.
+///
+/// # Example
+/// ```tuo
+/// let g = ec::curve::generator(c);
+/// ```
+pub fn generator(in c: Curve) -> Point {
+    affine(c.gx, c.gy, c)
+}
+
+/// A copy of `p`, reduced.
+///
+/// # Example
+/// ```tuo
+/// let q = ec::curve::copy(p, c);
+/// ```
+pub fn copy(in p: Point, in c: Curve) -> Point {
+    Point { x: ec::field::reduce(p.x, c.p), y: ec::field::reduce(p.y, c.p), z: ec::field::reduce(p.z, c.p) }
+}
+
+/// Whether the affine `(x, y)` satisfies the curve equation.
+///
+/// # Example
+/// ```tuo
+/// let on = ec::curve::on_curve(x, y, c);
+/// ```
+pub fn on_curve(in x: Array[Int], in y: Array[Int], in c: Curve) -> Bool {
+    if std::bignum::compare(x, c.p.m) >= 0 || std::bignum::compare(y, c.p.m) >= 0 {
+        return false;
+    }
+    let lhs = ec::field::square(y, c.p);
+    let x3 = ec::field::mul(ec::field::square(x, c.p), x, c.p);
+    let rhs = ec::field::add(ec::field::add(x3, ec::field::mul(c.a, x, c.p), c.p), c.b, c.p);
+    ec::field::same(lhs, rhs)
+}
+
+/// `2p`.
+///
+/// # Example
+/// ```tuo
+/// let d = ec::curve::double(p, c);
+/// ```
+pub fn double(in p: Point, in c: Curve) -> Point {
+    if is_infinity(p) || std::bignum::is_zero(p.y) {
+        return infinity();
+    }
+    let ysq = ec::field::square(p.y, c.p);
+    let s = ec::field::mul(ec::field::mul(std::bignum::from_int(4), p.x, c.p), ysq, c.p);
+    let zsq = ec::field::square(p.z, c.p);
+    let m = ec::field::add(ec::field::mul(std::bignum::from_int(3), ec::field::square(p.x, c.p), c.p), ec::field::mul(c.a, ec::field::square(zsq, c.p), c.p), c.p);
+    let x3 = ec::field::sub(ec::field::square(m, c.p), ec::field::mul(std::bignum::from_int(2), s, c.p), c.p);
+    let y3 = ec::field::sub(ec::field::mul(m, ec::field::sub(s, x3, c.p), c.p), ec::field::mul(std::bignum::from_int(8), ec::field::square(ysq, c.p), c.p), c.p);
+    let z3 = ec::field::mul(ec::field::mul(std::bignum::from_int(2), p.y, c.p), p.z, c.p);
+    Point { x: x3, y: y3, z: z3 }
+}
+
+/// `p + q`.
+///
+/// # Example
+/// ```tuo
+/// let s = ec::curve::add(p, q, c);
+/// ```
+pub fn add(in p: Point, in q: Point, in c: Curve) -> Point {
+    if is_infinity(p) {
+        return copy(q, c);
+    }
+    if is_infinity(q) {
+        return copy(p, c);
+    }
+    let z1sq = ec::field::square(p.z, c.p);
+    let z2sq = ec::field::square(q.z, c.p);
+    let u1 = ec::field::mul(p.x, z2sq, c.p);
+    let u2 = ec::field::mul(q.x, z1sq, c.p);
+    let s1 = ec::field::mul(p.y, ec::field::mul(q.z, z2sq, c.p), c.p);
+    let s2 = ec::field::mul(q.y, ec::field::mul(p.z, z1sq, c.p), c.p);
+    if ec::field::same(u1, u2) {
+        if ec::field::same(s1, s2) {
+            return double(p, c);
+        }
+        return infinity();
+    }
+    let h = ec::field::sub(u2, u1, c.p);
+    let r = ec::field::sub(s2, s1, c.p);
+    let hsq = ec::field::square(h, c.p);
+    let hcu = ec::field::mul(h, hsq, c.p);
+    let u1hsq = ec::field::mul(u1, hsq, c.p);
+    let x3 = ec::field::sub(ec::field::sub(ec::field::square(r, c.p), hcu, c.p), ec::field::mul(std::bignum::from_int(2), u1hsq, c.p), c.p);
+    let y3 = ec::field::sub(ec::field::mul(r, ec::field::sub(u1hsq, x3, c.p), c.p), ec::field::mul(s1, hcu, c.p), c.p);
+    let z3 = ec::field::mul(ec::field::mul(h, p.z, c.p), q.z, c.p);
+    Point { x: x3, y: y3, z: z3 }
+}
+
+/// `k·p`, by double-and-add from the most significant bit.
+///
+/// # Example
+/// ```tuo
+/// let q = ec::curve::scalar_mult(k, p, c);
+/// ```
+pub fn scalar_mult(in k: Array[Int], in p: Point, in c: Curve) -> Point {
+    var r = infinity();
+    var i = std::bignum::bit_length(k) - 1;
+    while i >= 0 {
+        r = double(r, c);
+        if ec::field::bit_at(k, i) == 1 {
+            r = add(r, p, c);
+        }
+        i = i - 1;
+    }
+    r
+}
+
+/// `u1·p + u2·q` in one pass (Shamir's trick), which is what a signature
+/// verification computes.
+///
+/// # Example
+/// ```tuo
+/// let r = ec::curve::double_scalar_mult(u1, g, u2, public, c);
+/// ```
+pub fn double_scalar_mult(in u1: Array[Int], in p: Point, in u2: Array[Int], in q: Point, in c: Curve) -> Point {
+    let both = add(p, q, c);
+    var r = infinity();
+    let b1 = std::bignum::bit_length(u1);
+    let b2 = std::bignum::bit_length(u2);
+    var i = (if b1 > b2 {
+        b1
+    } else {
+        b2
+    }) - 1;
+    while i >= 0 {
+        r = double(r, c);
+        let bit1 = ec::field::bit_at(u1, i);
+        let bit2 = ec::field::bit_at(u2, i);
+        if bit1 == 1 && bit2 == 1 {
+            r = add(r, both, c);
+        } else if bit1 == 1 {
+            r = add(r, p, c);
+        } else if bit2 == 1 {
+            r = add(r, q, c);
+        }
+        i = i - 1;
+    }
+    r
+}
+
+/// `p` with `z = 1` — its affine coordinates — or infinity unchanged.
+///
+/// # Example
+/// ```tuo
+/// let a = ec::curve::normalize(r, c);
+/// ```
+pub fn normalize(in p: Point, in c: Curve) -> Point {
+    if is_infinity(p) {
+        return infinity();
+    }
+    let zi = ec::field::invert(p.z, c.p);
+    let zi2 = ec::field::square(zi, c.p);
+    let x = ec::field::mul(p.x, zi2, c.p);
+    let y = ec::field::mul(p.y, ec::field::mul(zi, zi2, c.p), c.p);
+    Point { x: x, y: y, z: std::bignum::from_int(1) }
+}
+
+/// Whether two points are the same point.
+///
+/// # Example
+/// ```tuo
+/// let eq = ec::curve::equal(p, q, c);
+/// ```
+pub fn equal(in p: Point, in q: Point, in c: Curve) -> Bool {
+    let a = normalize(p, c);
+    let b = normalize(q, c);
+    if is_infinity(a) || is_infinity(b) {
+        return is_infinity(a) && is_infinity(b);
+    }
+    ec::field::same(a.x, b.x) && ec::field::same(a.y, b.y)
+}
+
+/// Decode an uncompressed SEC 1 point: `0x04 || x || y`, each coordinate
+/// `width` bytes. Anything else — a wrong length, a compressed form, a
+/// coordinate outside the field, a point off the curve — decodes to
+/// infinity, which no public key is.
+///
+/// # Example
+/// ```tuo
+/// let q = ec::curve::decode(bytes, c);
+/// ```
+pub fn decode(in bytes: Array[Int], in c: Curve) -> Point {
+    if std::array::len(bytes) != 1 + 2 * c.width || std::array::get(bytes, 0) != 4 {
+        return infinity();
+    }
+    var xb = std::array::empty();
+    var yb = std::array::empty();
+    var i = 0;
+    while i < c.width {
+        std::array::push(xb, std::array::get(bytes, 1 + i));
+        std::array::push(yb, std::array::get(bytes, 1 + c.width + i));
+        i = i + 1;
+    }
+    let x = std::bignum::from_be_bytes(xb);
+    let y = std::bignum::from_be_bytes(yb);
+    if !on_curve(x, y, c) {
+        return infinity();
+    }
+    affine(x, y, c)
+}
+
+// ----------------------------------------------------------------------------
+// Specs: the 19-point curve y² = x³ + 2x + 2 over F_17, generated by
+// (5, 1). Its multiples are listed in every introduction to the subject
+// and were recomputed for these specs with a ten-line Python script.
+// ----------------------------------------------------------------------------
+
+fn n(take v: Int) -> Array[Int] {
+    std::bignum::from_int(v)
+}
+
+fn tiny() -> Curve {
+    curve(n(17), n(2), n(2), n(19), n(5), n(1))
+}
+
+fn is_affine(in p: Point, take x: Int, take y: Int, in c: Curve) -> Bool {
+    let a = normalize(p, c);
+    if is_infinity(a) {
+        return false;
+    }
+    std::bignum::int_or(std::bignum::to_int(a.x), 0 - 1) == x && std::bignum::int_or(std::bignum::to_int(a.y), 0 - 1) == y
+}
+
+fn multiple(take k: Int) -> Point {
+    scalar_mult(n(k), generator(tiny()), tiny())
+}
+
+fn point_bytes(take a: Int, take b: Int, take d: Int) -> Array[Int] {
+    var out = std::array::empty();
+    std::array::push(out, a);
+    std::array::push(out, b);
+    std::array::push(out, d);
+    out
+}
+
+spec curve {
+    let c = tiny();
+    then c.bits == 5;
+    then c.width == 1;
+    then c.p.k == 1;
+    then on_curve(n(5), n(1), c);
+    then on_curve(n(0), n(6), c);
+    then !on_curve(n(5), n(2), c);
+    then !on_curve(n(17), n(1), c);
+}
+
+spec double {
+    let c = tiny();
+    then is_affine(double(generator(c), c), 6, 3, c);
+    then is_affine(double(multiple(4), c), 13, 7, c);
+    then is_infinity(double(infinity(), c));
+}
+
+spec add {
+    let c = tiny();
+    then is_affine(add(multiple(3), multiple(5), c), 13, 7, c);
+    then is_affine(add(generator(c), generator(c), c), 6, 3, c);
+    then is_infinity(add(multiple(9), multiple(10), c));
+    then is_affine(add(infinity(), generator(c), c), 5, 1, c);
+    then is_affine(add(generator(c), infinity(), c), 5, 1, c);
+}
+
+spec scalar_mult {
+    let c = tiny();
+    then is_affine(multiple(1), 5, 1, c);
+    then is_affine(multiple(2), 6, 3, c);
+    then is_affine(multiple(3), 10, 6, c);
+    then is_affine(multiple(4), 3, 1, c);
+    then is_affine(multiple(5), 9, 16, c);
+    then is_affine(multiple(7), 0, 6, c);
+    then is_affine(multiple(18), 5, 16, c);
+    then is_infinity(multiple(19));
+    then is_affine(multiple(20), 5, 1, c);
+    then is_infinity(multiple(0));
+}
+
+spec double_scalar_mult {
+    let c = tiny();
+    let g = generator(c);
+    then is_affine(double_scalar_mult(n(2), g, n(3), g, c), 9, 16, c);
+    then is_affine(double_scalar_mult(n(3), g, n(2), multiple(7), c), 6, 14, c);
+    then is_infinity(double_scalar_mult(n(9), g, n(10), g, c));
+    then is_affine(double_scalar_mult(n(0), g, n(4), g, c), 3, 1, c);
+}
+
+spec equal {
+    let c = tiny();
+    then equal(multiple(2), double(generator(c), c), c);
+    then !equal(multiple(2), multiple(3), c);
+    then equal(infinity(), multiple(19), c);
+    then !equal(infinity(), generator(c), c);
+}
+
+spec decode {
+    let c = tiny();
+    then is_affine(decode(point_bytes(4, 5, 1), c), 5, 1, c);
+    then is_infinity(decode(point_bytes(4, 5, 2), c));
+    then is_infinity(decode(point_bytes(2, 5, 1), c));
+    then is_infinity(decode(std::array::empty(), c));
+}

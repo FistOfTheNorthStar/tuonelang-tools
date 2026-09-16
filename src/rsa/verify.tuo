@@ -1,0 +1,391 @@
+// rsa::verify — RSA signature verification: PKCS#1 v1.5 for certificate
+// chains, and RSASSA-5b5c7a4a8480c9602f9ede1b7b5b1621fc71917d5fe29143d2cde57657e20e489020e6f463bfdc500e7a73161e3d3ec231ff99821809243e47bac0e332e101f687734af2667c3d8aa93ad94a43f44c7bf85c5159bcd7d115cf11861d8cdc2c3ee698c9e65546cab820acb7825c22fbead6a46371e761d35fb72f1f262b0aa199 for the TLS 1.3 CertificateVerify (RFC 8017).
+//
+// Every RSA certificate on the public web is signed `sha256WithRSA` (or
+// SHA-384/512), which is EMSA-PKCS1-v1_5: the digest wrapped in a fixed
+// DigestInfo prefix, padded with `00 01 ff…ff 00`. TLS 1.3 refuses that
+// scheme for the handshake signature and mandates `rsa_pss_rsae_sha256`:
+// EMSA-5b5c7a4a8480c9602f9ede1b7b5b1621fc71917d5fe29143d2cde57657e20e489020e6f463bfdc500e7a73161e3d3ec231ff99821809243e47bac0e332e101f687734af2667c3d8aa93ad94a43f44c7bf85c5159bcd7d115cf11861d8cdc2c3ee698c9e65546cab820acb7825c22fbead6a46371e761d35fb72f1f262b0aa199 with MGF1-SHA-256 and a 32-byte salt. Both are here, both
+// checked the way the RFC says a verifier must — by recomputing the
+// encoding and comparing it whole, never by parsing the padding leniently,
+// which is where Bleichenbacher's forgery lived.
+//
+// The modular exponentiation is `ec::field::pow` under Barrett reduction;
+// with the usual `e = 65537` it is seventeen squarings and multiplications.
+// Public values throughout, so variable time is acceptable, and there is
+// no signing function.
+
+module rsa::verify;
+
+/// An RSA public key: modulus `n`, exponent `e`, and the modulus's size in
+/// bits and bytes.
+pub struct PublicKey {
+    ok: Bool,
+    n: Array[Int],
+    e: Array[Int],
+    bits: Int,
+    width: Int,
+}
+
+/// A key that failed to decode.
+///
+/// # Example
+/// ```tuo
+/// let k = rsa::verify::bad_key();
+/// ```
+pub fn bad_key() -> PublicKey {
+    PublicKey { ok: false, n: std::array::empty(), e: std::array::empty(), bits: 0, width: 0 }
+}
+
+/// The value of the strictly-encoded non-negative INTEGER at child `index`
+/// of the SEQUENCE at offset 0, or empty for anything else.
+fn strict_integer(in bytes: Array[Int], take index: Int) -> Array[Int] {
+    let parent = std::der::read_header(bytes, 0);
+    let h = std::der::child_at(bytes, parent, index);
+    if !std::der::header_ok(h) || h.tag != std::der::tag_integer() || h.length < 1 {
+        return std::array::empty();
+    }
+    let value = std::der::value_of(bytes, h);
+    let first = std::array::get(value, 0);
+    if first >= 128 {
+        return std::array::empty();
+    }
+    if first == 0 && std::array::len(value) > 1 && std::array::get(value, 1) < 128 {
+        return std::array::empty();
+    }
+    value
+}
+
+/// Decode `RSAPublicKey ::= SEQUENCE { n INTEGER, e INTEGER }` — the
+/// bytes inside an `rsaEncryption` subjectPublicKeyInfo's BIT STRING.
+/// Refuses a modulus under 1024 bits or even, and an exponent that is
+/// even, below 3, or above 64 bits.
+///
+/// # Example
+/// ```tuo
+/// let key = rsa::verify::parse_public_key(cert.public_key);
+/// ```
+pub fn parse_public_key(in der: Array[Int]) -> PublicKey {
+    let seq = std::der::read_header(der, 0);
+    if !std::der::header_ok(seq) || seq.tag != std::der::tag_sequence() {
+        return bad_key();
+    }
+    if std::der::end_of(seq) != std::array::len(der) || std::der::child_count(der, seq) != 2 {
+        return bad_key();
+    }
+    if std::der::end_of(std::der::child_at(der, seq, 1)) != std::der::end_of(seq) {
+        return bad_key();
+    }
+    let nb = strict_integer(der, 0);
+    let eb = strict_integer(der, 1);
+    if std::array::len(nb) == 0 || std::array::len(eb) == 0 {
+        return bad_key();
+    }
+    let n = std::bignum::from_be_bytes(nb);
+    let e = std::bignum::from_be_bytes(eb);
+    let bits = std::bignum::bit_length(n);
+    if bits < 1024 || ec::field::bit_at(n, 0) != 1 {
+        return bad_key();
+    }
+    if std::bignum::bit_length(e) > 64 || std::bignum::bit_length(e) < 2 || ec::field::bit_at(e, 0) != 1 {
+        return bad_key();
+    }
+    PublicKey { ok: true, n: n, e: e, bits: bits, width: (bits + 7) / 8 }
+}
+
+/// `signature^e mod n` as `width` bytes — the encoded message a
+/// signature decrypts to. Empty when the signature is not exactly `width`
+/// bytes or is not below `n`.
+///
+/// # Example
+/// ```tuo
+/// let em = rsa::verify::encrypt(key, signature);
+/// ```
+pub fn encrypt(in key: PublicKey, in signature: Array[Int]) -> Array[Int] {
+    if !key.ok || std::array::len(signature) != key.width {
+        return std::array::empty();
+    }
+    let s = std::bignum::from_be_bytes(signature);
+    if std::bignum::compare(s, key.n) >= 0 {
+        return std::array::empty();
+    }
+    let m = ec::field::pow(s, key.e, ec::field::modulus(key.n));
+    ec::field::to_bytes(m, key.width)
+}
+
+/// The DigestInfo for a SHA-2 digest of `bits` (256, 384, or 512) bits:
+/// the fixed DER prefix RFC 8017 §9.2 note 1 lists, then the digest.
+/// Empty for any other size or a digest of the wrong length.
+///
+/// # Example
+/// ```tuo
+/// let t = rsa::verify::digest_info(256, digest);
+/// ```
+pub fn digest_info(take bits: Int, in digest: Array[Int]) -> Array[Int] {
+    var prefix = std::array::empty();
+    if bits == 256 && std::array::len(digest) == 32 {
+        prefix = ec::field::hex_bytes("3031300d060960864801650304020105000420");
+    } else if bits == 384 && std::array::len(digest) == 48 {
+        prefix = ec::field::hex_bytes("3041300d060960864801650304020205000430");
+    } else if bits == 512 && std::array::len(digest) == 64 {
+        prefix = ec::field::hex_bytes("3051300d060960864801650304020305000440");
+    } else {
+        return std::array::empty();
+    }
+    var i = 0;
+    while i < std::array::len(digest) {
+        std::array::push(prefix, std::array::get(digest, i));
+        i = i + 1;
+    }
+    prefix
+}
+
+/// Whether `signature` is `key`'s PKCS#1 v1.5 signature over the
+/// DigestInfo `t`: the encoded message must be exactly
+/// `00 01 ff…ff 00 || t` with at least eight `ff` bytes.
+///
+/// # Example
+/// ```tuo
+/// let ok = rsa::verify::pkcs1_v15_valid(key, rsa::verify::digest_info(256, digest), signature);
+/// ```
+pub fn pkcs1_v15_valid(in key: PublicKey, in t: Array[Int], in signature: Array[Int]) -> Bool {
+    let em = encrypt(key, signature);
+    let width = std::array::len(em);
+    let tlen = std::array::len(t);
+    if width == 0 || tlen == 0 || width < tlen + 11 {
+        return false;
+    }
+    var ok = std::array::get(em, 0) == 0 && std::array::get(em, 1) == 1;
+    var i = 2;
+    while i < width - tlen - 1 {
+        if std::array::get(em, i) != 255 {
+            ok = false;
+        }
+        i = i + 1;
+    }
+    if std::array::get(em, width - tlen - 1) != 0 {
+        ok = false;
+    }
+    var j = 0;
+    while j < tlen {
+        if std::array::get(em, width - tlen + j) != std::array::get(t, j) {
+            ok = false;
+        }
+        j = j + 1;
+    }
+    ok
+}
+
+/// SHA-256 of `bytes`.
+///
+/// # Example
+/// ```tuo
+/// let d = rsa::verify::sha256(bytes);
+/// ```
+pub fn sha256(in bytes: Array[Int]) -> Array[Int] {
+    std::crypto::sha256_bytes(std::string::as_str(std::crypto::str_of_bytes(bytes)))
+}
+
+/// MGF1 with SHA-256: `length` mask bytes from `seed` (RFC 8017 B.2.1).
+///
+/// # Example
+/// ```tuo
+/// let mask = rsa::verify::mgf1_sha256(h, 95);
+/// ```
+pub fn mgf1_sha256(in seed: Array[Int], take length: Int) -> Array[Int] {
+    var out = std::array::empty();
+    var counter = 0;
+    while std::array::len(out) < length {
+        var input = std::array::empty();
+        var i = 0;
+        while i < std::array::len(seed) {
+            std::array::push(input, std::array::get(seed, i));
+            i = i + 1;
+        }
+        std::crypto::push_be32(input, counter);
+        let block = sha256(input);
+        var j = 0;
+        while j < 32 && std::array::len(out) < length {
+            std::array::push(out, std::array::get(block, j));
+            j = j + 1;
+        }
+        counter = counter + 1;
+    }
+    out
+}
+
+/// Whether `signature` is `key`'s RSASSA-5b5c7a4a8480c9602f9ede1b7b5b1621fc71917d5fe29143d2cde57657e20e489020e6f463bfdc500e7a73161e3d3ec231ff99821809243e47bac0e332e101f687734af2667c3d8aa93ad94a43f44c7bf85c5159bcd7d115cf11861d8cdc2c3ee698c9e65546cab820acb7825c22fbead6a46371e761d35fb72f1f262b0aa199 signature over the message
+/// whose SHA-256 is `m_hash`, with MGF1-SHA-256 and a 32-byte salt — the
+/// `rsa_pss_rsae_sha256` scheme of TLS 1.3 (RFC 8017 §9.1.2).
+///
+/// # Example
+/// ```tuo
+/// let ok = rsa::verify::pss_sha256_valid(key, rsa::verify::sha256(content), signature);
+/// ```
+pub fn pss_sha256_valid(in key: PublicKey, in m_hash: Array[Int], in signature: Array[Int]) -> Bool {
+    let hlen = 32;
+    let slen = 32;
+    if std::array::len(m_hash) != hlen {
+        return false;
+    }
+    let full = encrypt(key, signature);
+    if std::array::len(full) != key.width {
+        return false;
+    }
+    let em_bits = key.bits - 1;
+    let em_len = (em_bits + 7) / 8;
+    if em_len < hlen + slen + 2 {
+        return false;
+    }
+    // The encoded message is the low em_len bytes; anything above must be zero.
+    var em = std::array::empty();
+    var i = 0;
+    while i < key.width {
+        let b = std::array::get(full, i);
+        if i < key.width - em_len {
+            if b != 0 {
+                return false;
+            }
+        } else {
+            std::array::push(em, b);
+        }
+        i = i + 1;
+    }
+    if std::array::get(em, em_len - 1) != 188 {
+        return false;
+    }
+    let db_len = em_len - hlen - 1;
+    var h = std::array::empty();
+    var k = 0;
+    while k < hlen {
+        std::array::push(h, std::array::get(em, db_len + k));
+        k = k + 1;
+    }
+    let top_bits = 8 * em_len - em_bits;
+    if top_bits > 0 && (std::array::get(em, 0) >> (8 - top_bits)) != 0 {
+        return false;
+    }
+    let mask = mgf1_sha256(h, db_len);
+    var db = std::array::empty();
+    var d = 0;
+    while d < db_len {
+        var b = std::array::get(em, d) ^ std::array::get(mask, d);
+        if d == 0 {
+            b = b & (255 >> top_bits);
+        }
+        std::array::push(db, b);
+        d = d + 1;
+    }
+    var ok = true;
+    var z = 0;
+    while z < db_len - slen - 1 {
+        if std::array::get(db, z) != 0 {
+            ok = false;
+        }
+        z = z + 1;
+    }
+    if std::array::get(db, db_len - slen - 1) != 1 {
+        ok = false;
+    }
+    var m2 = std::array::empty();
+    var pad = 0;
+    while pad < 8 {
+        std::array::push(m2, 0);
+        pad = pad + 1;
+    }
+    var mh = 0;
+    while mh < hlen {
+        std::array::push(m2, std::array::get(m_hash, mh));
+        mh = mh + 1;
+    }
+    var s = 0;
+    while s < slen {
+        std::array::push(m2, std::array::get(db, db_len - slen + s));
+        s = s + 1;
+    }
+    if !std::crypto::verify(sha256(m2), h) {
+        ok = false;
+    }
+    ok
+}
+
+// ----------------------------------------------------------------------------
+// Specs: a 1024-bit test key (small enough for the sandbox), its OpenSSL
+// signatures over "The quick brown fox jumps over the lazy dog", and the
+// wrong ones.
+// ----------------------------------------------------------------------------
+
+fn test_key() -> PublicKey {
+    parse_public_key(ec::field::hex_bytes("30818902818100b16eb181a254a035567672fb00c0052f89107e2387cc2ccd53e9996fab320d760851fe56e040f8d3e054dd9e047204f314395be0cb08cb026232f687019fa58af42bef7ca1e25a791ebcf6eede6b2401cccf16663a14a6dd57db5963ca9200b2d4e7f1cf7186e43da555b8b55f68c41fefb1b4914b1ebd69689a22109e23fa410203010001"))
+}
+
+fn message_digest() -> Array[Int] {
+    ec::field::hex_bytes("d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592")
+}
+
+fn v15_signature() -> Array[Int] {
+    ec::field::hex_bytes("256777cb0a63882908b1ce7d76f7787d5b18a74b3587645c32f4f66fed53eaedcd19abcc588a68db70c16f2086c85d5ff38525797557bf82e5bffc662dbc49c97fc9a33c2de016186e3891f26c696be1acdd0bf7cb45951d8b3039ab5e77824c32d9c8af8f11d9f85a656f82846a37a061782b83954cd962ef8f8122a4ad5304")
+}
+
+fn pss_signature() -> Array[Int] {
+    ec::field::hex_bytes("5b5c7a4a8480c9602f9ede1b7b5b1621fc71917d5fe29143d2cde57657e20e489020e6f463bfdc500e7a73161e3d3ec231ff99821809243e47bac0e332e101f687734af2667c3d8aa93ad94a43f44c7bf85c5159bcd7d115cf11861d8cdc2c3ee698c9e65546cab820acb7825c22fbead6a46371e761d35fb72f1f262b0aa199")
+}
+
+fn flipped(in bytes: Array[Int], take at: Int) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < std::array::len(bytes) {
+        var b = std::array::get(bytes, i);
+        if i == at {
+            b = b ^ 1;
+        }
+        std::array::push(out, b);
+        i = i + 1;
+    }
+    out
+}
+
+fn as_int(in a: Array[Int]) -> Int {
+    std::bignum::int_or(std::bignum::to_int(a), 0 - 1)
+}
+
+spec parse_public_key {
+    let key = test_key();
+    then key.ok;
+    then key.bits == 1024;
+    then key.width == 128;
+    then as_int(key.e) == 65537;
+    then !parse_public_key(std::array::empty()).ok;
+    then !parse_public_key(ec::field::hex_bytes("3006020103020103")).ok;
+    then !parse_public_key(ec::field::hex_bytes("300602010b020102")).ok;
+}
+
+spec digest_info {
+    then std::array::len(digest_info(256, message_digest())) == 51;
+    then std::array::get(digest_info(256, message_digest()), 0) == 48;
+    then std::array::len(digest_info(384, message_digest())) == 0;
+    then std::array::len(digest_info(1, message_digest())) == 0;
+}
+
+spec pkcs1_v15_valid {
+    let key = test_key();
+    then pkcs1_v15_valid(key, digest_info(256, message_digest()), v15_signature());
+    then !pkcs1_v15_valid(key, digest_info(256, message_digest()), flipped(v15_signature(), 5));
+    then !pkcs1_v15_valid(key, digest_info(256, flipped(message_digest(), 0)), v15_signature());
+    then !pkcs1_v15_valid(key, digest_info(256, message_digest()), pss_signature());
+    then !pkcs1_v15_valid(key, std::array::empty(), v15_signature());
+    then !pkcs1_v15_valid(bad_key(), digest_info(256, message_digest()), v15_signature());
+}
+
+spec mgf1_sha256 {
+    then std::array::len(mgf1_sha256(message_digest(), 95)) == 95;
+    then std::array::len(mgf1_sha256(message_digest(), 0)) == 0;
+}
+
+spec pss_sha256_valid {
+    let key = test_key();
+    then pss_sha256_valid(key, message_digest(), pss_signature());
+    then !pss_sha256_valid(key, flipped(message_digest(), 3), pss_signature());
+    then !pss_sha256_valid(key, message_digest(), flipped(pss_signature(), 100));
+    then !pss_sha256_valid(key, message_digest(), v15_signature());
+}

@@ -1,0 +1,208 @@
+// ec::ecdsa — ECDSA signature verification (FIPS 186-4 §6.4.2, SEC 1
+// §4.1.4) over any `ec::curve`.
+//
+// A signature arrives as the X.509 and TLS encoding: a DER SEQUENCE of two
+// INTEGERs, `r` and `s`. Both are decoded strictly — a negative value, a
+// non-minimal encoding, or trailing bytes is a malformed signature, not a
+// different spelling of the same one — and both must lie in `1 ..< n`. The
+// digest is truncated to the order's bit length as the standard says, so
+// a SHA-384 digest verifies against a P-256 key by its leftmost 256 bits,
+// which is a combination real certificates use.
+//
+// The check itself is `R = (e/s)·G + (r/s)·Q` and `R.x ≡ r (mod n)`.
+// Everything here is a public value, so variable time is acceptable; see
+// `ec::field`.
+
+module ec::ecdsa;
+
+/// A decoded signature: `r` and `s`, and whether decoding succeeded.
+pub struct Signature {
+    ok: Bool,
+    r: Array[Int],
+    s: Array[Int],
+}
+
+/// A signature that failed to decode.
+///
+/// # Example
+/// ```tuo
+/// let s = ec::ecdsa::bad_signature();
+/// ```
+pub fn bad_signature() -> Signature {
+    Signature { ok: false, r: std::array::empty(), s: std::array::empty() }
+}
+
+/// The value of the strictly-encoded non-negative INTEGER at child `index`
+/// of the SEQUENCE at offset 0, or empty for anything else.
+fn strict_integer(in bytes: Array[Int], take index: Int) -> Array[Int] {
+    let parent = std::der::read_header(bytes, 0);
+    let h = std::der::child_at(bytes, parent, index);
+    if !std::der::header_ok(h) || h.tag != std::der::tag_integer() || h.length < 1 {
+        return std::array::empty();
+    }
+    let value = std::der::value_of(bytes, h);
+    let first = std::array::get(value, 0);
+    if first >= 128 {
+        return std::array::empty();
+    }
+    if first == 0 && std::array::len(value) > 1 && std::array::get(value, 1) < 128 {
+        return std::array::empty();
+    }
+    value
+}
+
+/// Decode `SEQUENCE { r INTEGER, s INTEGER }`, strictly.
+///
+/// # Example
+/// ```tuo
+/// let sig = ec::ecdsa::decode(der);
+/// ```
+pub fn decode(in der: Array[Int]) -> Signature {
+    let seq = std::der::read_header(der, 0);
+    if !std::der::header_ok(seq) || seq.tag != std::der::tag_sequence() {
+        return bad_signature();
+    }
+    if std::der::end_of(seq) != std::array::len(der) || std::der::child_count(der, seq) != 2 {
+        return bad_signature();
+    }
+    // Two children accounting for every byte: `child_count` stops at the
+    // first undecodable child, so the end must be checked as well.
+    if std::der::end_of(std::der::child_at(der, seq, 1)) != std::der::end_of(seq) {
+        return bad_signature();
+    }
+    let r = strict_integer(der, 0);
+    let s = strict_integer(der, 1);
+    if std::array::len(r) == 0 || std::array::len(s) == 0 {
+        return bad_signature();
+    }
+    Signature { ok: true, r: std::bignum::from_be_bytes(r), s: std::bignum::from_be_bytes(s) }
+}
+
+/// The integer a digest maps to: its leftmost `bits` bits.
+///
+/// # Example
+/// ```tuo
+/// let e = ec::ecdsa::digest_value(digest, 256);
+/// ```
+pub fn digest_value(in digest: Array[Int], take bits: Int) -> Array[Int] {
+    let value = std::bignum::from_be_bytes(digest);
+    let have = 8 * std::array::len(digest);
+    if have > bits {
+        return std::bignum::shift_right(value, have - bits);
+    }
+    value
+}
+
+/// Whether `der` is a valid signature by the public key `public` (an
+/// uncompressed SEC 1 point) over `digest`, on curve `c`.
+///
+/// # Example
+/// ```tuo
+/// let ok = ec::ecdsa::verify(ec::p256::curve(), public_key, digest, signature);
+/// ```
+pub fn verify(in c: ec::curve::Curve, in public: Array[Int], in digest: Array[Int], in der: Array[Int]) -> Bool {
+    let q = ec::curve::decode(public, c);
+    if ec::curve::is_infinity(q) {
+        return false;
+    }
+    let sig = decode(der);
+    if !sig.ok || !ec::field::in_range(sig.r, c.n) || !ec::field::in_range(sig.s, c.n) {
+        return false;
+    }
+    if std::array::len(digest) == 0 {
+        return false;
+    }
+    let e = digest_value(digest, c.bits);
+    let w = ec::field::invert(sig.s, c.n);
+    let u1 = ec::field::mul(e, w, c.n);
+    let u2 = ec::field::mul(sig.r, w, c.n);
+    let r = ec::curve::double_scalar_mult(u1, ec::curve::generator(c), u2, q, c);
+    if ec::curve::is_infinity(r) {
+        return false;
+    }
+    let a = ec::curve::normalize(r, c);
+    ec::field::same(ec::field::reduce(a.x, c.n), sig.r)
+}
+
+// ----------------------------------------------------------------------------
+// Specs. Decoding against a real OpenSSL P-256 signature; verification on
+// the 19-point curve of `ec::curve`, where d = 7, Q = (0, 6), k = 3 and
+// e = 10 give the signature (r, s) = (10, 14) — computed by hand and by
+// Python. The real curves are asserted natively in `examples/x509.tuo`.
+// ----------------------------------------------------------------------------
+
+fn n(take v: Int) -> Array[Int] {
+    std::bignum::from_int(v)
+}
+
+fn tiny() -> ec::curve::Curve {
+    ec::curve::curve(n(17), n(2), n(2), n(19), n(5), n(1))
+}
+
+fn tiny_public() -> Array[Int] {
+    var out = std::array::empty();
+    std::array::push(out, 4);
+    std::array::push(out, 0);
+    std::array::push(out, 6);
+    out
+}
+
+fn one_byte(take b: Int) -> Array[Int] {
+    var out = std::array::empty();
+    std::array::push(out, b);
+    out
+}
+
+fn tiny_signature(take r: Int, take s: Int) -> Array[Int] {
+    var out = std::array::empty();
+    std::array::push(out, 48);
+    std::array::push(out, 6);
+    std::array::push(out, 2);
+    std::array::push(out, 1);
+    std::array::push(out, r);
+    std::array::push(out, 2);
+    std::array::push(out, 1);
+    std::array::push(out, s);
+    out
+}
+
+fn openssl_signature() -> Array[Int] {
+    ec::field::hex_bytes("3044022045bcaef5595832c34491f2282898f26dd2408779bab37ada65c82f858630795a02202a2f613a23eab1adfdc153bb562a8b907e22566a8165a7155397312dc4d0aa29")
+}
+
+fn hex_is(in value: Array[Int], in expected: Str) -> Bool {
+    std::string::as_str(std::bignum::to_hex(value)) == expected
+}
+
+spec decode {
+    let sig = decode(openssl_signature());
+    then sig.ok;
+    then hex_is(sig.r, "45bcaef5595832c34491f2282898f26dd2408779bab37ada65c82f858630795a");
+    then hex_is(sig.s, "2a2f613a23eab1adfdc153bb562a8b907e22566a8165a7155397312dc4d0aa29");
+    then decode(tiny_signature(10, 14)).ok;
+    then !decode(std::array::empty()).ok;
+    then !decode(ec::field::hex_bytes("300602010a02010e00")).ok;
+    then !decode(ec::field::hex_bytes("300602010a02018e")).ok;
+    then !decode(ec::field::hex_bytes("30070201000201010e")).ok;
+    then !decode(ec::field::hex_bytes("300702020001020101")).ok;
+    then !decode(ec::field::hex_bytes("30030201")).ok;
+}
+
+spec digest_value {
+    then std::bignum::int_or(std::bignum::to_int(digest_value(one_byte(80), 5)), 0 - 1) == 10;
+    then std::bignum::int_or(std::bignum::to_int(digest_value(one_byte(80), 8)), 0 - 1) == 80;
+    then std::bignum::int_or(std::bignum::to_int(digest_value(one_byte(80), 16)), 0 - 1) == 80;
+}
+
+spec verify {
+    let c = tiny();
+    then verify(c, tiny_public(), one_byte(80), tiny_signature(10, 14));
+    then !verify(c, tiny_public(), one_byte(88), tiny_signature(10, 14));
+    then !verify(c, tiny_public(), one_byte(80), tiny_signature(10, 15));
+    then !verify(c, tiny_public(), one_byte(80), tiny_signature(0, 14));
+    then !verify(c, tiny_public(), one_byte(80), tiny_signature(19, 14));
+    then !verify(c, tiny_public(), one_byte(80), tiny_signature(10, 19));
+    then !verify(c, tiny_public(), std::array::empty(), tiny_signature(10, 14));
+    then !verify(c, one_byte(4), one_byte(80), tiny_signature(10, 14));
+    then !verify(c, tiny_public(), one_byte(80), std::array::empty());
+}
