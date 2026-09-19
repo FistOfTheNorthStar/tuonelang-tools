@@ -11,7 +11,8 @@
 //
 // The one edit: `Location` values had Starlette's `http://testserver`
 // prefix removed, because `web::route` redirects to a path (see its
-// header). The capture script is in the README.
+// header). `examples/web_oracle.py` captured it and `examples/web_fixture.py`
+// wrote this file.
 //
 // Generated; do not edit by hand.
 

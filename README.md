@@ -372,7 +372,9 @@ spec fail. `examples/web.tuo` then serves `web::demo::handle` behind
 `http::server` and replays all 107 down one kept-alive connection.
 
 ```bash
-cd examples && ../../shallowflaws/.venv/bin/python web_oracle.py   # rewrites oracle.json
+cd examples
+../../shallowflaws/.venv/bin/python web_oracle.py   # writes oracle.json
+python3 web_fixture.py && tuo fmt ../src/web/fixture.tuo   # rewrites the fixture
 ```
 
 ### What the specs pin that a comment cannot
@@ -654,6 +656,7 @@ src/web/fixture.tuo      107 responses captured from FastAPI (generated)
 src/web/demo.tuo         the oracle's FastAPI app, reimplemented
 examples/web.tuo         the socket oracle: web::demo behind http::server
 examples/web_oracle.py   the FastAPI app and requests the fixture was captured from
+examples/web_fixture.py  oracle.json to src/web/fixture.tuo
 
 src/tls/handshake.tuo    the client's half of the handshake, as pure data; Trust
 src/tls/client.tuo       the session: handshake over a socket, bytes over records
