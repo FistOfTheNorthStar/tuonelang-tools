@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Six ports so far:
+Seven ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -15,10 +15,11 @@ Six ports so far:
 | **`http`** — HTTP/1.1 framing, a client with redirects, a keep-alive server | `httpx`, `requests`, `uvicorn` (behind Caddy) | 107 specs against bytes Cloudflare and gunicorn sent, an 18-check loopback oracle, an 11-check live one |
 | **`tls`** — a TLS 1.3 client on the catalog's `std::tls`, and `https://` in the HTTP client | the `ssl` module | RFC 8448's trace reproduced from the client's side, a 12-check loopback oracle against `std::tls`, an 8-check interop oracle against three OpenSSL servers, and live `https://` to Stripe, Sentry, and Cloudflare |
 | **`x509`**, **`ec`**, **`rsa`** — certificate parsing, chain validation, a root store, ECDSA on P-256/P-384, RSA PKCS#1 v1.5 and PSS, SHA-384 | the `ssl` module's trust half (`certifi`, `cryptography`'s verifier) | 380 specs (RFC 6979 and a test PKI natively), a 27-check oracle over chains captured from Cloudflare, Sentry, and Stripe |
+| **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
 
 ```bash
 ./run-tests.sh          # front end, the specs, formatting, the native Argon2 and X.509
-                        # oracles, and the HTTP and TLS loopback oracles (no network)
+                        # oracles, and the HTTP, web, and TLS loopback oracles (no network)
 ./run-tests.sh --live   # also resolve real names over UDP, fetch from public HTTP servers,
                         # complete TLS 1.3 handshakes with three openssl s_server instances,
                         # fetch https:// from Stripe, Sentry, and Cloudflare, and drive the
@@ -334,6 +335,105 @@ by design, and there is no signing function in `ec` or `rsa` at all.
 
 ---
 
+## `web` — FastAPI's request path
+
+The backend is 107 FastAPI routes over Pydantic models. What a client of
+it sees is decided by four things: which route a path and method reach,
+what the models make of the input, what a refusal looks like, and what
+the handler returns. The first three are the framework, and they are
+this port: `web::route` resolves as Starlette does, `web::schema`
+validates as Pydantic does in its default lax mode, and `web::errors`
+renders FastAPI's 422 — the `{"detail":[{"type","loc","msg","input","ctx"}]}`
+body the React frontend maps onto form fields — byte for byte.
+
+### Status
+
+| Layer | State |
+|---|---|
+| `web::json` — a JSON reader that keeps source spans, with CPython's error names and positions; a writer | ✅ proven |
+| `web::coerce` — lax `int`/`float`/`bool` conversion, character counts, `email-validator`'s checks and reasons | ✅ proven against Pydantic 2.13 |
+| `web::schema`, `web::errors` — models as data, validation of bodies and of query and path parameters, the 422 body | ✅ proven |
+| `web::query`, `web::route` — query strings; ordered routes, path parameters, 404, 405 with `Allow`, the trailing-slash 307 | ✅ proven |
+| `web::request`, `web::response` — the handler's view of a request; JSON, `detail`, and refusal responses | ✅ proven |
+| `web::demo` — a FastAPI application reimplemented on the above | ✅ 107 of 107 captured responses reproduced, in specs and over a socket |
+
+### The oracle is FastAPI itself
+
+`examples/web_oracle.py` is a FastAPI app shaped like the backend — a
+registration model with the constraints of
+`JobApplicantRegistrationRequest`, a search with validated query
+parameters, path parameters, routes whose order matters — and a list of
+107 requests. Run in `shallowflaws`'s own virtualenv it records what
+FastAPI 0.141, Pydantic 2.13, Starlette 1.6, and CPython 3.14 answered;
+`src/web/fixture.tuo` is that recording. `web::demo` is the same app on
+`web::*`, and its spec replays every request and compares status,
+`Allow`, `Location`, and body. It was broken on purpose once to see the
+spec fail. `examples/web.tuo` then serves `web::demo::handle` behind
+`http::server` and replays all 107 down one kept-alive connection.
+
+```bash
+cd examples && ../../shallowflaws/.venv/bin/python web_oracle.py   # rewrites oracle.json
+```
+
+### What the specs pin that a comment cannot
+
+**Invalid JSON fails where CPython says it fails.** FastAPI's 422 for a
+malformed body carries `loc: ["body", N]` and CPython's message. The
+reader is structured like `json.decoder`, so `{"email":"a@b.co",}` is
+"Illegal trailing comma before end of object" at 17, `{"age":01}` is
+"Expecting ',' delimiter" at 8 — the `0` parsed, the `1` did not belong —
+and positions count characters, not bytes, so an `é` before the error is
+one. Eighteen such cases are asserted.
+
+**Lax mode is generous in exact ways.** `"30"`, `30.0`, and `true` are
+all valid for an `int` field; `30.5` is `int_from_float`, `"thirty"` is
+`int_parsing`, `[1]` is `int_type`. `"yes"`, `"On"`, `1`, and `1.0` are
+`True`; `" yes "` and `2` are not. `"2.00"` is an int and `"2."` is not;
+`"1_0"` is ten and `"1__0"` is an error. Every one of these was probed
+against Pydantic first and is a spec line.
+
+**An error echoes its input, exactly.** `"input":91.5`, `"input":-91`,
+`"input":{"email":"jane@example.com","tags":[1,2]}` — compact, with the
+number's own spelling, which is why the reader keeps spans rather than
+floats. `ctx` is typed by the field: `{"le":90.0}` for a float,
+`{"lt":150}` for an int, while the message says `90` either way.
+Lengths count characters: seven `é` are too short for `min_length=8`,
+eight are not.
+
+**Email refusals give `email-validator`'s reason, in its order.** No
+`@`-sign, nothing before it, nothing after it, invalid characters (listed,
+sorted, a space shown as `SPACE`), the period rules, the hyphen rules, a
+label over 63 characters, no period in the domain, a numeric top-level
+domain, a reserved one. The domain is lowercased; the local part is not.
+
+**Routing is Starlette's, where it is surprising too.** Order is the
+only precedence, so `/jobs/search` must be registered before
+`/jobs/{job_id}`. A parameter is matched after percent-decoding, so
+`logo%20one.png` arrives as `logo one.png` and `a%2Fb` does not match at
+all. `/jobs/5/` is a 307 to `/jobs/5` with the query kept, even when the
+method would then be refused. `HEAD` is not implied by `GET`.
+
+### What is deliberately not here
+
+**Handlers are dispatched by the application**, with a `match` on the
+slot `resolve` returns: v0's growable arrays cannot hold function values
+(the finding `examples/router` documents), so a route table cannot carry
+them. **Two departures from Starlette, both stated in `web::route`:**
+`Allow` lists every method registered for the path rather than the first
+route's, and the 307's `Location` is a path rather than an absolute URL.
+**Three from Pydantic, stated in `web::coerce`:** integers beyond 64 bits
+are refused, `nan` and `inf` are refused, and a float is rendered from
+its source spelling rather than by shortest round-trip. **Not modelled:**
+nested models, enums and literals, dates, `extra="forbid"`, custom
+validators (a handler calls its own after `validate_body`), headers and
+cookies as parameters, form bodies, dependency injection, OpenAPI,
+middleware, CORS, WebSockets. Email addresses are the ASCII rules with
+non-ASCII bytes allowed through: no IDNA, no display names, no quoted
+local parts. The 107 routes themselves are the application, and they
+wait on the query layer.
+
+---
+
 ## `http` — the wire under everything
 
 In production `shallowflaws` is uvicorn on port 8000 behind Caddy, which
@@ -541,6 +641,19 @@ src/http/client.tuo      resolve through dns, connect, one request, redirects
 src/http/server.tuo      accept, read under the parser's direction, handle, keep alive
 examples/http.tuo        the loopback oracle: server and client in one process
 examples/http_live.tuo   the live oracle: public servers through dns::resolver
+
+src/web/json.tuo         a span-keeping JSON reader with CPython's errors; a writer
+src/web/coerce.tuo       Pydantic's lax conversions; email-validator's checks
+src/web/errors.tuo       FastAPI's 422 body
+src/web/schema.tuo       request models as data; validation of bodies and parameters
+src/web/query.tuo        query strings
+src/web/route.tuo        the route table, resolved as Starlette resolves
+src/web/request.tuo      a parsed request; is it JSON; the bearer token
+src/web/response.tuo     JSON, detail, 422, 404/405/307, HEAD
+src/web/fixture.tuo      107 responses captured from FastAPI (generated)
+src/web/demo.tuo         the oracle's FastAPI app, reimplemented
+examples/web.tuo         the socket oracle: web::demo behind http::server
+examples/web_oracle.py   the FastAPI app and requests the fixture was captured from
 
 src/tls/handshake.tuo    the client's half of the handshake, as pure data; Trust
 src/tls/client.tuo       the session: handshake over a socket, bytes over records

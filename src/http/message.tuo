@@ -1069,6 +1069,9 @@ pub fn reason_of(take status: Int) -> Str {
     if status == 413 {
         return "Content Too Large";
     }
+    if status == 422 {
+        return "Unprocessable Content";
+    }
     if status == 429 {
         return "Too Many Requests";
     }

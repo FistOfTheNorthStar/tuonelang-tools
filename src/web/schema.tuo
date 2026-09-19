@@ -1,0 +1,942 @@
+// web::schema — a request model as data, and Pydantic's verdict on an input.
+//
+// A Pydantic model is a list of fields with types and constraints, and
+// validating against it is a walk over that list. The ROADMAP's point was
+// that most of Pydantic disappears in a typed language, and it does: what
+// is left is parsing at the boundary. A `Schema` is built with ordinary
+// calls —
+//
+//     var s = web::schema::new();
+//     web::schema::email(s, "email");
+//     web::schema::string(s, "password");
+//     web::schema::length(s, 8, 128);
+//     web::schema::optional_int(s, "age");
+//     web::schema::at_least(s, 0.0);
+//     web::schema::below(s, 150.0);
+//
+// — constraints applying to the field most recently added, and
+// `validate_body` or `validate_pairs` returns a `Model`: the values, by
+// name, and the errors, in FastAPI's 422 shape exactly. Errors come out in
+// field order, one per field (one per item for a list), with the input
+// echoed, as Pydantic does; the specs and `web::demo` pin the bytes
+// against what FastAPI 0.141 with Pydantic 2.13 returned.
+//
+// The storage is parallel arrays because v0's growable arrays hold
+// scalars and strings; a field is an index into all of them.
+//
+// WHAT IS HERE: `str`, `int`, `float`, `bool`, `EmailStr`, `list[str]`,
+// each required, defaulted, or `Optional`; `min_length`, `max_length`,
+// `ge`, `gt`, `le`, `lt`. WHAT IS NOT: nested models, enums and literals,
+// dates, custom validators (`field_validator` is a function the handler
+// calls after this), `extra="forbid"` — unknown members are ignored, as
+// they are by default.
+
+module web::schema;
+
+/// The kind of a `str` field.
+///
+/// # Example
+/// ```tuo
+/// let k = web::schema::kind_string(); // 0
+/// ```
+pub fn kind_string() -> Int {
+    0
+}
+
+/// The kind of an `int` field.
+///
+/// # Example
+/// ```tuo
+/// let k = web::schema::kind_int(); // 1
+/// ```
+pub fn kind_int() -> Int {
+    1
+}
+
+/// The kind of a `float` field.
+///
+/// # Example
+/// ```tuo
+/// let k = web::schema::kind_float(); // 2
+/// ```
+pub fn kind_float() -> Int {
+    2
+}
+
+/// The kind of a `bool` field.
+///
+/// # Example
+/// ```tuo
+/// let k = web::schema::kind_bool(); // 3
+/// ```
+pub fn kind_bool() -> Int {
+    3
+}
+
+/// The kind of an `EmailStr` field.
+///
+/// # Example
+/// ```tuo
+/// let k = web::schema::kind_email(); // 4
+/// ```
+pub fn kind_email() -> Int {
+    4
+}
+
+/// The kind of a `list[str]` field.
+///
+/// # Example
+/// ```tuo
+/// let k = web::schema::kind_string_list(); // 5
+/// ```
+pub fn kind_string_list() -> Int {
+    5
+}
+
+/// A model: fields in declaration order.
+pub struct Schema {
+    names: Array[String],
+    kinds: Array[Int],
+    required: Array[Int],
+    nullable: Array[Int],
+    min_lengths: Array[Int],
+    max_lengths: Array[Int],
+    bound_flags: Array[Int],
+    ge: Array[Float],
+    gt: Array[Float],
+    le: Array[Float],
+    lt: Array[Float],
+}
+
+/// An empty model.
+///
+/// # Example
+/// ```tuo
+/// var s = web::schema::new();
+/// ```
+pub fn new() -> Schema {
+    Schema { names: std::array::empty(), kinds: std::array::empty(), required: std::array::empty(), nullable: std::array::empty(), min_lengths: std::array::empty(), max_lengths: std::array::empty(), bound_flags: std::array::empty(), ge: std::array::empty(), gt: std::array::empty(), le: std::array::empty(), lt: std::array::empty() }
+}
+
+/// Add a field of `kind`. `required` fields must be present; `nullable`
+/// ones (`Optional[…]`) accept `null`.
+///
+/// # Example
+/// ```tuo
+/// web::schema::field(s, "age", web::schema::kind_int(), false, true);
+/// ```
+pub fn field(mut s: Schema, in name: Str, take kind: Int, take required: Bool, take nullable: Bool) {
+    std::array::push(s.names, std::string::from_str(name));
+    std::array::push(s.kinds, kind);
+    std::array::push(s.required, if required {
+        1
+    } else {
+        0
+    });
+    std::array::push(s.nullable, if nullable {
+        1
+    } else {
+        0
+    });
+    std::array::push(s.min_lengths, 0 - 1);
+    std::array::push(s.max_lengths, 0 - 1);
+    std::array::push(s.bound_flags, 0);
+    std::array::push(s.ge, 0.0);
+    std::array::push(s.gt, 0.0);
+    std::array::push(s.le, 0.0);
+    std::array::push(s.lt, 0.0);
+}
+
+/// A required `str`.
+///
+/// # Example
+/// ```tuo
+/// web::schema::string(s, "password");
+/// ```
+pub fn string(mut s: Schema, in name: Str) {
+    field(s, name, kind_string(), true, false);
+}
+
+/// An `Optional[str] = None`.
+///
+/// # Example
+/// ```tuo
+/// web::schema::optional_string(s, "name");
+/// ```
+pub fn optional_string(mut s: Schema, in name: Str) {
+    field(s, name, kind_string(), false, true);
+}
+
+/// A required `EmailStr`.
+///
+/// # Example
+/// ```tuo
+/// web::schema::email(s, "email");
+/// ```
+pub fn email(mut s: Schema, in name: Str) {
+    field(s, name, kind_email(), true, false);
+}
+
+/// A required `int`.
+///
+/// # Example
+/// ```tuo
+/// web::schema::int(s, "job_id");
+/// ```
+pub fn int(mut s: Schema, in name: Str) {
+    field(s, name, kind_int(), true, false);
+}
+
+/// An `int` with a default: absent is fine, `null` is not.
+///
+/// # Example
+/// ```tuo
+/// web::schema::defaulted_int(s, "page");
+/// ```
+pub fn defaulted_int(mut s: Schema, in name: Str) {
+    field(s, name, kind_int(), false, false);
+}
+
+/// An `Optional[int] = None`.
+///
+/// # Example
+/// ```tuo
+/// web::schema::optional_int(s, "age");
+/// ```
+pub fn optional_int(mut s: Schema, in name: Str) {
+    field(s, name, kind_int(), false, true);
+}
+
+/// An `Optional[float] = None`.
+///
+/// # Example
+/// ```tuo
+/// web::schema::optional_float(s, "location_lat");
+/// ```
+pub fn optional_float(mut s: Schema, in name: Str) {
+    field(s, name, kind_float(), false, true);
+}
+
+/// A `bool` with a default.
+///
+/// # Example
+/// ```tuo
+/// web::schema::defaulted_bool(s, "newsletter");
+/// ```
+pub fn defaulted_bool(mut s: Schema, in name: Str) {
+    field(s, name, kind_bool(), false, false);
+}
+
+/// A `list[str]` with a default.
+///
+/// # Example
+/// ```tuo
+/// web::schema::defaulted_string_list(s, "tags");
+/// ```
+pub fn defaulted_string_list(mut s: Schema, in name: Str) {
+    field(s, name, kind_string_list(), false, false);
+}
+
+fn last(in s: Schema) -> Int {
+    std::array::len(s.names) - 1
+}
+
+/// `min_length` and `max_length` for the last field; -1 for neither.
+///
+/// # Example
+/// ```tuo
+/// web::schema::length(s, 8, 128);
+/// ```
+pub fn length(mut s: Schema, take min: Int, take max: Int) {
+    let i = last(s);
+    if i >= 0 {
+        std::array::set(s.min_lengths, i, min);
+        std::array::set(s.max_lengths, i, max);
+    }
+}
+
+fn set_bound(mut s: Schema, take which: Int, take value: Float) {
+    let i = last(s);
+    if i < 0 {
+        return;
+    }
+    std::array::set(s.bound_flags, i, std::array::get(s.bound_flags, i) | which);
+    if which == 1 {
+        std::array::set(s.ge, i, value);
+    } else if which == 2 {
+        std::array::set(s.gt, i, value);
+    } else if which == 4 {
+        std::array::set(s.le, i, value);
+    } else {
+        std::array::set(s.lt, i, value);
+    }
+}
+
+/// `ge=` for the last field.
+///
+/// # Example
+/// ```tuo
+/// web::schema::at_least(s, 0.0);
+/// ```
+pub fn at_least(mut s: Schema, take value: Float) {
+    set_bound(s, 1, value);
+}
+
+/// `gt=` for the last field.
+///
+/// # Example
+/// ```tuo
+/// web::schema::above(s, 0.0);
+/// ```
+pub fn above(mut s: Schema, take value: Float) {
+    set_bound(s, 2, value);
+}
+
+/// `le=` for the last field.
+///
+/// # Example
+/// ```tuo
+/// web::schema::at_most(s, 100.0);
+/// ```
+pub fn at_most(mut s: Schema, take value: Float) {
+    set_bound(s, 4, value);
+}
+
+/// `lt=` for the last field.
+///
+/// # Example
+/// ```tuo
+/// web::schema::below(s, 150.0);
+/// ```
+pub fn below(mut s: Schema, take value: Float) {
+    set_bound(s, 8, value);
+}
+
+// ----------------------------------------------------------------------------
+// The validated model.
+// ----------------------------------------------------------------------------
+
+/// What validation produced. Each field is absent (its default applies),
+/// null, or a value; `errors` is empty exactly when the input was valid.
+pub struct Model {
+    errors: web::errors::Errors,
+    names: Array[String],
+    states: Array[Int],
+    ints: Array[Int],
+    floats: Array[Float],
+    texts: Array[String],
+    item_starts: Array[Int],
+    item_counts: Array[Int],
+    items: Array[String],
+}
+
+fn empty_model(in s: Schema) -> Model {
+    var m = Model { errors: web::errors::none(), names: std::array::empty(), states: std::array::empty(), ints: std::array::empty(), floats: std::array::empty(), texts: std::array::empty(), item_starts: std::array::empty(), item_counts: std::array::empty(), items: std::array::empty() };
+    var i = 0;
+    while i < std::array::len(s.names) {
+        std::array::push(m.names, std::string::from_str(std::string::as_str(std::array::get(s.names, i))));
+        std::array::push(m.states, 0);
+        std::array::push(m.ints, 0);
+        std::array::push(m.floats, 0.0);
+        std::array::push(m.texts, std::string::empty());
+        std::array::push(m.item_starts, 0);
+        std::array::push(m.item_counts, 0);
+        i = i + 1;
+    }
+    m
+}
+
+/// Whether the input was valid.
+///
+/// # Example
+/// ```tuo
+/// if web::schema::valid(m) { /* … */ }
+/// ```
+pub fn valid(in m: Model) -> Bool {
+    web::errors::count(m.errors) == 0
+}
+
+/// The index of field `name`, or -1.
+///
+/// # Example
+/// ```tuo
+/// let i = web::schema::index_of(m, "email");
+/// ```
+pub fn index_of(in m: Model, in name: Str) -> Int {
+    var i = 0;
+    while i < std::array::len(m.names) {
+        if std::string::as_str(std::array::get(m.names, i)) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// Whether `name` carries a value (not absent, not null).
+///
+/// # Example
+/// ```tuo
+/// if web::schema::has(m, "age") { /* … */ }
+/// ```
+pub fn has(in m: Model, in name: Str) -> Bool {
+    let i = index_of(m, name);
+    i >= 0 && std::array::get(m.states, i) == 2
+}
+
+/// The `int` or `bool` (1/0) value of `name`, or `fallback`.
+///
+/// # Example
+/// ```tuo
+/// let page = web::schema::int_or(m, "page", 1);
+/// ```
+pub fn int_or(in m: Model, in name: Str, take fallback: Int) -> Int {
+    let i = index_of(m, name);
+    if i < 0 || std::array::get(m.states, i) != 2 {
+        return fallback;
+    }
+    std::array::get(m.ints, i)
+}
+
+/// The `float` value of `name`, or `fallback`.
+///
+/// # Example
+/// ```tuo
+/// let lat = web::schema::float_or(m, "location_lat", 0.0);
+/// ```
+pub fn float_or(in m: Model, in name: Str, take fallback: Float) -> Float {
+    let i = index_of(m, name);
+    if i < 0 || std::array::get(m.states, i) != 2 {
+        return fallback;
+    }
+    std::array::get(m.floats, i)
+}
+
+/// The text of `name`: a string's value, an email's normal form, a
+/// float's response spelling. Empty when absent or null.
+///
+/// # Example
+/// ```tuo
+/// let email = web::schema::text_of(m, "email");
+/// ```
+pub fn text_of(in m: Model, in name: Str) -> String {
+    let i = index_of(m, name);
+    if i < 0 || std::array::get(m.states, i) != 2 {
+        return std::string::empty();
+    }
+    std::string::from_str(std::string::as_str(std::array::get(m.texts, i)))
+}
+
+/// How many items the list `name` holds.
+///
+/// # Example
+/// ```tuo
+/// let n = web::schema::item_count(m, "tags");
+/// ```
+pub fn item_count(in m: Model, in name: Str) -> Int {
+    let i = index_of(m, name);
+    if i < 0 {
+        return 0;
+    }
+    std::array::get(m.item_counts, i)
+}
+
+/// Item `index` of the list `name`, or empty.
+///
+/// # Example
+/// ```tuo
+/// let tag = web::schema::item_at(m, "tags", 0);
+/// ```
+pub fn item_at(in m: Model, in name: Str, take index: Int) -> String {
+    let i = index_of(m, name);
+    if i < 0 || index < 0 || index >= std::array::get(m.item_counts, i) {
+        return std::string::empty();
+    }
+    std::string::from_str(std::string::as_str(std::array::get(m.items, std::array::get(m.item_starts, i) + index)))
+}
+
+// ----------------------------------------------------------------------------
+// Constraint checks, shared by bodies and parameters.
+// ----------------------------------------------------------------------------
+
+fn plural(take n: Int) -> Str {
+    if n == 1 {
+        "character"
+    } else {
+        "characters"
+    }
+}
+
+/// Check a string's length; records the error and returns false when it
+/// fails.
+fn length_ok(mut m: Model, in s: Schema, take i: Int, in loc: Str, in text: Str, in input: Str) -> Bool {
+    let count = web::coerce::char_count(text);
+    let min = std::array::get(s.min_lengths, i);
+    let max = std::array::get(s.max_lengths, i);
+    if min >= 0 && count < min {
+        var msg = std::string::from_str("String should have at least ");
+        web::json::push_int(msg, min);
+        std::string::push_byte(msg, 32);
+        std::string::append(msg, plural(min));
+        var ctx = std::string::from_str("{\"min_length\":");
+        web::json::push_int(ctx, min);
+        std::string::push_byte(ctx, 125);
+        web::errors::add(m.errors, "string_too_short", loc, std::string::as_str(msg), input, std::string::as_str(ctx));
+        return false;
+    }
+    if max >= 0 && count > max {
+        var msg = std::string::from_str("String should have at most ");
+        web::json::push_int(msg, max);
+        std::string::push_byte(msg, 32);
+        std::string::append(msg, plural(max));
+        var ctx = std::string::from_str("{\"max_length\":");
+        web::json::push_int(ctx, max);
+        std::string::push_byte(ctx, 125);
+        web::errors::add(m.errors, "string_too_long", loc, std::string::as_str(msg), input, std::string::as_str(ctx));
+        return false;
+    }
+    true
+}
+
+fn bound_error(mut m: Model, in kind: Str, in words: Str, in key: Str, take bound: Float, take float_field: Bool, in loc: Str, in input: Str) {
+    var msg = std::string::from_str("Input should be ");
+    std::string::append(msg, words);
+    std::string::push_byte(msg, 32);
+    std::string::append(msg, std::string::as_str(web::coerce::number_text(bound, false)));
+    var ctx = std::string::from_str("{");
+    web::json::push_key(ctx, key);
+    std::string::append(ctx, std::string::as_str(web::coerce::number_text(bound, float_field)));
+    std::string::push_byte(ctx, 125);
+    web::errors::add(m.errors, kind, loc, std::string::as_str(msg), input, std::string::as_str(ctx));
+}
+
+/// Check a number against the field's bounds, in pydantic-core's order:
+/// `le`, `lt`, `ge`, `gt`.
+fn bounds_ok(mut m: Model, in s: Schema, take i: Int, take value: Float, in loc: Str, in input: Str) -> Bool {
+    let flags = std::array::get(s.bound_flags, i);
+    let float_field = std::array::get(s.kinds, i) == kind_float();
+    if (flags & 4) != 0 && value > std::array::get(s.le, i) {
+        bound_error(m, "less_than_equal", "less than or equal to", "le", std::array::get(s.le, i), float_field, loc, input);
+        return false;
+    }
+    if (flags & 8) != 0 && value >= std::array::get(s.lt, i) {
+        bound_error(m, "less_than", "less than", "lt", std::array::get(s.lt, i), float_field, loc, input);
+        return false;
+    }
+    if (flags & 1) != 0 && value < std::array::get(s.ge, i) {
+        bound_error(m, "greater_than_equal", "greater than or equal to", "ge", std::array::get(s.ge, i), float_field, loc, input);
+        return false;
+    }
+    if (flags & 2) != 0 && value <= std::array::get(s.gt, i) {
+        bound_error(m, "greater_than", "greater than", "gt", std::array::get(s.gt, i), float_field, loc, input);
+        return false;
+    }
+    true
+}
+
+fn accept_int(mut m: Model, in s: Schema, take i: Int, take value: Int, in loc: Str, in input: Str) {
+    if bounds_ok(m, s, i, value as Float, loc, input) {
+        std::array::set(m.states, i, 2);
+        std::array::set(m.ints, i, value);
+    }
+}
+
+fn accept_float(mut m: Model, in s: Schema, take i: Int, take value: Float, in text: Str, in loc: Str, in input: Str) {
+    if bounds_ok(m, s, i, value, loc, input) {
+        std::array::set(m.states, i, 2);
+        std::array::set(m.floats, i, value);
+        std::array::set(m.texts, i, std::string::from_str(text));
+    }
+}
+
+fn accept_email(mut m: Model, take i: Int, in text: Str, in loc: Str, in input: Str) {
+    let why = web::coerce::email_problem(text);
+    if std::string::len(why) == 0 {
+        std::array::set(m.states, i, 2);
+        std::array::set(m.texts, i, web::coerce::email_normalized(text));
+        return;
+    }
+    var msg = std::string::from_str("value is not a valid email address: ");
+    std::string::append(msg, std::string::as_str(why));
+    var ctx = std::string::from_str("{");
+    web::json::push_key(ctx, "reason");
+    web::json::push_string(ctx, std::string::as_str(why));
+    std::string::push_byte(ctx, 125);
+    web::errors::add(m.errors, "value_error", loc, std::string::as_str(msg), input, std::string::as_str(ctx));
+}
+
+/// Convert and check text for field `i` — the path every query and path
+/// parameter takes, and the one a JSON string takes for a non-string
+/// field.
+fn accept_text(mut m: Model, in s: Schema, take i: Int, in text: Str, in loc: Str, in input: Str) {
+    let kind = std::array::get(s.kinds, i);
+    if kind == kind_string() {
+        if length_ok(m, s, i, loc, text, input) {
+            std::array::set(m.states, i, 2);
+            std::array::set(m.texts, i, std::string::from_str(text));
+        }
+    } else if kind == kind_email() {
+        accept_email(m, i, text, loc, input);
+    } else if kind == kind_int() {
+        let r = web::coerce::int_from_text(text);
+        if r.ok {
+            accept_int(m, s, i, r.value, loc, input);
+        } else {
+            web::errors::add(m.errors, "int_parsing", loc, "Input should be a valid integer, unable to parse string as an integer", input, "");
+        }
+    } else if kind == kind_float() {
+        let r = web::coerce::float_from_text(text);
+        if r.ok {
+            accept_float(m, s, i, r.value, std::string::as_str(r.text), loc, input);
+        } else {
+            web::errors::add(m.errors, "float_parsing", loc, "Input should be a valid number, unable to parse string as a number", input, "");
+        }
+    } else if kind == kind_bool() {
+        let b = web::coerce::bool_from_text(text);
+        if b >= 0 {
+            std::array::set(m.states, i, 2);
+            std::array::set(m.ints, i, b);
+        } else {
+            web::errors::add(m.errors, "bool_parsing", loc, "Input should be a valid boolean, unable to interpret input", input, "");
+        }
+    } else {
+        web::errors::add(m.errors, "list_type", loc, "Input should be a valid list", input, "");
+    }
+}
+
+fn type_error(mut m: Model, take kind: Int, in loc: Str, in input: Str) {
+    if kind == kind_int() {
+        web::errors::add(m.errors, "int_type", loc, "Input should be a valid integer", input, "");
+    } else if kind == kind_float() {
+        web::errors::add(m.errors, "float_type", loc, "Input should be a valid number", input, "");
+    } else if kind == kind_bool() {
+        web::errors::add(m.errors, "bool_type", loc, "Input should be a valid boolean", input, "");
+    } else if kind == kind_string_list() {
+        web::errors::add(m.errors, "list_type", loc, "Input should be a valid list", input, "");
+    } else {
+        web::errors::add(m.errors, "string_type", loc, "Input should be a valid string", input, "");
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Bodies.
+// ----------------------------------------------------------------------------
+
+/// Validate the JSON value at `node` for field `i`.
+fn accept_node(mut m: Model, in s: Schema, take i: Int, in d: web::json::Doc, take node: Int, in source: Str) {
+    let kind = std::array::get(s.kinds, i);
+    let name = std::string::from_str(std::string::as_str(std::array::get(s.names, i)));
+    let loc = web::errors::loc_field(source, std::string::as_str(name));
+    let input = web::json::node_text(d, node);
+    let json_kind = web::json::kind_of(d, node);
+    if json_kind == web::json::kind_null() {
+        if std::array::get(s.nullable, i) == 1 {
+            std::array::set(m.states, i, 1);
+        } else {
+            type_error(m, kind, std::string::as_str(loc), std::string::as_str(input));
+        }
+        return;
+    }
+    let token = web::json::text_of(d, node);
+    if kind == kind_string_list() {
+        if json_kind != web::json::kind_array() {
+            type_error(m, kind, std::string::as_str(loc), std::string::as_str(input));
+            return;
+        }
+        let start = std::array::len(m.items);
+        var index = 0;
+        var item = web::json::first_child(d, node);
+        while item >= 0 {
+            if web::json::kind_of(d, item) == web::json::kind_string() {
+                std::array::push(m.items, web::json::text_of(d, item));
+            } else {
+                std::array::push(m.items, std::string::empty());
+                let item_loc = web::errors::loc_item(source, std::string::as_str(name), index);
+                web::errors::add(m.errors, "string_type", std::string::as_str(item_loc), "Input should be a valid string", std::string::as_str(web::json::node_text(d, item)), "");
+            }
+            index = index + 1;
+            item = web::json::next_sibling(d, item);
+        }
+        std::array::set(m.states, i, 2);
+        std::array::set(m.item_starts, i, start);
+        std::array::set(m.item_counts, i, index);
+        return;
+    }
+    if json_kind == web::json::kind_string() {
+        // A JSON string goes through the same lax doors a parameter does.
+        accept_text(m, s, i, std::string::as_str(token), std::string::as_str(loc), std::string::as_str(input));
+        return;
+    }
+    if kind == kind_string() || kind == kind_email() {
+        type_error(m, kind, std::string::as_str(loc), std::string::as_str(input));
+        return;
+    }
+    let is_true = json_kind == web::json::kind_true();
+    let is_bool = is_true || json_kind == web::json::kind_false();
+    let is_number = json_kind == web::json::kind_int() || json_kind == web::json::kind_float();
+    if kind == kind_bool() {
+        if is_bool {
+            std::array::set(m.states, i, 2);
+            std::array::set(m.ints, i, if is_true {
+                1
+            } else {
+                0
+            });
+        } else if is_number {
+            let b = web::coerce::bool_from_number(std::string::as_str(token));
+            if b >= 0 {
+                std::array::set(m.states, i, 2);
+                std::array::set(m.ints, i, b);
+            } else {
+                web::errors::add(m.errors, "bool_parsing", std::string::as_str(loc), "Input should be a valid boolean, unable to interpret input", std::string::as_str(input), "");
+            }
+        } else {
+            type_error(m, kind, std::string::as_str(loc), std::string::as_str(input));
+        }
+        return;
+    }
+    if kind == kind_int() {
+        if is_bool {
+            accept_int(m, s, i, if is_true {
+                1
+            } else {
+                0
+            }, std::string::as_str(loc), std::string::as_str(input));
+        } else if json_kind == web::json::kind_int() {
+            let r = web::coerce::int_from_text(std::string::as_str(token));
+            if r.ok {
+                accept_int(m, s, i, r.value, std::string::as_str(loc), std::string::as_str(input));
+            } else {
+                web::errors::add(m.errors, "int_parsing_size", std::string::as_str(loc), "Unable to parse input string as an integer, exceeded maximum size", std::string::as_str(input), "");
+            }
+        } else if json_kind == web::json::kind_float() {
+            let r = web::coerce::int_from_float_token(std::string::as_str(token));
+            if r.ok {
+                accept_int(m, s, i, r.value, std::string::as_str(loc), std::string::as_str(input));
+            } else {
+                web::errors::add(m.errors, "int_from_float", std::string::as_str(loc), "Input should be a valid integer, got a number with a fractional part", std::string::as_str(input), "");
+            }
+        } else {
+            type_error(m, kind, std::string::as_str(loc), std::string::as_str(input));
+        }
+        return;
+    }
+    // A float field.
+    if is_bool {
+        accept_float(m, s, i, if is_true {
+            1.0
+        } else {
+            0.0
+        }, if is_true {
+            "1.0"
+        } else {
+            "0.0"
+        }, std::string::as_str(loc), std::string::as_str(input));
+    } else if is_number {
+        let r = web::coerce::float_from_text(std::string::as_str(token));
+        if r.ok {
+            accept_float(m, s, i, r.value, std::string::as_str(r.text), std::string::as_str(loc), std::string::as_str(input));
+        } else {
+            type_error(m, kind, std::string::as_str(loc), std::string::as_str(input));
+        }
+    } else {
+        type_error(m, kind, std::string::as_str(loc), std::string::as_str(input));
+    }
+}
+
+/// Validate a request body against `s`, as FastAPI does for a single
+/// model parameter. `is_json` is whether the content type said JSON (or
+/// said nothing); when it did not, the raw text is the input and cannot
+/// be a model.
+///
+/// # Example
+/// ```tuo
+/// let m = web::schema::validate_body(s, body, true);
+/// ```
+pub fn validate_body(in s: Schema, in body: Str, take is_json: Bool) -> Model {
+    var m = empty_model(s);
+    let here = web::errors::loc_source("body");
+    if std::str::len(body) == 0 {
+        web::errors::add(m.errors, "missing", std::string::as_str(here), "Field required", "null", "");
+        return m;
+    }
+    let message = "Input should be a valid dictionary or object to extract fields from";
+    if !is_json {
+        var input = std::string::empty();
+        web::json::push_string(input, body);
+        web::errors::add(m.errors, "model_attributes_type", std::string::as_str(here), message, std::string::as_str(input), "");
+        return m;
+    }
+    let d = web::json::parse(body);
+    if !d.ok {
+        var ctx = std::string::from_str("{");
+        web::json::push_key(ctx, "error");
+        web::json::push_string(ctx, std::string::as_str(d.error));
+        std::string::push_byte(ctx, 125);
+        let loc = web::errors::loc_position("body", web::json::error_position(d));
+        web::errors::add(m.errors, "json_invalid", std::string::as_str(loc), "JSON decode error", "{}", std::string::as_str(ctx));
+        return m;
+    }
+    let root = web::json::root(d);
+    let root_kind = web::json::kind_of(d, root);
+    if root_kind == web::json::kind_null() {
+        web::errors::add(m.errors, "missing", std::string::as_str(here), "Field required", "null", "");
+        return m;
+    }
+    if root_kind != web::json::kind_object() {
+        web::errors::add(m.errors, "model_attributes_type", std::string::as_str(here), message, std::string::as_str(web::json::node_text(d, root)), "");
+        return m;
+    }
+    let whole = web::json::node_text(d, root);
+    var i = 0;
+    while i < std::array::len(s.names) {
+        let node = web::json::member(d, root, std::string::as_str(std::array::get(s.names, i)));
+        if node < 0 {
+            if std::array::get(s.required, i) == 1 {
+                let loc = web::errors::loc_field("body", std::string::as_str(std::array::get(s.names, i)));
+                web::errors::add(m.errors, "missing", std::string::as_str(loc), "Field required", std::string::as_str(whole), "");
+            }
+        } else {
+            accept_node(m, s, i, d, node, "body");
+        }
+        i = i + 1;
+    }
+    m
+}
+
+// ----------------------------------------------------------------------------
+// Parameters: query strings and path segments, which arrive as text.
+// ----------------------------------------------------------------------------
+
+/// Validate named text values — query or path parameters — against `s`.
+/// `source` is `"query"` or `"path"`. A name given twice takes its last
+/// value, as Starlette's `QueryParams.get` does.
+///
+/// # Example
+/// ```tuo
+/// let m = web::schema::validate_pairs(s, names, values, "query");
+/// ```
+pub fn validate_pairs(in s: Schema, in names: Array[String], in values: Array[String], in source: Str) -> Model {
+    var m = empty_model(s);
+    var i = 0;
+    while i < std::array::len(s.names) {
+        var found = 0 - 1;
+        var k = 0;
+        while k < std::array::len(names) && k < std::array::len(values) {
+            if std::string::as_str(std::array::get(names, k)) == std::string::as_str(std::array::get(s.names, i)) {
+                found = k;
+            }
+            k = k + 1;
+        }
+        let loc = web::errors::loc_field(source, std::string::as_str(std::array::get(s.names, i)));
+        if found < 0 {
+            if std::array::get(s.required, i) == 1 {
+                web::errors::add(m.errors, "missing", std::string::as_str(loc), "Field required", "null", "");
+            }
+        } else {
+            var input = std::string::empty();
+            web::json::push_string(input, std::string::as_str(std::array::get(values, found)));
+            accept_text(m, s, i, std::string::as_str(std::array::get(values, found)), std::string::as_str(loc), std::string::as_str(input));
+        }
+        i = i + 1;
+    }
+    m
+}
+
+// ----------------------------------------------------------------------------
+// Specs. The end-to-end bytes are pinned in `web::demo` against FastAPI's
+// captured responses; these pin the pieces.
+// ----------------------------------------------------------------------------
+
+fn register() -> Schema {
+    var s = new();
+    email(s, "email");
+    string(s, "password");
+    length(s, 8, 128);
+    optional_string(s, "name");
+    length(s, 0 - 1, 255);
+    optional_float(s, "location_lat");
+    at_least(s, 0.0 - 90.0);
+    at_most(s, 90.0);
+    optional_int(s, "age");
+    at_least(s, 0.0);
+    below(s, 150.0);
+    defaulted_bool(s, "newsletter");
+    defaulted_string_list(s, "tags");
+    s
+}
+
+fn errors_of(in body: Str) -> String {
+    let m = validate_body(register(), body, true);
+    web::errors::render(m.errors)
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+fn good() -> Model {
+    validate_body(register(), "{\"email\":\"Jane@EXAMPLE.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":40,\"age\":\"30\",\"newsletter\":\"yes\",\"tags\":[\"a\",\"b\"],\"role\":\"admin\"}", true)
+}
+
+fn pairs(in a: Str, in av: Str, in b: Str, in bv: Str) -> Model {
+    var s = new();
+    string(s, "q");
+    length(s, 2, 50);
+    defaulted_int(s, "page");
+    at_least(s, 1.0);
+    var names = std::array::empty();
+    var values = std::array::empty();
+    if std::str::len(a) > 0 {
+        std::array::push(names, std::string::from_str(a));
+        std::array::push(values, std::string::from_str(av));
+    }
+    if std::str::len(b) > 0 {
+        std::array::push(names, std::string::from_str(b));
+        std::array::push(values, std::string::from_str(bv));
+    }
+    validate_pairs(s, names, values, "query")
+}
+
+spec validate_body {
+    let m = good();
+    then valid(m);
+    then text_is(text_of(m, "email"), "Jane@example.com");
+    then text_is(text_of(m, "password"), "SecurePass123!");
+    then !has(m, "name");
+    then has(m, "location_lat");
+    then float_or(m, "location_lat", 0.0) == 40.0;
+    then text_is(text_of(m, "location_lat"), "40.0");
+    then int_or(m, "age", 0 - 1) == 30;
+    then int_or(m, "newsletter", 0) == 1;
+    then item_count(m, "tags") == 2;
+    then text_is(item_at(m, "tags", 1), "b");
+    then text_is(item_at(m, "tags", 2), "");
+    then index_of(m, "role") == 0 - 1;
+    then int_or(m, "missing", 7) == 7;
+}
+
+spec "errors are FastAPI's bytes" {
+    then text_is(errors_of("{}"), "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\",\"email\"],\"msg\":\"Field required\",\"input\":{}},{\"type\":\"missing\",\"loc\":[\"body\",\"password\"],\"msg\":\"Field required\",\"input\":{}}]}");
+    then text_is(errors_of("{\"email\":\"jane@example.com\",\"password\":\"short\"}"), "{\"detail\":[{\"type\":\"string_too_short\",\"loc\":[\"body\",\"password\"],\"msg\":\"String should have at least 8 characters\",\"input\":\"short\",\"ctx\":{\"min_length\":8}}]}");
+    then text_is(errors_of("{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"location_lat\":91.5}"), "{\"detail\":[{\"type\":\"less_than_equal\",\"loc\":[\"body\",\"location_lat\"],\"msg\":\"Input should be less than or equal to 90\",\"input\":91.5,\"ctx\":{\"le\":90.0}}]}");
+    then text_is(errors_of("{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"age\":150}"), "{\"detail\":[{\"type\":\"less_than\",\"loc\":[\"body\",\"age\"],\"msg\":\"Input should be less than 150\",\"input\":150,\"ctx\":{\"lt\":150}}]}");
+    then text_is(errors_of("{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"tags\":[\"a\",7]}"), "{\"detail\":[{\"type\":\"string_type\",\"loc\":[\"body\",\"tags\",1],\"msg\":\"Input should be a valid string\",\"input\":7}]}");
+    then text_is(errors_of("[1,2]"), "{\"detail\":[{\"type\":\"model_attributes_type\",\"loc\":[\"body\"],\"msg\":\"Input should be a valid dictionary or object to extract fields from\",\"input\":[1,2]}]}");
+    then text_is(errors_of(""), "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\"],\"msg\":\"Field required\",\"input\":null}]}");
+    then text_is(errors_of("{\"email\": "), "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",10],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Expecting value\"}}]}");
+}
+
+spec validate_pairs {
+    let m = pairs("q", "python", "page", "2");
+    then valid(m);
+    then text_is(text_of(m, "q"), "python");
+    then int_or(m, "page", 1) == 2;
+    then int_or(pairs("q", "python", "", ""), "page", 1) == 1;
+    // The last of a repeated name wins.
+    then int_or(pairs("page", "1", "page", "3"), "page", 1) == 3;
+    then text_is(web::errors::render(pairs("", "", "", "").errors), "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"query\",\"q\"],\"msg\":\"Field required\",\"input\":null}]}");
+    then text_is(web::errors::render(pairs("q", "p", "", "").errors), "{\"detail\":[{\"type\":\"string_too_short\",\"loc\":[\"query\",\"q\"],\"msg\":\"String should have at least 2 characters\",\"input\":\"p\",\"ctx\":{\"min_length\":2}}]}");
+    then text_is(web::errors::render(pairs("q", "python", "page", "two").errors), "{\"detail\":[{\"type\":\"int_parsing\",\"loc\":[\"query\",\"page\"],\"msg\":\"Input should be a valid integer, unable to parse string as an integer\",\"input\":\"two\"}]}");
+    then text_is(web::errors::render(pairs("q", "python", "page", "0").errors), "{\"detail\":[{\"type\":\"greater_than_equal\",\"loc\":[\"query\",\"page\"],\"msg\":\"Input should be greater than or equal to 1\",\"input\":\"0\",\"ctx\":{\"ge\":1}}]}");
+}

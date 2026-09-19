@@ -1,0 +1,174 @@
+// web::response — the responses FastAPI would have sent.
+//
+// A handler returns raw HTTP bytes, because that is what `http::server`
+// writes. These build them: a JSON body with its content type, the
+// `{"detail": …}` shape of an `HTTPException`, the 422 of a validation
+// failure, and the three answers a route table can give on its own.
+
+module web::response;
+
+/// `status` with a JSON `body`.
+///
+/// # Example
+/// ```tuo
+/// let raw = web::response::json(200, "{\"ok\":true}");
+/// ```
+pub fn json(take status: Int, in body: Str) -> String {
+    var extra = std::string::empty();
+    http::message::header_line(extra, "Content-Type", "application/json");
+    http::message::response(status, std::string::as_str(extra), body)
+}
+
+/// `status` with `{"detail": message}` — an `HTTPException`.
+///
+/// # Example
+/// ```tuo
+/// let raw = web::response::detail(401, "Not authenticated");
+/// ```
+pub fn detail(take status: Int, in message: Str) -> String {
+    var body = std::string::from_str("{\"detail\":");
+    web::json::push_string(body, message);
+    std::string::push_byte(body, 125);
+    json(status, std::string::as_str(body))
+}
+
+/// The 422 for a list of validation errors.
+///
+/// # Example
+/// ```tuo
+/// let raw = web::response::invalid(model.errors);
+/// ```
+pub fn invalid(in errors: web::errors::Errors) -> String {
+    json(422, std::string::as_str(web::errors::render(errors)))
+}
+
+/// The response for a match that is not a found route: 404, 405 with
+/// `Allow`, or 307 with `Location`. Empty for a found route, which is the
+/// handler's to answer.
+///
+/// # Example
+/// ```tuo
+/// let raw = web::response::unrouted(m);
+/// ```
+pub fn unrouted(in m: web::route::Match) -> String {
+    if m.kind == web::route::not_found() {
+        return detail(404, "Not Found");
+    }
+    if m.kind == web::route::method_not_allowed() {
+        var extra = std::string::empty();
+        http::message::header_line(extra, "Allow", std::string::as_str(m.allow));
+        http::message::header_line(extra, "Content-Type", "application/json");
+        return http::message::response(405, std::string::as_str(extra), "{\"detail\":\"Method Not Allowed\"}");
+    }
+    if m.kind == web::route::redirect() {
+        var extra = std::string::empty();
+        http::message::header_line(extra, "Location", std::string::as_str(m.location));
+        return http::message::response(307, std::string::as_str(extra), "");
+    }
+    std::string::empty()
+}
+
+/// `raw` as the answer to a `HEAD`: the same head, `Content-Length`
+/// included, and no body (RFC 9110 §9.3.2). A handler applies this last;
+/// a body on a `HEAD` response would be read as the start of the next
+/// response on a kept-alive connection.
+///
+/// # Example
+/// ```tuo
+/// let raw = web::response::for_head(web::response::detail(405, "Method Not Allowed"));
+/// ```
+pub fn for_head(in raw: Str) -> String {
+    let head = http::message::parse_head(raw, true);
+    if !head.ok {
+        return std::string::from_str(raw);
+    }
+    http::message::slice(raw, 0, head.end)
+}
+
+/// The status of a raw response, or 0.
+///
+/// # Example
+/// ```tuo
+/// let s = web::response::status_of(raw);
+/// ```
+pub fn status_of(in raw: Str) -> Int {
+    let head = http::message::parse_head(raw, true);
+    if head.ok {
+        head.status
+    } else {
+        0
+    }
+}
+
+/// Header `name` of a raw response, or empty.
+///
+/// # Example
+/// ```tuo
+/// let allow = web::response::header_of(raw, "Allow");
+/// ```
+pub fn header_of(in raw: Str, in name: Str) -> String {
+    let head = http::message::parse_head(raw, true);
+    http::message::header(head, name)
+}
+
+/// The body of a raw response.
+///
+/// # Example
+/// ```tuo
+/// let body = web::response::body_of(raw);
+/// ```
+pub fn body_of(in raw: Str) -> String {
+    http::message::body(raw, true, false)
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+fn routed(in method: Str, in target: Str) -> String {
+    var routes = web::route::new();
+    web::route::add(routes, "GET", "/me", 1);
+    web::route::add(routes, "PATCH", "/me", 2);
+    unrouted(web::route::resolve(routes, method, target))
+}
+
+spec json {
+    let raw = json(200, "{\"ok\":true}");
+    then status_of(std::string::as_str(raw)) == 200;
+    then text_is(header_of(std::string::as_str(raw), "Content-Type"), "application/json");
+    then text_is(header_of(std::string::as_str(raw), "Content-Length"), "11");
+    then text_is(body_of(std::string::as_str(raw)), "{\"ok\":true}");
+}
+
+spec for_head {
+    let raw = for_head(std::string::as_str(json(200, "{\"ok\":true}")));
+    then status_of(std::string::as_str(raw)) == 200;
+    then text_is(header_of(std::string::as_str(raw), "Content-Length"), "11");
+    then std::str::ends_with(std::string::as_str(raw), "\r\n\r\n");
+    then text_is(for_head("garbage"), "garbage");
+}
+
+spec detail {
+    then text_is(body_of(std::string::as_str(detail(401, "Not authenticated"))), "{\"detail\":\"Not authenticated\"}");
+    then status_of(std::string::as_str(detail(401, "x"))) == 401;
+    then text_is(body_of(std::string::as_str(detail(400, "a \"quoted\" word"))), "{\"detail\":\"a \\\"quoted\\\" word\"}");
+}
+
+spec invalid {
+    var e = web::errors::none();
+    web::errors::add(e, "missing", "[\"body\"]", "Field required", "null", "");
+    then status_of(std::string::as_str(invalid(e))) == 422;
+    then text_is(body_of(std::string::as_str(invalid(e))), "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\"],\"msg\":\"Field required\",\"input\":null}]}");
+}
+
+spec unrouted {
+    then status_of(std::string::as_str(routed("GET", "/nope"))) == 404;
+    then text_is(body_of(std::string::as_str(routed("GET", "/nope"))), "{\"detail\":\"Not Found\"}");
+    then status_of(std::string::as_str(routed("DELETE", "/me"))) == 405;
+    then text_is(header_of(std::string::as_str(routed("DELETE", "/me")), "Allow"), "GET, PATCH");
+    then text_is(body_of(std::string::as_str(routed("DELETE", "/me"))), "{\"detail\":\"Method Not Allowed\"}");
+    then status_of(std::string::as_str(routed("GET", "/me/?x=1"))) == 307;
+    then text_is(header_of(std::string::as_str(routed("GET", "/me/?x=1")), "Location"), "/me?x=1");
+    then text_is(body_of(std::string::as_str(routed("GET", "/me/?x=1"))), "");
+    then std::string::len(routed("GET", "/me")) == 0;
+}

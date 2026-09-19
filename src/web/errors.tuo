@@ -1,0 +1,188 @@
+// web::errors — FastAPI's 422 body, accumulated and rendered.
+//
+// A validation failure in FastAPI is `{"detail": [ … ]}` where each entry
+// is Pydantic's error dict: `type`, `loc`, `msg`, `input`, and sometimes
+// `ctx`. Frontends parse this shape — the React app this backend serves
+// maps `loc` to form fields — so it is reproduced byte for byte rather
+// than approximated. `loc`, `input`, and `ctx` are stored pre-rendered as
+// JSON text, because each is heterogeneous (`["body","tags",1]`) and v0
+// has no sum type that would hold one.
+
+module web::errors;
+
+/// A list of validation errors, in the order they were found.
+pub struct Errors {
+    types: Array[String],
+    locs: Array[String],
+    msgs: Array[String],
+    inputs: Array[String],
+    ctxs: Array[String],
+}
+
+/// No errors.
+///
+/// # Example
+/// ```tuo
+/// var e = web::errors::none();
+/// ```
+pub fn none() -> Errors {
+    Errors { types: std::array::empty(), locs: std::array::empty(), msgs: std::array::empty(), inputs: std::array::empty(), ctxs: std::array::empty() }
+}
+
+/// How many errors there are.
+///
+/// # Example
+/// ```tuo
+/// let n = web::errors::count(e);
+/// ```
+pub fn count(in e: Errors) -> Int {
+    std::array::len(e.types)
+}
+
+/// Record one error. `loc`, `input`, and `ctx` are JSON text; an empty
+/// `ctx` omits the member.
+///
+/// # Example
+/// ```tuo
+/// web::errors::add(e, "missing", "[\"body\",\"email\"]", "Field required", "{}", "");
+/// ```
+pub fn add(mut e: Errors, in kind: Str, in loc: Str, in msg: Str, in input: Str, in ctx: Str) {
+    std::array::push(e.types, std::string::from_str(kind));
+    std::array::push(e.locs, std::string::from_str(loc));
+    std::array::push(e.msgs, std::string::from_str(msg));
+    std::array::push(e.inputs, std::string::from_str(input));
+    std::array::push(e.ctxs, std::string::from_str(ctx));
+}
+
+/// Append every error of `from` to `into` — path errors, then query, then
+/// body, which is the order FastAPI reports them in.
+///
+/// # Example
+/// ```tuo
+/// web::errors::merge(all, body_errors);
+/// ```
+pub fn merge(mut into: Errors, in from: Errors) {
+    var i = 0;
+    while i < count(from) {
+        add(into, std::string::as_str(std::array::get(from.types, i)), std::string::as_str(std::array::get(from.locs, i)), std::string::as_str(std::array::get(from.msgs, i)), std::string::as_str(std::array::get(from.inputs, i)), std::string::as_str(std::array::get(from.ctxs, i)));
+        i = i + 1;
+    }
+}
+
+/// The `loc` of a whole source: `["body"]`.
+///
+/// # Example
+/// ```tuo
+/// let loc = web::errors::loc_source("body");
+/// ```
+pub fn loc_source(in source: Str) -> String {
+    var out = std::string::from_str("[");
+    web::json::push_string(out, source);
+    std::string::push_byte(out, 93);
+    out
+}
+
+/// The `loc` of a field: `["body","email"]`.
+///
+/// # Example
+/// ```tuo
+/// let loc = web::errors::loc_field("body", "email");
+/// ```
+pub fn loc_field(in source: Str, in name: Str) -> String {
+    var out = std::string::from_str("[");
+    web::json::push_string(out, source);
+    std::string::push_byte(out, 44);
+    web::json::push_string(out, name);
+    std::string::push_byte(out, 93);
+    out
+}
+
+/// The `loc` of a list item: `["body","tags",1]`.
+///
+/// # Example
+/// ```tuo
+/// let loc = web::errors::loc_item("body", "tags", 1);
+/// ```
+pub fn loc_item(in source: Str, in name: Str, take index: Int) -> String {
+    var out = std::string::from_str("[");
+    web::json::push_string(out, source);
+    std::string::push_byte(out, 44);
+    web::json::push_string(out, name);
+    std::string::push_byte(out, 44);
+    web::json::push_int(out, index);
+    std::string::push_byte(out, 93);
+    out
+}
+
+/// The `loc` of a position in a source: `["body",17]`, for invalid JSON.
+///
+/// # Example
+/// ```tuo
+/// let loc = web::errors::loc_position("body", 17);
+/// ```
+pub fn loc_position(in source: Str, take position: Int) -> String {
+    var out = std::string::from_str("[");
+    web::json::push_string(out, source);
+    std::string::push_byte(out, 44);
+    web::json::push_int(out, position);
+    std::string::push_byte(out, 93);
+    out
+}
+
+/// The 422 body: `{"detail":[{"type":…,"loc":…,"msg":…,"input":…,"ctx":…}]}`.
+///
+/// # Example
+/// ```tuo
+/// let body = web::errors::render(e);
+/// ```
+pub fn render(in e: Errors) -> String {
+    var out = std::string::from_str("{\"detail\":[");
+    var i = 0;
+    while i < count(e) {
+        if i > 0 {
+            std::string::push_byte(out, 44);
+        }
+        std::string::append(out, "{\"type\":");
+        web::json::push_string(out, std::string::as_str(std::array::get(e.types, i)));
+        std::string::append(out, ",\"loc\":");
+        std::string::append(out, std::string::as_str(std::array::get(e.locs, i)));
+        std::string::append(out, ",\"msg\":");
+        web::json::push_string(out, std::string::as_str(std::array::get(e.msgs, i)));
+        std::string::append(out, ",\"input\":");
+        std::string::append(out, std::string::as_str(std::array::get(e.inputs, i)));
+        if std::string::len(std::array::get(e.ctxs, i)) > 0 {
+            std::string::append(out, ",\"ctx\":");
+            std::string::append(out, std::string::as_str(std::array::get(e.ctxs, i)));
+        }
+        std::string::push_byte(out, 125);
+        i = i + 1;
+    }
+    std::string::append(out, "]}");
+    out
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+spec loc_field {
+    then text_is(loc_source("body"), "[\"body\"]");
+    then text_is(loc_field("body", "email"), "[\"body\",\"email\"]");
+    then text_is(loc_item("body", "tags", 1), "[\"body\",\"tags\",1]");
+    then text_is(loc_position("body", 17), "[\"body\",17]");
+}
+
+spec render {
+    var e = none();
+    then count(e) == 0;
+    then text_is(render(e), "{\"detail\":[]}");
+    add(e, "missing", "[\"body\",\"email\"]", "Field required", "{}", "");
+    add(e, "string_too_short", "[\"body\",\"password\"]", "String should have at least 8 characters", "\"short\"", "{\"min_length\":8}");
+    then count(e) == 2;
+    then text_is(render(e), "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\",\"email\"],\"msg\":\"Field required\",\"input\":{}},{\"type\":\"string_too_short\",\"loc\":[\"body\",\"password\"],\"msg\":\"String should have at least 8 characters\",\"input\":\"short\",\"ctx\":{\"min_length\":8}}]}");
+    var all = none();
+    add(all, "int_parsing", "[\"path\",\"job_id\"]", "m", "\"abc\"", "");
+    merge(all, e);
+    then count(all) == 3;
+    then text_is(std::array::get(all.types, 2), "string_too_short");
+}

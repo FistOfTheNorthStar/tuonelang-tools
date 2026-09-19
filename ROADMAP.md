@@ -24,9 +24,10 @@ SHA-256/HMAC/PBKDF2, `std::bignum`, `std::json`, `std::fs`, `std::sync`,
 | this repo, `redis` | `redis` | RESP2 client, the backend's commands, `redis://` URLs; 40 specs; 35 live checks against Redis 7 |
 | this repo, `http` | `httpx`, `requests`, `uvicorn` | HTTP/1.1 framing, client with redirects, keep-alive server; 107 specs; 29 live checks |
 | this repo, `tls` | `ssl` (client side) | TLS 1.3 client on the catalog's stack; RFC 8448 reproduced; handshakes with `std::tls` and OpenSSL; `https://` to Stripe, Sentry, Cloudflare |
+| this repo, `web` | `fastapi`, `pydantic`, `starlette` (the request path) | routing, models as data, lax validation, the 422 body; 107 captured FastAPI responses reproduced byte for byte |
 | this repo, `x509` + `ec` + `rsa` | the trust half of `ssl`, `certifi` | X.509 parsing and chain validation, a root store, ECDSA P-256/P-384, RSA v1.5/PSS; 380 specs; real chains validated |
 
-All eight prove the thesis: the *engine* of a Python library is pure logic, and pure
+All nine prove the thesis: the *engine* of a Python library is pure logic, and pure
 logic is what tuonelang specs pin best.
 
 ---
@@ -76,7 +77,7 @@ one item left; `http::message::message_end` is what it loops on. Pair it
 with TLS and the whole outbound-integration surface (Stripe, R2, Sentry)
 becomes reachable.
 
-### 4. FastAPI-equivalent routing + validation — replaces `fastapi` + `pydantic`
+### 4. FastAPI-equivalent routing + validation — replaces `fastapi` + `pydantic` — ◐ the request path is done
 
 `examples/router` exists as a seed. This is the largest port by surface area but
 the most natural fit: Pydantic is runtime type validation, and tuonelang has
@@ -84,6 +85,16 @@ the most natural fit: Pydantic is runtime type validation, and tuonelang has
 reimplemented — the schema becomes a struct, and validation becomes parsing at
 the boundary. Focus on: route matching, path/query extraction, JSON body
 decoding into structs, and error responses.
+
+Done on 2026-09-19 as `web`: Starlette's route resolution, request models
+as data, Pydantic's lax validation of bodies and of query and path
+parameters, and FastAPI's 422 body — pinned against 107 responses
+captured from the real FastAPI in the backend's virtualenv, reproduced
+byte for byte. Still to come, as the backend's routes are ported: nested
+models, enums, dates, headers as parameters, JWT bearer auth (HS256 is
+`std::crypto::hmac_sha256` away), CORS, and multipart uploads. Handlers
+are dispatched by a `match` on a slot, since a route table cannot hold
+function values in v0.
 
 ### 5. SQLAlchemy-equivalent query layer — replaces `sqlalchemy` + `alembic`
 
@@ -148,8 +159,8 @@ Be honest about these rather than half-porting them.
 4. ✅ **HTTP/1.1** — the backbone of everything outbound and inbound.
 5. ✅ **TLS 1.3** — the client, and the chain validation that makes it
    reach Stripe, R2, and Sentry.
-6. **Router + validation**, then **query layer** — the application framework
-   — **next**.
+6. ◐ **Router + validation** — the request path is done; then the **query
+   layer** — **next** — which is what the backend's own routes wait on.
 
 Tiers 2 and 3 fall out largely for free once 4 and 5 exist.
 

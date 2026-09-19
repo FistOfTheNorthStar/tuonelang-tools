@@ -2,8 +2,8 @@
 # run-tests.sh — the validation suite for tuonelang-python-tools.
 #
 #   ./run-tests.sh          front end, specs, formatting, the native Argon2
-#                           and X.509 oracles, and the HTTP and TLS loopback
-#                           oracles (no network)
+#                           and X.509 oracles, and the HTTP, web, and TLS
+#                           loopback oracles (no network)
 #   ./run-tests.sh --live   also resolve real names against a public DNS
 #                           server, fetch from public HTTP servers, complete
 #                           TLS 1.3 handshakes with three openssl s_server
@@ -62,6 +62,10 @@ HTTP_SRC=(src/http/message.tuo src/http/fixture.tuo src/http/url.tuo
           "${X509_SRC[@]}"
           src/std_net.tuo src/std_sync.tuo)
 
+WEB_SRC=(src/web/json.tuo src/web/coerce.tuo src/web/errors.tuo src/web/schema.tuo
+         src/web/query.tuo src/web/route.tuo src/web/request.tuo src/web/response.tuo
+         src/web/fixture.tuo src/web/demo.tuo)
+
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
 check() { if [ "$1" -eq 0 ]; then echo "PASS $2"; else echo "FAIL $2"; failed=1; fi }
@@ -96,11 +100,18 @@ step "HTTP and TLS: front end (check)"
 step "HTTP and TLS: specs (verify)"
 "$TUO" verify "${HTTP_SRC[@]}"; check $? "http+tls verify"
 
+step "Web: front end (check)"
+"$TUO" check "${WEB_SRC[@]}" "${HTTP_SRC[@]}" examples/web.tuo; check $? "web check"
+
+# Only the web modules and what they stand on: the HTTP group's specs ran above.
+step "Web: specs (verify), all 107 captured FastAPI responses replayed"
+"$TUO" verify "${WEB_SRC[@]}" src/http/message.tuo src/http/fixture.tuo src/http/url.tuo src/std_str.tuo src/std_bits.tuo; check $? "web verify"
+
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
 # to `crates/tuo-stdlib/src/std/`.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.
@@ -137,6 +148,18 @@ if [ "$rc" -eq 0 ]; then
 else
   echo "http oracle exited $rc — that many checks disagreed"
   check 1 "http oracle"
+fi
+
+# The FastAPI-shaped application behind http::server, every captured case
+# replayed down one kept-alive connection.
+step "Web: loopback oracle (web::demo behind http::server)"
+"$TUO" run examples/web.tuo "${WEB_SRC[@]}" "${HTTP_SRC[@]}"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  check 0 "web oracle (all checks agreed)"
+else
+  echo "web oracle exited $rc — that many checks disagreed"
+  check 1 "web oracle"
 fi
 
 # The TLS client and the catalog's TLS server prove each other over loopback.
