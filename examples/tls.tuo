@@ -142,10 +142,10 @@ fn client_role(take port: Int) -> Int {
     let hash = tls::fixture::bytes(tls::fixture::hello_hash());
     let der = tls::fixture::bytes(tls::fixture::test_certificate());
     let good = std::ed25519::sign(tls::fixture::bytes(tls::fixture::test_seed()), std::tls::certificate_verify_content(hash));
-    failed = failed + report("a CertificateVerify signature by the test key verifies", tls::handshake::signature_valid(der, hash, good));
+    failed = failed + report("a CertificateVerify signature by the test key verifies", tls::handshake::signature_valid(der, hash, std::tls::signature_ed25519(), good));
     let other = std::ed25519::sign(std::hkdf::zeros(32), std::tls::certificate_verify_content(hash));
-    failed = failed + report("a signature by another key does not", !tls::handshake::signature_valid(der, hash, other));
-    failed = failed + report("nor does the right signature over another transcript", !tls::handshake::signature_valid(der, tls::fixture::bytes(tls::fixture::finished_hash()), good));
+    failed = failed + report("a signature by another key does not", !tls::handshake::signature_valid(der, hash, std::tls::signature_ed25519(), other));
+    failed = failed + report("nor does the right signature over another transcript", !tls::handshake::signature_valid(der, tls::fixture::bytes(tls::fixture::finished_hash()), std::tls::signature_ed25519(), good));
 
     // 1 connection: a full handshake and an HTTPS request against std::tls.
     let r1 = http::client::get_pinned(std::string::as_str(base(port, "/")), pin, t);

@@ -1,0 +1,226 @@
+// examples/x509 — the signature and chain checks the spec sandbox cannot
+// afford, asserted natively.
+//
+// `ec::curve` is spec'd on a 19-point curve and `x509::chain` on an
+// RSA-1024 test PKI, because a real ECDSA verification is more than the
+// sandbox's instruction fuel. This program runs the real thing:
+//
+//   * RFC 6979 A.2.5 and A.2.6 — the published P-256/SHA-256 and
+//     P-384/SHA-384 signatures over "sample" and "test" verify under the
+//     published public keys, and not under the wrong digest.
+//   * The P-256/P-384 and RSA-2048 test PKIs validate against their own
+//     roots, and fail for the wrong host, the wrong time, and the wrong
+//     root.
+//   * Real chains captured from api.cloudflare.com, www.cloudflare.com,
+//     sentry.io, api.stripe.com, and r2.cloudflarestorage.com on
+//     2026-09-15 validate against `x509::roots` at that date — ECDSA
+//     P-256 and P-384, RSA-2048 and RSA-4096, cross-signed bags — and
+//     the R2 chain, whose leaf had already expired, is refused for that
+//     reason and accepted a fortnight earlier.
+//
+//     tuo run examples/x509.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/std_*.tuo
+//
+// No network. One line per check; exit is the failure count.
+
+module x509_check;
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn ascii(in text: Str) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < std::str::len(text) {
+        std::array::push(out, std::str::byte_at(text, i));
+        i = i + 1;
+    }
+    out
+}
+
+/// A DER INTEGER of the big-endian magnitude in `hex`.
+fn der_integer(in hex: Str) -> Array[Int] {
+    let magnitude = ec::field::hex_bytes(hex);
+    var body = std::array::empty();
+    if std::array::get(magnitude, 0) >= 128 {
+        std::array::push(body, 0);
+    }
+    var i = 0;
+    while i < std::array::len(magnitude) {
+        std::array::push(body, std::array::get(magnitude, i));
+        i = i + 1;
+    }
+    var out = std::array::empty();
+    std::array::push(out, 2);
+    std::array::push(out, std::array::len(body));
+    var j = 0;
+    while j < std::array::len(body) {
+        std::array::push(out, std::array::get(body, j));
+        j = j + 1;
+    }
+    out
+}
+
+/// `SEQUENCE { r, s }` from the RFC's hex.
+fn der_signature(in r: Str, in s: Str) -> Array[Int] {
+    let ri = der_integer(r);
+    let si = der_integer(s);
+    var out = std::array::empty();
+    std::array::push(out, 48);
+    std::array::push(out, std::array::len(ri) + std::array::len(si));
+    var i = 0;
+    while i < std::array::len(ri) {
+        std::array::push(out, std::array::get(ri, i));
+        i = i + 1;
+    }
+    var j = 0;
+    while j < std::array::len(si) {
+        std::array::push(out, std::array::get(si, j));
+        j = j + 1;
+    }
+    out
+}
+
+/// `04 || x || y`.
+fn public_point(in x: Str, in y: Str) -> Array[Int] {
+    var out = std::array::empty();
+    std::array::push(out, 4);
+    let xb = ec::field::hex_bytes(x);
+    let yb = ec::field::hex_bytes(y);
+    var i = 0;
+    while i < std::array::len(xb) {
+        std::array::push(out, std::array::get(xb, i));
+        i = i + 1;
+    }
+    var j = 0;
+    while j < std::array::len(yb) {
+        std::array::push(out, std::array::get(yb, j));
+        j = j + 1;
+    }
+    out
+}
+
+fn list1(in a: Str) -> Array[Int] {
+    var list = std::array::empty();
+    x509::chain::push_entry(list, ec::field::hex_bytes(a));
+    list
+}
+
+fn list2(in a: Str, in b: Str) -> Array[Int] {
+    var list = list1(a);
+    x509::chain::push_entry(list, ec::field::hex_bytes(b));
+    list
+}
+
+fn list3(in a: Str, in b: Str, in c: Str) -> Array[Int] {
+    var list = list2(a, b);
+    x509::chain::push_entry(list, ec::field::hex_bytes(c));
+    list
+}
+
+fn list4(in a: Str, in b: Str, in c: Str, in d: Str) -> Array[Int] {
+    var list = list3(a, b, c);
+    x509::chain::push_entry(list, ec::field::hex_bytes(d));
+    list
+}
+
+fn list5(in a: Str, in b: Str, in c: Str, in d: Str, in e: Str) -> Array[Int] {
+    var list = list4(a, b, c, d);
+    x509::chain::push_entry(list, ec::field::hex_bytes(e));
+    list
+}
+
+/// 2026-09-15T00:00:00Z, the capture date.
+fn capture_time() -> Int {
+    1789430400
+}
+
+/// 2026-09-01T00:00:00Z.
+fn fortnight_before() -> Int {
+    1788220800
+}
+
+fn verdict_is(in list: Array[Int], in roots: Array[Int], in host: Str, take now: Int, take expected: Int) -> Bool {
+    let v = x509::chain::validate(list, roots, host, now);
+    if v != expected {
+        var line = std::string::empty();
+        std::str::push(line, "      got: ");
+        std::str::push(line, x509::chain::describe(v));
+        std::str::push(line, "\n");
+        let _ = std::rt::write_string(1, line);
+    }
+    v == expected
+}
+
+fn main() -> Int {
+    var failed = 0;
+
+    // --- RFC 6979 A.2.5: P-256 with SHA-256 ---------------------------------------
+    let p256 = ec::p256::curve();
+    let u256 = public_point("60fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6", "7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299");
+    let sample256 = der_signature("efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716", "f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8");
+    let test256 = der_signature("f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d38367", "019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083");
+    failed = failed + report("RFC 6979 P-256/SHA-256 signature over \"sample\" verifies", ec::ecdsa::verify(p256, u256, rsa::verify::sha256(ascii("sample")), sample256));
+    failed = failed + report("RFC 6979 P-256/SHA-256 signature over \"test\" verifies", ec::ecdsa::verify(p256, u256, rsa::verify::sha256(ascii("test")), test256));
+    failed = failed + report("the \"sample\" signature does not verify over \"test\"", !ec::ecdsa::verify(p256, u256, rsa::verify::sha256(ascii("test")), sample256));
+    failed = failed + report("nor under the base point as a public key", !ec::ecdsa::verify(p256, public_point("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296", "4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5"), rsa::verify::sha256(ascii("sample")), sample256));
+
+    // --- RFC 6979 A.2.6: P-384 with SHA-384 ---------------------------------------
+    let p384 = ec::p384::curve();
+    let u384 = public_point("ec3a4e415b4e19a4568618029f427fa5da9a8bc4ae92e02e06aae5286b300c64def8f0ea9055866064a254515480bc13", "8015d9b72d7d57244ea8ef9ac0c621896708a59367f9dfb9f54ca84b3f1c9db1288b231c3ae0d4fe7344fd2533264720");
+    let sample384 = der_signature("94edbb92a5ecb8aad4736e56c691916b3f88140666ce9fa73d64c4ea95ad133c81a648152e44acf96e36dd1e80fabe46", "99ef4aeb15f178cea1fe40db2603138f130e740a19624526203b6351d0a3a94fa329c145786e679e7b82c71a38628ac8");
+    let test384 = der_signature("8203b63d3c853e8d77227fb377bcf7b7b772e97892a80f36ab775d509d7a5feb0542a7f0812998da8f1dd3ca3cf023db", "ddd0760448d42d8a43af45af836fce4de8be06b485e9b61b827c2f13173923e06a739f040649a667bf3b828246baa5a5");
+    failed = failed + report("RFC 6979 P-384/SHA-384 signature over \"sample\" verifies", ec::ecdsa::verify(p384, u384, crypto::sha384::hash(ascii("sample")), sample384));
+    failed = failed + report("RFC 6979 P-384/SHA-384 signature over \"test\" verifies", ec::ecdsa::verify(p384, u384, crypto::sha384::hash(ascii("test")), test384));
+    failed = failed + report("the P-384 \"test\" signature does not verify over \"sample\"", !ec::ecdsa::verify(p384, u384, crypto::sha384::hash(ascii("sample")), test384));
+
+    // --- The test PKIs ------------------------------------------------------------------
+    let ec_chain = list2(x509::fixture::ec_leaf(), x509::fixture::ec_int());
+    let ec_roots = list1(x509::fixture::ec_root());
+    let big_chain = list2(x509::fixture::big_leaf(), x509::fixture::big_int());
+    let big_roots = list1(x509::fixture::big_root());
+    let later = 1800000000;
+    failed = failed + report("the P-256 leaf under the P-384 root validates for localhost", verdict_is(ec_chain, ec_roots, "localhost", later, x509::chain::ok()));
+    failed = failed + report("and for a.wild.test through the wildcard name", verdict_is(ec_chain, ec_roots, "a.wild.test", later, x509::chain::ok()));
+    failed = failed + report("but not for wild.test itself", verdict_is(ec_chain, ec_roots, "wild.test", later, x509::chain::name_mismatch()));
+    failed = failed + report("nor before the leaf's notBefore", verdict_is(ec_chain, ec_roots, "localhost", 1700000000, x509::chain::not_current()));
+    failed = failed + report("nor under the RSA root", verdict_is(ec_chain, big_roots, "localhost", later, x509::chain::untrusted()));
+    failed = failed + report("nor without the intermediate", verdict_is(list1(x509::fixture::ec_leaf()), ec_roots, "localhost", later, x509::chain::untrusted()));
+    failed = failed + report("the RSA-2048 PKI validates", verdict_is(big_chain, big_roots, "localhost", later, x509::chain::ok()));
+    failed = failed + report("the RSA-2048 intermediate is not accepted as a root for the EC leaf", verdict_is(ec_chain, list1(x509::fixture::big_int()), "localhost", later, x509::chain::untrusted()));
+
+    // --- Real chains against the root store at the capture date ------------------
+    let store = x509::roots::store();
+    let now = capture_time();
+    failed = failed + report("api.cloudflare.com (P-256 leaf, WE1, GTS Root R4 via P-384) validates", verdict_is(list3(x509::fixture::api_cloudflare_com_0(), x509::fixture::api_cloudflare_com_1(), x509::fixture::api_cloudflare_com_2()), store, "api.cloudflare.com", now, x509::chain::ok()));
+    failed = failed + report("www.cloudflare.com (Let's Encrypt YE2, Root YE, ISRG Root X2) validates", verdict_is(list4(x509::fixture::www_cloudflare_com_0(), x509::fixture::www_cloudflare_com_1(), x509::fixture::www_cloudflare_com_2(), x509::fixture::www_cloudflare_com_3()), store, "www.cloudflare.com", now, x509::chain::ok()));
+    let sentry = list2(x509::fixture::sentry_io_0(), x509::fixture::sentry_io_1());
+    failed = failed + report("sentry.io (RSA-2048, DigiCert Global Root G2) validates", verdict_is(sentry, store, "sentry.io", now, x509::chain::ok()));
+    failed = failed + report("and o1.sentry.io through its wildcard", verdict_is(sentry, store, "o1.sentry.io", now, x509::chain::ok()));
+    failed = failed + report("but not for another host", verdict_is(sentry, store, "sentry.example", now, x509::chain::name_mismatch()));
+    failed = failed + report("nor in May 2027, past its notAfter", verdict_is(sentry, store, "sentry.io", 1810000000, x509::chain::not_current()));
+    failed = failed + report("nor with an empty store", verdict_is(sentry, std::array::empty(), "sentry.io", now, x509::chain::untrusted()));
+    failed = failed + report("api.stripe.com (five certificates, two cross-signed routes, RSA-4096) validates", verdict_is(list5(x509::fixture::api_stripe_com_0(), x509::fixture::api_stripe_com_1(), x509::fixture::api_stripe_com_2(), x509::fixture::api_stripe_com_3(), x509::fixture::api_stripe_com_4()), store, "api.stripe.com", now, x509::chain::ok()));
+    let r2 = list3(x509::fixture::r2_cloudflarestorage_com_0(), x509::fixture::r2_cloudflarestorage_com_1(), x509::fixture::r2_cloudflarestorage_com_2());
+    failed = failed + report("r2.cloudflarestorage.com's leaf had expired on the capture date", verdict_is(r2, store, "r2.cloudflarestorage.com", now, x509::chain::not_current()));
+    failed = failed + report("and validated a fortnight earlier", verdict_is(r2, store, "r2.cloudflarestorage.com", fortnight_before(), x509::chain::ok()));
+
+    // --- Through the handshake's trust ---------------------------------------------------
+    failed = failed + report("tls::handshake::trusted accepts sentry.io's chain with the store", tls::handshake::trusted(tls::handshake::trust_roots(store, "sentry.io", now), sentry));
+    failed = failed + report("and refuses it under a pin", !tls::handshake::trusted(tls::handshake::pin(std::hkdf::zeros(32)), sentry));
+
+    failed
+}

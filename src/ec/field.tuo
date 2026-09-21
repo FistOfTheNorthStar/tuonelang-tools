@@ -1,0 +1,608 @@
+// ec::field — modular arithmetic over `std::bignum`, for public values.
+//
+// `std::bignum` stops at add, sub, mul, and small division: it has no
+// division by a bignum and no modular exponentiation, because each is a
+// real algorithm rather than glue. This module is that increment, in the
+// shape signature *verification* needs: a modulus prepared once, then
+// reduction, multiplication, inversion, and exponentiation against it.
+//
+// REDUCTION IS BARRETT'S (HAC 14.42). A modulus of `k` limbs carries
+// `mu = floor(B^2k / m)`, and any `x < B^2k` — every product of two reduced
+// values — is reduced with two multiplications and a shift rather than a
+// bit-by-bit subtraction loop. The estimate `q3` is at most two short of
+// the true quotient, so `x - q3·m` lands in `[0, 3m)` and at most two
+// subtractions finish it. Anything wider than `2k` limbs takes the slow
+// binary path in `divide`, which is also how `mu` itself is computed.
+//
+// NOT CONSTANT TIME, ON PURPOSE. Everything here is variable-time, as
+// `std::bignum` is. That is correct for what this module is for: checking
+// a signature over a public key, a public message, and a public signature.
+// It is **not** safe for a private key, and there is deliberately no
+// signing function anywhere in `ec::` or `rsa::` — see the catalog's own
+// `std::bignum` header for why masking would not fix it.
+//
+// Every function is total: a zero modulus reduces everything to zero
+// rather than trapping, so hostile inputs from a certificate fail closed.
+
+module ec::field;
+
+/// A modulus with its Barrett constant. `k` is the limb count of `m`, and
+/// `mu` is `floor(B^(2k) / m)` for the limb base `B = 2^28`.
+pub struct Modulus {
+    m: Array[Int],
+    mu: Array[Int],
+    k: Int,
+}
+
+/// The value of one hex digit, or -1.
+fn nibble(take b: Int) -> Int {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    0 - 1
+}
+
+/// The bytes a hex string spells; empty for an odd length or a non-digit.
+///
+/// # Example
+/// ```tuo
+/// let b = ec::field::hex_bytes("0304"); // [3, 4]
+/// ```
+pub fn hex_bytes(in hex: Str) -> Array[Int] {
+    var out = std::array::empty();
+    let n = std::str::len(hex);
+    if n % 2 != 0 {
+        return out;
+    }
+    var i = 0;
+    while i < n {
+        let hi = nibble(std::str::byte_at(hex, i));
+        let lo = nibble(std::str::byte_at(hex, i + 1));
+        if hi < 0 || lo < 0 {
+            return std::array::empty();
+        }
+        std::array::push(out, hi * 16 + lo);
+        i = i + 2;
+    }
+    out
+}
+
+/// The lowercase hex spelling of `bytes`.
+///
+/// # Example
+/// ```tuo
+/// let h = ec::field::bytes_hex(b); // "0304"
+/// ```
+pub fn bytes_hex(in bytes: Array[Int]) -> String {
+    let digits = "0123456789abcdef";
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::array::len(bytes) {
+        let b = std::array::get(bytes, i) & 255;
+        std::string::push_byte(out, std::str::byte_at(digits, b >> 4));
+        std::string::push_byte(out, std::str::byte_at(digits, b & 15));
+        i = i + 1;
+    }
+    out
+}
+
+/// The bignum a big-endian hex string spells (zero for malformed hex).
+///
+/// # Example
+/// ```tuo
+/// let n = ec::field::from_hex("ffffffff00000001"); // 2^64 - 2^32 + 1
+/// ```
+pub fn from_hex(in hex: Str) -> Array[Int] {
+    std::bignum::from_be_bytes(hex_bytes(hex))
+}
+
+/// `value` as big-endian bytes, left-padded with zeros to `width` bytes.
+/// Empty when it does not fit.
+///
+/// # Example
+/// ```tuo
+/// let b = ec::field::to_bytes(std::bignum::from_int(5), 4); // [0, 0, 0, 5]
+/// ```
+pub fn to_bytes(in value: Array[Int], take width: Int) -> Array[Int] {
+    let raw = std::bignum::to_be_bytes(value);
+    let n = std::array::len(raw);
+    if n > width {
+        return std::array::empty();
+    }
+    var out = std::array::empty();
+    var pad = width - n;
+    while pad > 0 {
+        std::array::push(out, 0);
+        pad = pad - 1;
+    }
+    var i = 0;
+    while i < n {
+        std::array::push(out, std::array::get(raw, i));
+        i = i + 1;
+    }
+    out
+}
+
+/// Bit `index` of `value` (0 is the least significant), as 0 or 1.
+///
+/// # Example
+/// ```tuo
+/// let b = ec::field::bit_at(std::bignum::from_int(5), 2); // 1
+/// ```
+pub fn bit_at(in value: Array[Int], take index: Int) -> Int {
+    if index < 0 {
+        return 0;
+    }
+    let limb = index / 28;
+    if limb >= std::array::len(value) {
+        return 0;
+    }
+    (std::array::get(value, limb) >> (index % 28)) & 1
+}
+
+/// `2^bits` as a bignum.
+///
+/// # Example
+/// ```tuo
+/// let p = ec::field::power_of_two(28); // one limb of zero, then 1
+/// ```
+pub fn power_of_two(take bits: Int) -> Array[Int] {
+    std::bignum::shift_left(std::bignum::from_int(1), bits)
+}
+
+// ----------------------------------------------------------------------------
+// Division: Knuth's Algorithm D (TAOCP vol. 2, §4.3.1), limb by limb.
+// ----------------------------------------------------------------------------
+
+/// `count` zero limbs.
+fn zeros(take count: Int) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < count {
+        std::array::push(out, 0);
+        i = i + 1;
+    }
+    out
+}
+
+/// Long division of `a` by `b`: the quotient when `want_quotient`, else
+/// the remainder. Division by zero yields an empty quotient and `a` as
+/// the remainder.
+///
+/// Algorithm D estimates each quotient limb from the top two limbs of the
+/// running remainder and the top limb of a normalised divisor, and the
+/// estimate is at most two too large; with 28-bit limbs every product and
+/// sum below stays under 2^57, so nothing traps. It costs one limb
+/// multiplication per quotient limb rather than one array pass per bit,
+/// which is what makes preparing an RSA modulus affordable.
+fn long_division(in a: Array[Int], in b: Array[Int], take want_quotient: Bool) -> Array[Int] {
+    let u0 = std::bignum::normalized(a);
+    let v0 = std::bignum::normalized(b);
+    if std::bignum::is_zero(v0) || std::bignum::compare(u0, v0) < 0 {
+        return if want_quotient {
+            std::array::empty()
+        } else {
+            std::bignum::normalized(u0)
+        };
+    }
+    let n = std::array::len(v0);
+    if n == 1 {
+        let d = std::array::get(v0, 0);
+        return if want_quotient {
+            std::bignum::div_small(u0, d)
+        } else {
+            std::bignum::from_int(std::bignum::rem_small(u0, d))
+        };
+    }
+    // D1: normalise so the divisor's top limb has its high bit set.
+    var shift = 0;
+    var top = std::array::get(v0, n - 1);
+    while top < 134217728 {
+        top = top * 2;
+        shift = shift + 1;
+    }
+    let v = std::bignum::shift_left(v0, shift);
+    var u = std::bignum::shift_left(u0, shift);
+    while std::array::len(u) < std::array::len(u0) + 1 {
+        std::array::push(u, 0);
+    }
+    let m = std::array::len(u) - n - 1;
+    var q = zeros(m + 1);
+    let base = 268435456;
+    let mask = 268435455;
+    let vtop = std::array::get(v, n - 1);
+    let vnext = std::array::get(v, n - 2);
+    var j = m;
+    while j >= 0 {
+        // D3: estimate, then correct the estimate down at most twice.
+        let num = std::array::get(u, j + n) * base + std::array::get(u, j + n - 1);
+        var qhat = num / vtop;
+        var rhat = num % vtop;
+        var testing = true;
+        while testing {
+            testing = false;
+            if qhat >= base || qhat * vnext > rhat * base + std::array::get(u, j + n - 2) {
+                qhat = qhat - 1;
+                rhat = rhat + vtop;
+                if rhat < base {
+                    testing = true;
+                }
+            }
+        }
+        // D4: multiply and subtract.
+        var borrow = 0;
+        var carry = 0;
+        var i = 0;
+        while i < n {
+            let p = qhat * std::array::get(v, i) + carry;
+            carry = p >> 28;
+            let t = std::array::get(u, i + j) - (p & mask) - borrow;
+            if t < 0 {
+                std::array::set(u, i + j, t + base);
+                borrow = 1;
+            } else {
+                std::array::set(u, i + j, t);
+                borrow = 0;
+            }
+            i = i + 1;
+        }
+        let t = std::array::get(u, j + n) - carry - borrow;
+        if t < 0 {
+            // D6: the estimate was one too large; add the divisor back.
+            std::array::set(u, j + n, t + base);
+            qhat = qhat - 1;
+            var c = 0;
+            var k = 0;
+            while k < n {
+                let sum = std::array::get(u, k + j) + std::array::get(v, k) + c;
+                std::array::set(u, k + j, sum & mask);
+                c = sum >> 28;
+                k = k + 1;
+            }
+            std::array::set(u, j + n, (std::array::get(u, j + n) + c) & mask);
+        } else {
+            std::array::set(u, j + n, t);
+        }
+        std::array::set(q, j, qhat);
+        j = j - 1;
+    }
+    if want_quotient {
+        return std::bignum::normalized(q);
+    }
+    // D8: the remainder is the low n limbs, un-normalised.
+    var rest = std::array::empty();
+    var r = 0;
+    while r < n {
+        std::array::push(rest, std::array::get(u, r));
+        r = r + 1;
+    }
+    std::bignum::shift_right(rest, shift)
+}
+
+/// The quotient `floor(a / b)`; zero when `b` is zero.
+///
+/// # Example
+/// ```tuo
+/// let q = ec::field::divide(std::bignum::from_int(100), std::bignum::from_int(7)); // 14
+/// ```
+pub fn divide(in a: Array[Int], in b: Array[Int]) -> Array[Int] {
+    long_division(a, b, true)
+}
+
+/// The remainder `a mod b`; `a` itself when `b` is zero.
+///
+/// # Example
+/// ```tuo
+/// let r = ec::field::remainder(std::bignum::from_int(100), std::bignum::from_int(7)); // 2
+/// ```
+pub fn remainder(in a: Array[Int], in b: Array[Int]) -> Array[Int] {
+    long_division(a, b, false)
+}
+
+// ----------------------------------------------------------------------------
+// The modulus, prepared once.
+// ----------------------------------------------------------------------------
+
+/// Prepare `m` for Barrett reduction. A zero modulus yields `k` 0 and
+/// reduces everything to zero.
+///
+/// # Example
+/// ```tuo
+/// let p = ec::field::modulus(ec::field::from_hex("fffffffb"));
+/// ```
+pub fn modulus(in m: Array[Int]) -> Modulus {
+    let n = std::bignum::normalized(m);
+    let k = std::array::len(n);
+    if k == 0 {
+        return Modulus { m: std::array::empty(), mu: std::array::empty(), k: 0 };
+    }
+    let mu = divide(power_of_two(56 * k), n);
+    Modulus { m: n, mu: mu, k: k }
+}
+
+/// `x mod m`. Barrett for `x < B^(2k)`, binary division above that.
+///
+/// # Example
+/// ```tuo
+/// let r = ec::field::reduce(product, p);
+/// ```
+pub fn reduce(in x: Array[Int], in mod: Modulus) -> Array[Int] {
+    if mod.k == 0 {
+        return std::array::empty();
+    }
+    let v = std::bignum::normalized(x);
+    if std::bignum::compare(v, mod.m) < 0 {
+        return v;
+    }
+    if std::array::len(v) > 2 * mod.k {
+        return remainder(v, mod.m);
+    }
+    // q3 = ((x >> 28(k-1)) * mu) >> 28(k+1), at most two below the true
+    // quotient, so the remainder is non-negative and below 3m.
+    let q1 = std::bignum::shift_right(v, 28 * (mod.k - 1));
+    let q3 = std::bignum::shift_right(std::bignum::mul(q1, mod.mu), 28 * (mod.k + 1));
+    var r = std::bignum::sub(v, std::bignum::mul(q3, mod.m));
+    while std::bignum::compare(r, mod.m) >= 0 {
+        r = std::bignum::sub(r, mod.m);
+    }
+    r
+}
+
+/// `(a + b) mod m` for reduced `a` and `b`.
+///
+/// # Example
+/// ```tuo
+/// let s = ec::field::add(a, b, p);
+/// ```
+pub fn add(in a: Array[Int], in b: Array[Int], in mod: Modulus) -> Array[Int] {
+    let s = std::bignum::add(a, b);
+    if mod.k == 0 {
+        return std::array::empty();
+    }
+    if std::bignum::compare(s, mod.m) >= 0 {
+        return std::bignum::sub(s, mod.m);
+    }
+    s
+}
+
+/// `(a - b) mod m` for reduced `a` and `b`.
+///
+/// # Example
+/// ```tuo
+/// let d = ec::field::sub(a, b, p);
+/// ```
+pub fn sub(in a: Array[Int], in b: Array[Int], in mod: Modulus) -> Array[Int] {
+    if mod.k == 0 {
+        return std::array::empty();
+    }
+    if std::bignum::compare(a, b) >= 0 {
+        return std::bignum::sub(a, b);
+    }
+    std::bignum::sub(std::bignum::add(a, mod.m), b)
+}
+
+/// `(a * b) mod m`.
+///
+/// # Example
+/// ```tuo
+/// let q = ec::field::mul(a, b, p);
+/// ```
+pub fn mul(in a: Array[Int], in b: Array[Int], in mod: Modulus) -> Array[Int] {
+    reduce(std::bignum::mul(a, b), mod)
+}
+
+/// `a^2 mod m`.
+///
+/// # Example
+/// ```tuo
+/// let q = ec::field::square(a, p);
+/// ```
+pub fn square(in a: Array[Int], in mod: Modulus) -> Array[Int] {
+    reduce(std::bignum::mul(a, a), mod)
+}
+
+/// `a^e mod m`, by square-and-multiply from the most significant bit.
+///
+/// # Example
+/// ```tuo
+/// let q = ec::field::pow(a, e, p);
+/// ```
+pub fn pow(in a: Array[Int], in e: Array[Int], in mod: Modulus) -> Array[Int] {
+    if mod.k == 0 {
+        return std::array::empty();
+    }
+    var result = reduce(std::bignum::from_int(1), mod);
+    let base = reduce(a, mod);
+    var i = std::bignum::bit_length(e) - 1;
+    while i >= 0 {
+        result = square(result, mod);
+        if bit_at(e, i) == 1 {
+            result = mul(result, base, mod);
+        }
+        i = i - 1;
+    }
+    result
+}
+
+/// `a^-1 mod m` for a **prime** `m`, by Fermat: `a^(m-2)`. Zero has no
+/// inverse and yields zero; a composite modulus yields garbage, which is
+/// why `rsa::verify` never calls this.
+///
+/// # Example
+/// ```tuo
+/// let w = ec::field::invert(s, n);
+/// ```
+pub fn invert(in a: Array[Int], in mod: Modulus) -> Array[Int] {
+    if mod.k == 0 {
+        return std::array::empty();
+    }
+    pow(a, std::bignum::sub(mod.m, std::bignum::from_int(2)), mod)
+}
+
+/// Whether `a` is a reduced, non-zero element: `0 < a < m`.
+///
+/// # Example
+/// ```tuo
+/// let ok = ec::field::in_range(r, n);
+/// ```
+pub fn in_range(in a: Array[Int], in mod: Modulus) -> Bool {
+    !std::bignum::is_zero(a) && std::bignum::compare(a, mod.m) < 0
+}
+
+/// Whether two bignums denote the same value.
+///
+/// # Example
+/// ```tuo
+/// let same = ec::field::same(a, b);
+/// ```
+pub fn same(in a: Array[Int], in b: Array[Int]) -> Bool {
+    std::bignum::equals(a, b)
+}
+
+// ----------------------------------------------------------------------------
+// Specs. The expected values were computed with Python's integers; the
+// moduli are chosen to exercise one, two, and three limbs, and the Barrett
+// constant of each is asserted limb by limb.
+// ----------------------------------------------------------------------------
+
+fn n(take v: Int) -> Array[Int] {
+    std::bignum::from_int(v)
+}
+
+fn as_int(in a: Array[Int]) -> Int {
+    std::bignum::int_or(std::bignum::to_int(a), 0 - 1)
+}
+
+fn decimal_is(in a: Array[Int], in expected: Str) -> Bool {
+    std::string::as_str(std::bignum::to_decimal(a)) == expected
+}
+
+fn one_limb() -> Modulus {
+    modulus(n(1000003))
+}
+
+fn two_limbs() -> Modulus {
+    modulus(n(4294967291))
+}
+
+fn three_limbs() -> Modulus {
+    modulus(n(1152921504606846883))
+}
+
+fn wide() -> Modulus {
+    modulus(std::bignum::num_or_zero(std::bignum::from_decimal("12345678901234567890123")))
+}
+
+spec "hex round trip" {
+    then std::string::as_str(bytes_hex(hex_bytes("00ff10ab"))) == "00ff10ab";
+    then std::array::len(hex_bytes("abc")) == 0;
+    then std::array::len(hex_bytes("zz")) == 0;
+    then as_int(from_hex("ffffffff00000001")) == 0 - 1 || decimal_is(from_hex("ffffffff00000001"), "18446744069414584321");
+    then std::array::len(to_bytes(n(5), 4)) == 4;
+    then std::array::get(to_bytes(n(5), 4), 3) == 5;
+    then std::array::get(to_bytes(n(5), 4), 0) == 0;
+    then std::array::len(to_bytes(n(256), 1)) == 0;
+}
+
+spec bit_at {
+    then bit_at(n(5), 0) == 1;
+    then bit_at(n(5), 1) == 0;
+    then bit_at(n(5), 2) == 1;
+    then bit_at(n(5), 300) == 0;
+    then bit_at(power_of_two(28), 28) == 1;
+    then bit_at(power_of_two(28), 27) == 0;
+    then std::bignum::bit_length(power_of_two(100)) == 101;
+}
+
+spec divide {
+    then as_int(divide(n(100), n(7))) == 14;
+    then as_int(remainder(n(100), n(7))) == 2;
+    then as_int(divide(n(5), n(7))) == 0;
+    then as_int(remainder(n(5), n(7))) == 5;
+    then as_int(divide(n(100), n(0))) == 0;
+    then decimal_is(divide(power_of_two(100), n(3)), "422550200076076467165567735125");
+    then as_int(remainder(power_of_two(100), n(3))) == 1;
+    // Multi-limb divisors: 2^200 by 12345678901234567890123 and by 2^100 + 1.
+    then decimal_is(divide(power_of_two(200), wide().m), "130161982756436057243974045149555016803");
+    then decimal_is(remainder(power_of_two(200), wide().m), "12200757996003312564607");
+    then decimal_is(divide(power_of_two(200), std::bignum::add(power_of_two(100), n(1))), "1267650600228229401496703205375");
+    then decimal_is(remainder(power_of_two(200), std::bignum::add(power_of_two(100), n(1))), "1");
+    then decimal_is(divide(std::bignum::sub(power_of_two(200), n(1)), power_of_two(150)), "1125899906842623");
+    then as_int(divide(n(4294967291), n(4294967291))) == 1;
+    then as_int(remainder(n(4294967291), n(4294967291))) == 0;
+    then as_int(divide(n(4294967290), n(4294967291))) == 0;
+}
+
+spec modulus {
+    let m1 = one_limb();
+    then m1.k == 1;
+    then as_int(m1.mu) == 72057377865;
+    let m2 = two_limbs();
+    then m2.k == 2;
+    then std::array::len(m2.mu) == 3;
+    then std::array::get(m2.mu, 0) == 1638400;
+    then std::array::get(m2.mu, 1) == 5242880;
+    then std::array::get(m2.mu, 2) == 16777216;
+    let m3 = three_limbs();
+    then m3.k == 3;
+    then std::array::len(m3.mu) == 4;
+    then std::array::get(m3.mu, 0) == 2;
+    then std::array::get(m3.mu, 1) == 97517568;
+    then std::array::get(m3.mu, 2) == 0;
+    then std::array::get(m3.mu, 3) == 16777216;
+    let w = wide();
+    then w.k == 3;
+    then std::array::get(w.mu, 0) == 104005388;
+    then std::array::get(w.mu, 3) == 1566;
+    let z = modulus(n(0));
+    then z.k == 0;
+}
+
+spec reduce {
+    let m1 = one_limb();
+    then as_int(reduce(std::bignum::mul(n(1000003), n(1000003)), m1)) == 0;
+    then as_int(reduce(std::bignum::sub(std::bignum::mul(n(1000003), n(1000003)), n(1)), m1)) == 1000002;
+    then as_int(reduce(n(5), m1)) == 5;
+    then as_int(reduce(n(1000003), m1)) == 0;
+    let m2 = two_limbs();
+    then as_int(reduce(std::bignum::sub(std::bignum::mul(n(4294967291), n(4294967291)), n(1)), m2)) == 4294967290;
+    let m3 = three_limbs();
+    then decimal_is(reduce(std::bignum::sub(std::bignum::mul(n(1152921504606846883), n(1152921504606846883)), n(1)), m3), "1152921504606846882");
+    then decimal_is(reduce(std::bignum::sub(std::bignum::mul(wide().m, wide().m), n(1)), wide()), "12345678901234567890122");
+    // Wider than 2k limbs takes the slow path and agrees with it.
+    then as_int(reduce(power_of_two(200), m1)) == as_int(remainder(power_of_two(200), n(1000003)));
+    then std::array::len(reduce(n(7), modulus(n(0)))) == 0;
+}
+
+spec pow {
+    let m1 = one_limb();
+    then as_int(add(n(1000002), n(5), m1)) == 4;
+    then as_int(add(n(2), n(5), m1)) == 7;
+    then as_int(sub(n(2), n(5), m1)) == 1000000;
+    then as_int(sub(n(5), n(2), m1)) == 3;
+    then as_int(mul(n(1000002), n(1000002), m1)) == 1;
+    then as_int(square(n(1000002), m1)) == 1;
+    then as_int(pow(n(2), n(100), m1)) == 253109;
+    then as_int(pow(n(2), n(100), two_limbs())) == 2000;
+    then decimal_is(pow(n(2), n(100), three_limbs()), "102254581383168");
+    then decimal_is(pow(n(2), n(100), wide()), "6698813242143808492399");
+    then as_int(pow(n(7), n(0), m1)) == 1;
+}
+
+spec invert {
+    then as_int(invert(n(3), one_limb())) == 666669;
+    then as_int(mul(n(3), n(666669), one_limb())) == 1;
+    then as_int(invert(n(3), two_limbs())) == 1431655764;
+    then decimal_is(invert(n(3), three_limbs()), "768614336404564589");
+    then as_int(invert(n(0), one_limb())) == 0;
+    then in_range(n(5), one_limb());
+    then !in_range(n(0), one_limb());
+    then !in_range(n(1000003), one_limb());
+    then same(n(5), reduce(n(1000008), one_limb()));
+}

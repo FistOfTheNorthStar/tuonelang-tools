@@ -1,0 +1,445 @@
+// x509::chain — from a server's certificates to a trust decision.
+//
+// A TLS server sends its own certificate first and then whatever it
+// thinks helps: usually the intermediates up to a root, sometimes extra
+// cross-signed ones, sometimes the root itself. This module turns that
+// bag plus a root store into one answer, by RFC 5280 §6's rules cut down
+// to what a TLS client needs:
+//
+//   1. The leaf names the host (`x509::name`), is valid now, and may be
+//      used for server authentication.
+//   2. Some path leaf → intermediate… → root exists in which each
+//      certificate was signed by the next one's key, each intermediate
+//      is a CA valid now whose key usage allows signing certificates and
+//      whose path-length constraint is honoured, and the last one was
+//      signed by a root in the store.
+//
+// The search is depth-first over the certificates the server sent, with
+// a depth bound, so a cross-signed bag with two routes to two roots is
+// handled by trying both, and a bag that loops terminates. Signature
+// checks are the expensive step, so every cheap test runs first.
+//
+// LISTS ARE FLAT. A chain is an `Array[Int]` of `u24 length || DER`
+// entries — exactly the TLS Certificate message's list with the
+// per-entry extensions stripped — because tuonelang v0 has no array of
+// arrays. The root store is the same shape.
+//
+// NOT HERE, AND SAID SO: name constraints (a critical one rejects the
+// certificate in `x509::certificate`), policy processing, revocation
+// (CRL, OCSP), and Certificate Transparency. Each is an increment on
+// this walk, not a rewrite of it.
+
+module x509::chain;
+
+// --- Flat lists ------------------------------------------------------------------
+
+/// Append `der` to `list` as one entry.
+///
+/// # Example
+/// ```tuo
+/// x509::chain::push_entry(list, der);
+/// ```
+pub fn push_entry(mut list: Array[Int], in der: Array[Int]) {
+    let n = std::array::len(der);
+    std::array::push(list, (n >> 16) & 255);
+    std::array::push(list, (n >> 8) & 255);
+    std::array::push(list, n & 255);
+    var i = 0;
+    while i < n {
+        std::array::push(list, std::array::get(der, i));
+        i = i + 1;
+    }
+}
+
+/// The offset of entry `index`'s length prefix, or -1.
+fn entry_offset(in list: Array[Int], take index: Int) -> Int {
+    var at = 0;
+    var seen = 0;
+    while at + 3 <= std::array::len(list) {
+        let n = (std::array::get(list, at) << 16) | (std::array::get(list, at + 1) << 8) | std::array::get(list, at + 2);
+        if at + 3 + n > std::array::len(list) {
+            return 0 - 1;
+        }
+        if seen == index {
+            return at;
+        }
+        at = at + 3 + n;
+        seen = seen + 1;
+    }
+    0 - 1
+}
+
+/// How many well-formed entries `list` holds before any malformed one.
+///
+/// # Example
+/// ```tuo
+/// let n = x509::chain::entry_count(list);
+/// ```
+pub fn entry_count(in list: Array[Int]) -> Int {
+    var at = 0;
+    var seen = 0;
+    while at + 3 <= std::array::len(list) {
+        let n = (std::array::get(list, at) << 16) | (std::array::get(list, at + 1) << 8) | std::array::get(list, at + 2);
+        if at + 3 + n > std::array::len(list) {
+            return seen;
+        }
+        at = at + 3 + n;
+        seen = seen + 1;
+    }
+    seen
+}
+
+/// The DER of entry `index`, or empty.
+///
+/// # Example
+/// ```tuo
+/// let leaf = x509::chain::entry_at(list, 0);
+/// ```
+pub fn entry_at(in list: Array[Int], take index: Int) -> Array[Int] {
+    var out = std::array::empty();
+    let at = entry_offset(list, index);
+    if at < 0 {
+        return out;
+    }
+    let n = (std::array::get(list, at) << 16) | (std::array::get(list, at + 1) << 8) | std::array::get(list, at + 2);
+    var i = 0;
+    while i < n {
+        std::array::push(out, std::array::get(list, at + 3 + i));
+        i = i + 1;
+    }
+    out
+}
+
+// --- Verdicts ----------------------------------------------------------------------
+
+/// The chain validates.
+///
+/// # Example
+/// ```tuo
+/// let ok = x509::chain::validate(list, roots, host, now) == x509::chain::ok();
+/// ```
+pub fn ok() -> Int {
+    0
+}
+
+/// No decodable leaf certificate.
+///
+/// # Example
+/// ```tuo
+/// let v = x509::chain::no_leaf(); // 1
+/// ```
+pub fn no_leaf() -> Int {
+    1
+}
+
+/// The leaf does not name the host.
+///
+/// # Example
+/// ```tuo
+/// let v = x509::chain::name_mismatch(); // 2
+/// ```
+pub fn name_mismatch() -> Int {
+    2
+}
+
+/// The leaf is not yet valid or has expired.
+///
+/// # Example
+/// ```tuo
+/// let v = x509::chain::not_current(); // 3
+/// ```
+pub fn not_current() -> Int {
+    3
+}
+
+/// The leaf's key cannot be used for TLS server authentication: an
+/// unsupported key type, a key usage without digitalSignature, or an
+/// extended key usage without serverAuth.
+///
+/// # Example
+/// ```tuo
+/// let v = x509::chain::wrong_purpose(); // 4
+/// ```
+pub fn wrong_purpose() -> Int {
+    4
+}
+
+/// No path from the leaf to a root in the store.
+///
+/// # Example
+/// ```tuo
+/// let v = x509::chain::untrusted(); // 5
+/// ```
+pub fn untrusted() -> Int {
+    5
+}
+
+/// The most intermediates a path may contain.
+///
+/// # Example
+/// ```tuo
+/// let d = x509::chain::max_depth(); // 5
+/// ```
+pub fn max_depth() -> Int {
+    5
+}
+
+/// A short description of a verdict.
+///
+/// # Example
+/// ```tuo
+/// let why = x509::chain::describe(verdict);
+/// ```
+pub fn describe(take verdict: Int) -> Str {
+    if verdict == 0 {
+        return "ok";
+    }
+    if verdict == 1 {
+        return "no leaf certificate";
+    }
+    if verdict == 2 {
+        return "name mismatch";
+    }
+    if verdict == 3 {
+        return "not currently valid";
+    }
+    if verdict == 4 {
+        return "not usable for server authentication";
+    }
+    if verdict == 5 {
+        return "no path to a trusted root";
+    }
+    "unknown"
+}
+
+// --- Signatures ----------------------------------------------------------------------
+
+/// Whether `child`'s signature was made by `issuer`'s key, for every
+/// algorithm and key pairing this crate speaks. A pairing it does not
+/// (an RSA signature under an EC key, an unsupported algorithm) is false.
+///
+/// # Example
+/// ```tuo
+/// let signed = x509::chain::issued(leaf, intermediate);
+/// ```
+pub fn issued(in child: x509::certificate::Certificate, in issuer: x509::certificate::Certificate) -> Bool {
+    if !child.ok || !issuer.ok {
+        return false;
+    }
+    let alg = child.signature_algorithm;
+    let kind = issuer.key_kind;
+    if alg == x509::certificate::sig_ed25519() {
+        if kind != x509::certificate::key_ed25519() {
+            return false;
+        }
+        return std::ed25519::verify(issuer.public_key, child.tbs, child.signature);
+    }
+    if alg == x509::certificate::sig_ecdsa_sha256() || alg == x509::certificate::sig_ecdsa_sha384() || alg == x509::certificate::sig_ecdsa_sha512() {
+        let digest = if alg == x509::certificate::sig_ecdsa_sha256() {
+            rsa::verify::sha256(child.tbs)
+        } else if alg == x509::certificate::sig_ecdsa_sha384() {
+            crypto::sha384::hash(child.tbs)
+        } else {
+            std::sha512::hash(child.tbs)
+        };
+        if kind == x509::certificate::key_p256() {
+            return ec::ecdsa::verify(ec::p256::curve(), issuer.public_key, digest, child.signature);
+        }
+        if kind == x509::certificate::key_p384() {
+            return ec::ecdsa::verify(ec::p384::curve(), issuer.public_key, digest, child.signature);
+        }
+        return false;
+    }
+    if alg == x509::certificate::sig_rsa_sha256() || alg == x509::certificate::sig_rsa_sha384() || alg == x509::certificate::sig_rsa_sha512() {
+        if kind != x509::certificate::key_rsa() {
+            return false;
+        }
+        let info = if alg == x509::certificate::sig_rsa_sha256() {
+            rsa::verify::digest_info(256, rsa::verify::sha256(child.tbs))
+        } else if alg == x509::certificate::sig_rsa_sha384() {
+            rsa::verify::digest_info(384, crypto::sha384::hash(child.tbs))
+        } else {
+            rsa::verify::digest_info(512, std::sha512::hash(child.tbs))
+        };
+        return rsa::verify::pkcs1_v15_valid(rsa::verify::parse_public_key(issuer.public_key), info, child.signature);
+    }
+    false
+}
+
+// --- The walk ---------------------------------------------------------------------------
+
+/// Whether some path from `cert` reaches a root in `roots` through the
+/// intermediates in `list`. `depth` counts intermediates used so far and
+/// `below` the CA certificates beneath the next candidate, for its
+/// path-length constraint.
+fn trusted_from(in cert: x509::certificate::Certificate, in list: Array[Int], in roots: Array[Int], take now: Int, take depth: Int, take below: Int) -> Bool {
+    // A root that issued it ends the walk.
+    let root_count = entry_count(roots);
+    var r = 0;
+    while r < root_count {
+        let root = x509::certificate::parse(entry_at(roots, r));
+        if root.ok && x509::certificate::same_bytes(cert.issuer, root.subject) && issued(cert, root) {
+            return true;
+        }
+        r = r + 1;
+    }
+    if depth >= max_depth() {
+        return false;
+    }
+    // Otherwise an intermediate the server sent, that is a CA, current,
+    // allowed to sign certificates, within its own path-length limit, and
+    // not the certificate itself again.
+    let count = entry_count(list);
+    var i = 1;
+    while i < count {
+        let candidate = x509::certificate::parse(entry_at(list, i));
+        var usable = candidate.ok && candidate.is_ca && x509::certificate::same_bytes(cert.issuer, candidate.subject);
+        if usable && !x509::certificate::valid_at(candidate, now) {
+            usable = false;
+        }
+        if usable && candidate.key_usage >= 0 && (candidate.key_usage & x509::certificate::usage_key_cert_sign()) == 0 {
+            usable = false;
+        }
+        if usable && candidate.path_len >= 0 && candidate.path_len < below {
+            usable = false;
+        }
+        if usable && x509::certificate::same_bytes(candidate.subject, cert.subject) {
+            usable = false;
+        }
+        if usable && issued(cert, candidate) {
+            if trusted_from(candidate, list, roots, now, depth + 1, below + 1) {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+/// Validate the server's certificate list for `host` at Unix time `now`
+/// against `roots`. Returns `ok()` or the first failing verdict.
+///
+/// # Example
+/// ```tuo
+/// let verdict = x509::chain::validate(list, x509::roots::store(), "sentry.io", now);
+/// ```
+pub fn validate(in list: Array[Int], in roots: Array[Int], in host: Str, take now: Int) -> Int {
+    if entry_count(list) == 0 {
+        return no_leaf();
+    }
+    let leaf = x509::certificate::parse(entry_at(list, 0));
+    if !leaf.ok {
+        return no_leaf();
+    }
+    if !x509::name::any_matches(leaf.dns_names, host) {
+        return name_mismatch();
+    }
+    if !x509::certificate::valid_at(leaf, now) {
+        return not_current();
+    }
+    if leaf.key_kind == x509::certificate::key_none() {
+        return wrong_purpose();
+    }
+    if leaf.key_usage >= 0 && (leaf.key_usage & x509::certificate::usage_digital_signature()) == 0 {
+        return wrong_purpose();
+    }
+    if leaf.has_ext_key_usage && !leaf.server_auth {
+        return wrong_purpose();
+    }
+    if trusted_from(leaf, list, roots, now, 0, 0) {
+        ok()
+    } else {
+        untrusted()
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Specs: the RSA-1024 test PKI, small enough to verify in the sandbox.
+// The P-256/P-384 and RSA-2048 PKIs and the captured public chains are
+// validated natively by `examples/x509.tuo`.
+// ----------------------------------------------------------------------------
+
+fn cert(in hex: Str) -> x509::certificate::Certificate {
+    x509::certificate::parse(ec::field::hex_bytes(hex))
+}
+
+fn list_of(in a: Str, in b: Str) -> Array[Int] {
+    var list = std::array::empty();
+    if std::str::len(a) > 0 {
+        push_entry(list, ec::field::hex_bytes(a));
+    }
+    if std::str::len(b) > 0 {
+        push_entry(list, ec::field::hex_bytes(b));
+    }
+    list
+}
+
+fn tampered_leaf() -> Str {
+    // The last byte of the signature, flipped: still a certificate, not
+    // the intermediate's signature.
+    x509::fixture::rsa_leaf()
+}
+
+fn flipped_last(in list: Array[Int]) -> Array[Int] {
+    var out = std::array::empty();
+    let n = std::array::len(list);
+    var i = 0;
+    while i < n {
+        var b = std::array::get(list, i);
+        if i == n - 1 {
+            b = b ^ 1;
+        }
+        std::array::push(out, b);
+        i = i + 1;
+    }
+    out
+}
+
+fn now() -> Int {
+    1800000000
+}
+
+spec push_entry {
+    let list = list_of(x509::fixture::rsa_leaf(), x509::fixture::rsa_int());
+    then entry_count(list) == 2;
+    then std::array::len(entry_at(list, 0)) == std::array::len(ec::field::hex_bytes(x509::fixture::rsa_leaf()));
+    then std::array::len(entry_at(list, 1)) == std::array::len(ec::field::hex_bytes(x509::fixture::rsa_int()));
+    then std::array::len(entry_at(list, 2)) == 0;
+    then entry_count(std::array::empty()) == 0;
+    then entry_count(ec::field::hex_bytes("000005aa")) == 0;
+}
+
+spec describe {
+    then describe(ok()) == "ok";
+    then describe(untrusted()) == "no path to a trusted root";
+    then describe(9) == "unknown";
+}
+
+spec issued {
+    then issued(cert(x509::fixture::rsa_leaf()), cert(x509::fixture::rsa_int()));
+    then issued(cert(x509::fixture::rsa_int()), cert(x509::fixture::rsa_root()));
+    then issued(cert(x509::fixture::rsa_root()), cert(x509::fixture::rsa_root()));
+    then !issued(cert(x509::fixture::rsa_leaf()), cert(x509::fixture::rsa_root()));
+    then !issued(cert(x509::fixture::rsa_leaf()), cert(x509::fixture::ec_int()));
+    then !issued(x509::certificate::bad(), cert(x509::fixture::rsa_int()));
+}
+
+spec validate {
+    let chain = list_of(x509::fixture::rsa_leaf(), x509::fixture::rsa_int());
+    let roots = list_of(x509::fixture::rsa_root(), "");
+    then validate(chain, roots, "localhost", now()) == ok();
+    then validate(chain, roots, "EXAMPLE.test", now()) == ok();
+    then validate(chain, roots, "a.wild.test", now()) == ok();
+    then validate(chain, roots, "wild.test", now()) == name_mismatch();
+    then validate(chain, roots, "example.com", now()) == name_mismatch();
+    then validate(chain, roots, "localhost", 1700000000) == not_current();
+    then validate(chain, roots, "localhost", 2500000000) == not_current();
+    then validate(chain, list_of(x509::fixture::ec_root(), ""), "localhost", now()) == untrusted();
+    then validate(chain, std::array::empty(), "localhost", now()) == untrusted();
+    then validate(list_of(x509::fixture::rsa_leaf(), ""), roots, "localhost", now()) == untrusted();
+    then validate(flipped_last(list_of(x509::fixture::rsa_leaf(), "")), list_of(x509::fixture::rsa_int(), ""), "localhost", now()) == untrusted();
+    then validate(list_of(x509::fixture::rsa_leaf(), ""), list_of(x509::fixture::rsa_int(), ""), "localhost", now()) == ok();
+    then validate(list_of(x509::fixture::rsa_int(), ""), roots, "localhost", now()) == name_mismatch();
+    then validate(std::array::empty(), roots, "localhost", now()) == no_leaf();
+    then validate(ec::field::hex_bytes("0000023000"), roots, "localhost", now()) == no_leaf();
+}

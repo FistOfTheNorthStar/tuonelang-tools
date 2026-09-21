@@ -1,0 +1,207 @@
+// tls::clock — the time of day, from an SNTP server.
+//
+// Certificate validity is a pair of instants, and checking it needs the
+// current one. tuonelang's `std::rt::now_nanos` is a *monotonic* clock
+// with an arbitrary epoch — right for timeouts, useless for dates — and
+// there is no wall-clock primitive. So the client asks the network, the
+// way an embedded TLS stack without a battery-backed clock does: one SNTP
+// request (RFC 4330) over the UDP primitives `dns::resolver` already
+// proved, one 48-byte reply, and the transmit timestamp is the answer.
+//
+// The default server is Cloudflare's anycast NTP address; a caller that
+// already knows the time — a server process with a real clock, or an
+// oracle checking a captured chain — passes it straight to
+// `x509::chain::validate` and never comes here. A failed query yields 0,
+// and `http::client` then refuses `https://` rather than guess.
+//
+// NTP's seconds count from 1900 and wrap in 2036; the era is resolved the
+// way RFC 4330 §3 says, so the decode is correct until 2104.
+
+module tls::clock;
+
+/// The default SNTP server: `time.cloudflare.com`'s anycast address.
+///
+/// # Example
+/// ```tuo
+/// let s = tls::clock::default_server(); // "162.159.200.1"
+/// ```
+pub fn default_server() -> Str {
+    "162.159.200.1"
+}
+
+/// The NTP port.
+///
+/// # Example
+/// ```tuo
+/// let p = tls::clock::port(); // 123
+/// ```
+pub fn port() -> Int {
+    123
+}
+
+/// Seconds from the NTP epoch (1900) to the Unix epoch (1970).
+///
+/// # Example
+/// ```tuo
+/// let d = tls::clock::epoch_offset(); // 2208988800
+/// ```
+pub fn epoch_offset() -> Int {
+    2208988800
+}
+
+/// A client request: leap 0, version 4, mode 3, and nothing else set.
+///
+/// # Example
+/// ```tuo
+/// let packet = tls::clock::request(); // 48 bytes, first is 0x23
+/// ```
+pub fn request() -> Array[Int] {
+    var out = std::array::empty();
+    std::array::push(out, 35);
+    var i = 1;
+    while i < 48 {
+        std::array::push(out, 0);
+        i = i + 1;
+    }
+    out
+}
+
+/// The Unix seconds a server reply's transmit timestamp names, or 0 for
+/// anything that is not a usable reply: too short, not mode 4, a
+/// kiss-o'-death (stratum 0) or unsynchronised (stratum 16+) server, or
+/// a zero timestamp. Timestamps with the top bit clear are read as NTP
+/// era 1 (2036 onward).
+///
+/// # Example
+/// ```tuo
+/// let now = tls::clock::decode(reply);
+/// ```
+pub fn decode(in reply: Array[Int]) -> Int {
+    if std::array::len(reply) < 48 {
+        return 0;
+    }
+    let first = std::array::get(reply, 0);
+    if (first & 7) != 4 {
+        return 0;
+    }
+    let version = (first >> 3) & 7;
+    if version < 3 || version > 4 {
+        return 0;
+    }
+    let stratum = std::array::get(reply, 1);
+    if stratum < 1 || stratum > 15 {
+        return 0;
+    }
+    let seconds = (std::array::get(reply, 40) << 24) | (std::array::get(reply, 41) << 16) | (std::array::get(reply, 42) << 8) | std::array::get(reply, 43);
+    if seconds == 0 {
+        return 0;
+    }
+    if seconds >= 2147483648 {
+        seconds - epoch_offset()
+    } else {
+        seconds + 2085978496
+    }
+}
+
+/// How many times `now_unix` asks before giving up: UDP drops packets,
+/// and one lost reply must not refuse an `https://` request.
+///
+/// # Example
+/// ```tuo
+/// let n = tls::clock::attempts(); // 3
+/// ```
+pub fn attempts() -> Int {
+    3
+}
+
+/// EFFECT: ask `server` for the time, up to `attempts` times; the Unix
+/// seconds it reports, or 0 when nothing usable arrived within
+/// `timeout_ms` of any attempt.
+///
+/// # Example
+/// ```tuo
+/// let now = tls::clock::now_unix(tls::clock::default_server(), 3000);
+/// ```
+pub fn now_unix(in server: Str, take timeout_ms: Int) -> Int {
+    var tries = 0;
+    while tries < attempts() {
+        let now = query_once(server, timeout_ms);
+        if now > 0 {
+            return now;
+        }
+        tries = tries + 1;
+    }
+    0
+}
+
+/// EFFECT: one SNTP exchange with `server`; the Unix seconds it reports,
+/// or 0.
+///
+/// # Example
+/// ```tuo
+/// let now = tls::clock::query_once(tls::clock::default_server(), 3000);
+/// ```
+pub fn query_once(in server: Str, take timeout_ms: Int) -> Int {
+    let sock = std::net::udp_bind(0);
+    if sock < 0 {
+        return 0;
+    }
+    if std::net::udp_send(sock, server, port(), std::string::as_str(std::crypto::str_of_bytes(request()))) < 0 {
+        let _ = std::net::close(sock);
+        return 0;
+    }
+    let len = std::net::udp_recv(sock, timeout_ms);
+    var reply = std::array::empty();
+    var i = 0;
+    while i < len {
+        std::array::push(reply, std::net::udp_byte_at(sock, i));
+        i = i + 1;
+    }
+    let _ = std::net::close(sock);
+    decode(reply)
+}
+
+// --- Specs ------------------------------------------------------------------
+
+fn reply(take first: Int, take stratum: Int, take b40: Int, take b41: Int, take b42: Int, take b43: Int) -> Array[Int] {
+    var out = std::array::empty();
+    std::array::push(out, first);
+    std::array::push(out, stratum);
+    var i = 2;
+    while i < 48 {
+        if i == 40 {
+            std::array::push(out, b40);
+        } else if i == 41 {
+            std::array::push(out, b41);
+        } else if i == 42 {
+            std::array::push(out, b42);
+        } else if i == 43 {
+            std::array::push(out, b43);
+        } else {
+            std::array::push(out, 0);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+spec request {
+    then std::array::len(request()) == 48;
+    then std::array::get(request(), 0) == 35;
+    then std::array::get(request(), 1) == 0;
+    then std::array::get(request(), 47) == 0;
+}
+
+spec decode {
+    // 0xd0000000 seconds since 1900 is 1280672128 since 1970 (2010-08-01).
+    then decode(reply(36, 2, 208, 0, 0, 0)) == 1280672128;
+    then decode(reply(28, 15, 208, 0, 0, 0)) == 1280672128;
+    // Era 1: the top bit clear means 2036 onward.
+    then decode(reply(36, 2, 0, 0, 0, 1)) == 2085978497;
+    then decode(reply(36, 2, 0, 0, 0, 0)) == 0;
+    then decode(reply(36, 0, 208, 0, 0, 0)) == 0;
+    then decode(reply(36, 16, 208, 0, 0, 0)) == 0;
+    then decode(reply(35, 2, 208, 0, 0, 0)) == 0;
+    then decode(reply(12, 2, 208, 0, 0, 0)) == 0;
+    then decode(std::array::empty()) == 0;
+}

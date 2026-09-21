@@ -1,0 +1,86 @@
+// examples/https_live — `https://` to the backend's real integrations.
+//
+// `examples/x509.tuo` validates captured chains at a fixed date. This
+// program does the whole thing live: learns the time from an SNTP
+// server, resolves the names, completes TLS 1.3 handshakes with public
+// servers, validates their chains against `x509::roots`, and reads an
+// HTTP response through the session. The hosts are the ones the backend
+// talks to (Stripe, Sentry, Cloudflare), so passing here is what
+// "reaches Stripe, R2, and Sentry" means.
+//
+//     tuo run examples/https_live.tuo src/http/*.tuo src/tls/*.tuo src/dns/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/std_*.tuo
+//
+// Needs outbound UDP 53 and 123 and TCP 443. One line per check; exit is
+// the failure count.
+
+module https_live;
+
+fn timeout() -> Int {
+    15000
+}
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn status_line(in label: Str, take status: Int) -> Int {
+    var line = std::string::empty();
+    std::str::push(line, "      ");
+    std::str::push(line, label);
+    std::str::push(line, " -> ");
+    std::str::push(line, std::string::as_str(std::str::to_string(status)));
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    0
+}
+
+fn main() -> Int {
+    var failed = 0;
+    let t = timeout();
+
+    let now = tls::clock::now_unix(tls::clock::default_server(), t);
+    failed = failed + report("SNTP from time.cloudflare.com reports a time after the capture date", now > 1789430400);
+    var line = std::string::empty();
+    std::str::push(line, "      now = ");
+    std::str::push(line, std::string::as_str(x509::time::render(now)));
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+
+    let stripe = http::client::get("https://api.stripe.com/v1/charges", t);
+    let _ = status_line("GET https://api.stripe.com/v1/charges", stripe.status);
+    failed = failed + report("api.stripe.com answers over TLS 1.3 (401 without a key, RSA-PSS CertificateVerify)", stripe.ok && stripe.status == 401);
+    failed = failed + report("and the body is Stripe's JSON error", std::str::contains(std::string::as_str(stripe.body), "\"error\""));
+
+    let sentry = http::client::get("https://sentry.io/", t);
+    let _ = status_line("GET https://sentry.io/", sentry.status);
+    failed = failed + report("sentry.io answers over TLS 1.3, redirects followed", sentry.ok && sentry.status >= 200 && sentry.status < 400);
+
+    let cf = http::client::get("https://api.cloudflare.com/client/v4/", t);
+    let _ = status_line("GET https://api.cloudflare.com/client/v4/", cf.status);
+    failed = failed + report("api.cloudflare.com answers over TLS 1.3 (ECDSA P-256 CertificateVerify, P-384 root)", cf.ok && cf.status >= 200 && cf.status < 500);
+
+    let www = http::client::get("https://www.cloudflare.com/", t);
+    let _ = status_line("GET https://www.cloudflare.com/", www.status);
+    failed = failed + report("www.cloudflare.com answers over TLS 1.3 (Let's Encrypt, ISRG Root X2)", www.ok && www.status >= 200 && www.status < 400);
+
+    let pinned = http::client::get_pinned("https://sentry.io/", std::hkdf::zeros(32), t);
+    failed = failed + report("a public server is refused under an Ed25519 pin it cannot match", !pinned.ok);
+
+    let no_roots = http::client::get_with_roots("https://sentry.io/", std::array::empty(), t);
+    failed = failed + report("and with an empty root store", !no_roots.ok);
+
+    failed
+}

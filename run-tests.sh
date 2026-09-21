@@ -2,13 +2,16 @@
 # run-tests.sh — the validation suite for tuonelang-python-tools.
 #
 #   ./run-tests.sh          front end, specs, formatting, the native Argon2
-#                           oracle, and the HTTP and TLS loopback oracles
-#                           (no network)
+#                           and X.509 oracles, and the HTTP, web, and TLS
+#                           loopback oracles (no network)
 #   ./run-tests.sh --live   also resolve real names against a public DNS
 #                           server, fetch from public HTTP servers, complete
-#                           a TLS 1.3 handshake with openssl s_server, and
-#                           drive the Redis client against the docker compose
-#                           redis on 127.0.0.1:6380
+#                           TLS 1.3 handshakes with three openssl s_server
+#                           instances (Ed25519 pinned, P-256 and RSA-2048
+#                           chains), fetch https:// from Stripe, Sentry, and
+#                           Cloudflare with chains validated against the root
+#                           store, and drive the Redis client against the
+#                           docker compose redis on 127.0.0.1:6380
 #
 # TUO may be set to a `tuo` binary; otherwise the one on PATH is used.
 #
@@ -45,13 +48,23 @@ REDIS_SRC=(src/redis/resp.tuo src/redis/command.tuo src/redis/url.tuo
 CRYPTO_STD=(src/std_tls.tuo src/std_hkdf.tuo src/std_chacha.tuo src/std_x25519.tuo
             src/std_ed25519.tuo src/std_der.tuo src/std_sha512.tuo src/std_bignum.tuo
             src/std_ct.tuo src/std_crypto.tuo)
+X509_SRC=(src/x509/chain.tuo src/x509/roots.tuo src/x509/certificate.tuo
+          src/x509/fixture.tuo src/x509/time.tuo src/x509/name.tuo
+          src/ec/field.tuo src/ec/curve.tuo src/ec/p256.tuo src/ec/p384.tuo
+          src/ec/ecdsa.tuo src/rsa/verify.tuo src/crypto/sha384.tuo
+          src/tls/handshake.tuo src/tls/fixture.tuo
+          "${CRYPTO_STD[@]}" src/std_str.tuo src/std_bits.tuo)
 HTTP_SRC=(src/http/message.tuo src/http/fixture.tuo src/http/url.tuo
           src/http/client.tuo src/http/server.tuo
-          src/tls/handshake.tuo src/tls/client.tuo src/tls/fixture.tuo
+          src/tls/client.tuo src/tls/clock.tuo
           src/dns/wire.tuo src/dns/name.tuo src/dns/message.tuo src/dns/record.tuo
           src/dns/resolver.tuo
-          "${CRYPTO_STD[@]}"
-          src/std_str.tuo src/std_net.tuo src/std_bits.tuo src/std_sync.tuo)
+          "${X509_SRC[@]}"
+          src/std_net.tuo src/std_sync.tuo)
+
+WEB_SRC=(src/web/json.tuo src/web/coerce.tuo src/web/errors.tuo src/web/schema.tuo
+         src/web/query.tuo src/web/route.tuo src/web/request.tuo src/web/response.tuo
+         src/web/fixture.tuo src/web/demo.tuo)
 
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
@@ -75,17 +88,30 @@ step "Redis: front end (check)"
 step "Redis: specs (verify)"
 "$TUO" verify "${REDIS_SRC[@]}"; check $? "redis verify"
 
+step "X.509 and signatures: front end (check)"
+"$TUO" check "${X509_SRC[@]}" examples/x509.tuo; check $? "x509 check"
+
+step "X.509 and signatures: specs (verify)"
+"$TUO" verify "${X509_SRC[@]}"; check $? "x509 verify"
+
 step "HTTP and TLS: front end (check)"
-"$TUO" check "${HTTP_SRC[@]}" examples/http.tuo examples/http_live.tuo examples/tls.tuo examples/tls_openssl.tuo; check $? "http+tls check"
+"$TUO" check "${HTTP_SRC[@]}" examples/http.tuo examples/http_live.tuo examples/tls.tuo examples/tls_openssl.tuo examples/https_live.tuo; check $? "http+tls check"
 
 step "HTTP and TLS: specs (verify)"
 "$TUO" verify "${HTTP_SRC[@]}"; check $? "http+tls verify"
+
+step "Web: front end (check)"
+"$TUO" check "${WEB_SRC[@]}" "${HTTP_SRC[@]}" examples/web.tuo; check $? "web check"
+
+# Only the web modules and what they stand on: the HTTP group's specs ran above.
+step "Web: specs (verify), all 107 captured FastAPI responses replayed"
+"$TUO" verify "${WEB_SRC[@]}" src/http/message.tuo src/http/fixture.tuo src/http/url.tuo src/std_str.tuo src/std_bits.tuo; check $? "web verify"
 
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
 # to `crates/tuo-stdlib/src/std/`.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/tls/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.
@@ -99,6 +125,20 @@ else
   check 1 "argon2 oracle"
 fi
 
+# ECDSA on the real curves and the chain walks over real certificates
+# exceed the sandbox's fuel: RFC 6979's signatures, the P-256/P-384 and
+# RSA-2048 test PKIs, and chains captured from Cloudflare, Sentry, and
+# Stripe, validated against the root store at the capture date. No network.
+step "X.509: native oracle (RFC 6979, the test PKIs, captured public chains)"
+"$TUO" run examples/x509.tuo "${X509_SRC[@]}"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  check 0 "x509 oracle (all checks agreed)"
+else
+  echo "x509 oracle exited $rc — that many checks disagreed"
+  check 1 "x509 oracle"
+fi
+
 # The HTTP server and client prove each other over loopback, in one process.
 step "HTTP: loopback oracle (server and client in one process)"
 "$TUO" run examples/http.tuo "${HTTP_SRC[@]}"
@@ -108,6 +148,18 @@ if [ "$rc" -eq 0 ]; then
 else
   echo "http oracle exited $rc — that many checks disagreed"
   check 1 "http oracle"
+fi
+
+# The FastAPI-shaped application behind http::server, every captured case
+# replayed down one kept-alive connection.
+step "Web: loopback oracle (web::demo behind http::server)"
+"$TUO" run examples/web.tuo "${WEB_SRC[@]}" "${HTTP_SRC[@]}"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  check 0 "web oracle (all checks agreed)"
+else
+  echo "web oracle exited $rc — that many checks disagreed"
+  check 1 "web oracle"
 fi
 
 # The TLS client and the catalog's TLS server prove each other over loopback.
@@ -142,16 +194,25 @@ if [ "$live" -eq 1 ]; then
     check 1 "http live"
   fi
 
-  # The TLS interop oracle: an OpenSSL server with the test certificate.
-  step "TLS: live — against openssl s_server"
+  # The TLS interop oracle: three OpenSSL servers — the pinned Ed25519 test
+  # certificate, the P-256 chain, and the RSA-2048 chain (examples/tls-test).
+  step "TLS: live — against openssl s_server (pinned, P-256 chain, RSA chain)"
   if command -v openssl >/dev/null 2>&1; then
     openssl s_server -tls1_3 -cert examples/tls-test/cert.pem -key examples/tls-test/key.pem \
       -accept 4433 -www -naccept 2 -quiet >/dev/null 2>&1 &
     openssl_pid=$!
+    openssl s_server -tls1_3 -cert examples/tls-test/ec-leaf.pem -key examples/tls-test/ec-leaf.key \
+      -cert_chain examples/tls-test/ec-int.pem -accept 4434 -www -naccept 2 -quiet >/dev/null 2>&1 &
+    openssl_ec_pid=$!
+    openssl s_server -tls1_3 -cert examples/tls-test/big-leaf.pem -key examples/tls-test/big-leaf.key \
+      -cert_chain examples/tls-test/big-int.pem -accept 4435 -www -naccept 1 -quiet >/dev/null 2>&1 &
+    openssl_big_pid=$!
     sleep 1
     "$TUO" run examples/tls_openssl.tuo "${HTTP_SRC[@]}"
     rc=$?
-    kill "$openssl_pid" >/dev/null 2>&1; wait "$openssl_pid" 2>/dev/null
+    for pid in "$openssl_pid" "$openssl_ec_pid" "$openssl_big_pid"; do
+      kill "$pid" >/dev/null 2>&1; wait "$pid" 2>/dev/null
+    done
     if [ "$rc" -eq 0 ]; then
       check 0 "tls openssl (all checks agreed)"
     else
@@ -160,6 +221,16 @@ if [ "$live" -eq 1 ]; then
     fi
   else
     echo "no openssl on PATH; skipping"
+  fi
+
+  step "HTTPS: live — Stripe, Sentry, and Cloudflare through the root store"
+  "$TUO" run examples/https_live.tuo "${HTTP_SRC[@]}"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    check 0 "https live (all checks agreed)"
+  else
+    echo "https live exited $rc — that many checks disagreed"
+    check 1 "https live"
   fi
 
   # The Redis oracle needs shallowflaws's docker compose redis on 127.0.0.1:6380.

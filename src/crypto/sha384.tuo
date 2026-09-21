@@ -1,0 +1,186 @@
+// crypto::sha384 — SHA-384 (FIPS 180-4 §6.5), on `std::sha512`'s parts.
+//
+// SHA-384 is SHA-512 with different initial values and the last 128 bits
+// of the result dropped. The catalog's `std::sha512` exposes its padding,
+// message schedule, round constants, and 64-bit helpers, so only the
+// compression loop is restated here, seeded with §5.3.5's values. It is
+// needed because the CAs that sign P-384 intermediates — ISRG Root X2,
+// GTS Root R4, Let's Encrypt's YE2 — sign with `ecdsa-with-SHA384`.
+//
+// The 64-bit words are `Int` bit patterns: the initial values above 2^63
+// are assembled from 32-bit halves exactly as `std::sha512` does.
+
+module crypto::sha384;
+
+/// The high 32 bits of initial hash value `index`.
+///
+/// # Example
+/// ```tuo
+/// let h = crypto::sha384::initial_hi(0); // 0xcbbb9d5d
+/// ```
+pub fn initial_hi(take index: Int) -> Int {
+    var table = std::array::empty();
+    std::array::push(table, 3418070365);
+    std::array::push(table, 1654270250);
+    std::array::push(table, 2438529370);
+    std::array::push(table, 355462360);
+    std::array::push(table, 1731405415);
+    std::array::push(table, 2394180231);
+    std::array::push(table, 3675008525);
+    std::array::push(table, 1203062813);
+    if index < 0 || index >= std::array::len(table) {
+        return 0;
+    }
+    std::array::get(table, index)
+}
+
+/// The low 32 bits of initial hash value `index`.
+///
+/// # Example
+/// ```tuo
+/// let l = crypto::sha384::initial_lo(0); // 0xc1059ed8
+/// ```
+pub fn initial_lo(take index: Int) -> Int {
+    var table = std::array::empty();
+    std::array::push(table, 3238371032);
+    std::array::push(table, 914150663);
+    std::array::push(table, 812702999);
+    std::array::push(table, 4144912697);
+    std::array::push(table, 4290775857);
+    std::array::push(table, 1750603025);
+    std::array::push(table, 1694076839);
+    std::array::push(table, 3204075428);
+    if index < 0 || index >= std::array::len(table) {
+        return 0;
+    }
+    std::array::get(table, index)
+}
+
+/// Initial hash value `index` as a 64-bit pattern.
+///
+/// # Example
+/// ```tuo
+/// let h = crypto::sha384::initial(0);
+/// ```
+pub fn initial(take index: Int) -> Int {
+    (initial_hi(index) << 32) | initial_lo(index)
+}
+
+/// The 48-byte SHA-384 digest of `message`.
+///
+/// # Example
+/// ```tuo
+/// let d = crypto::sha384::hash(bytes);
+/// ```
+pub fn hash(in message: Array[Int]) -> Array[Int] {
+    let padded = std::sha512::pad(message);
+    var h0 = initial(0);
+    var h1 = initial(1);
+    var h2 = initial(2);
+    var h3 = initial(3);
+    var h4 = initial(4);
+    var h5 = initial(5);
+    var h6 = initial(6);
+    var h7 = initial(7);
+    var block = 0;
+    let blocks = std::array::len(padded) / 128;
+    while block < blocks {
+        let base = block * 128;
+        var w = std::array::empty();
+        var t = 0;
+        while t < 16 {
+            std::array::push(w, std::sha512::word_at(padded, base + t * 8));
+            t = t + 1;
+        }
+        while t < 80 {
+            let s1 = std::sha512::small_sigma1(std::array::get(w, t - 2));
+            let w7 = std::array::get(w, t - 7);
+            let s0 = std::sha512::small_sigma0(std::array::get(w, t - 15));
+            let w16 = std::array::get(w, t - 16);
+            std::array::push(w, std::sha512::add64(std::sha512::add64(s1, w7), std::sha512::add64(s0, w16)));
+            t = t + 1;
+        }
+        var a = h0;
+        var b = h1;
+        var c = h2;
+        var d = h3;
+        var e = h4;
+        var f = h5;
+        var g = h6;
+        var h = h7;
+        var round = 0;
+        while round < 80 {
+            let t1 = std::sha512::add64(std::sha512::add64(std::sha512::add64(h, std::sha512::big_sigma1(e)), std::sha512::ch(e, f, g)), std::sha512::add64(std::sha512::round_constant(round), std::array::get(w, round)));
+            let t2 = std::sha512::add64(std::sha512::big_sigma0(a), std::sha512::maj(a, b, c));
+            h = g;
+            g = f;
+            f = e;
+            e = std::sha512::add64(d, t1);
+            d = c;
+            c = b;
+            b = a;
+            a = std::sha512::add64(t1, t2);
+            round = round + 1;
+        }
+        h0 = std::sha512::add64(h0, a);
+        h1 = std::sha512::add64(h1, b);
+        h2 = std::sha512::add64(h2, c);
+        h3 = std::sha512::add64(h3, d);
+        h4 = std::sha512::add64(h4, e);
+        h5 = std::sha512::add64(h5, f);
+        h6 = std::sha512::add64(h6, g);
+        h7 = std::sha512::add64(h7, h);
+        block = block + 1;
+    }
+    var out = std::array::empty();
+    let _ = std::sha512::push_word(out, h0);
+    let _ = std::sha512::push_word(out, h1);
+    let _ = std::sha512::push_word(out, h2);
+    let _ = std::sha512::push_word(out, h3);
+    let _ = std::sha512::push_word(out, h4);
+    let _ = std::sha512::push_word(out, h5);
+    out
+}
+
+// --- Specs: FIPS 180-4's published digests, and one from Python -------------
+
+fn ascii(in text: Str) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < std::str::len(text) {
+        std::array::push(out, std::str::byte_at(text, i));
+        i = i + 1;
+    }
+    out
+}
+
+fn hex_is(in data: Array[Int], in expected: Str) -> Bool {
+    std::string::as_str(std::crypto::to_hex(data)) == expected
+}
+
+fn many_a(take count: Int) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < count {
+        std::array::push(out, 97);
+        i = i + 1;
+    }
+    out
+}
+
+spec initial {
+    then initial_hi(0) == 3418070365;
+    then initial_lo(0) == 3238371032;
+    then initial_hi(7) == 1203062813;
+    then initial_lo(7) == 3204075428;
+    then initial_hi(8) == 0;
+    then initial(7) == (1203062813 << 32) | 3204075428;
+}
+
+spec hash {
+    then std::array::len(hash(std::array::empty())) == 48;
+    then hex_is(hash(std::array::empty()), "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b");
+    then hex_is(hash(ascii("abc")), "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7");
+    then hex_is(hash(ascii("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu")), "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039");
+    then hex_is(hash(many_a(112)), "187d4e07cb306103c69967bf544d0dfbe9042577599c73c330abc0cb64c61236d5ed565ee19119d8c31779a38f791fcd");
+}

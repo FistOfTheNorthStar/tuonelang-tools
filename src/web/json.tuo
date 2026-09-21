@@ -1,0 +1,1059 @@
+// web::json — a JSON reader that remembers where things were, and a writer.
+//
+// The catalog's `std::json` parses into an arena of decoded values with
+// every number a `Float`. A validation layer needs two things that loses.
+// It must tell `30` from `30.0` — Pydantic accepts both for an `int` field
+// but refuses `30.5`, and echoes the offending input back exactly — and it
+// must say *where* a malformed body went wrong, because FastAPI's 422 for
+// invalid JSON carries the character offset and CPython's message. So this
+// reader keeps spans into the source instead of values: a node is a kind
+// and a byte range, a number is its own text, and a string is decoded on
+// demand.
+//
+// THE GRAMMAR AND THE ERRORS ARE CPYTHON'S. The scanner is structured like
+// `json.decoder` so that the first error it meets is the one CPython
+// meets, at the same position, under the same name: "Expecting value",
+// "Expecting ',' delimiter", "Illegal trailing comma before end of
+// object", "Unterminated string starting at", and the rest. The specs pin
+// each against what FastAPI 0.141 on Python 3.14 returned. Two deliberate
+// differences: `NaN` and `Infinity`, which CPython accepts and JSON does
+// not, are refused here; and nesting deeper than `max_depth` is an error
+// instead of a `RecursionError`.
+//
+// TOTAL ON HOSTILE INPUT. A body arrives before anything is authenticated;
+// every read is bounds-checked, recursion is bounded, and failure is a
+// document with `ok` false, never a trap.
+//
+// The arena is flat, `stride()` ints per node in depth-first pre-order:
+// kind, start, end, key start, key end, next sibling, subtree end. A
+// container's first child, when it has one, is the node after it.
+
+module web::json;
+
+/// A parsed document. `ok` false carries `error` (CPython's message) and
+/// `error_at` (a byte offset into `source`).
+pub struct Doc {
+    ok: Bool,
+    error: String,
+    error_at: Int,
+    source: String,
+    nodes: Array[Int],
+}
+
+/// Ints per node in the arena.
+///
+/// # Example
+/// ```tuo
+/// let s = web::json::stride(); // 7
+/// ```
+pub fn stride() -> Int {
+    7
+}
+
+/// The deepest nesting accepted.
+///
+/// # Example
+/// ```tuo
+/// let d = web::json::max_depth(); // 64
+/// ```
+pub fn max_depth() -> Int {
+    64
+}
+
+/// The kind of `null`.
+///
+/// # Example
+/// ```tuo
+/// let k = web::json::kind_null(); // 0
+/// ```
+pub fn kind_null() -> Int {
+    0
+}
+
+/// The kind of `false`.
+///
+/// # Example
+/// ```tuo
+/// let k = web::json::kind_false(); // 1
+/// ```
+pub fn kind_false() -> Int {
+    1
+}
+
+/// The kind of `true`.
+///
+/// # Example
+/// ```tuo
+/// let k = web::json::kind_true(); // 2
+/// ```
+pub fn kind_true() -> Int {
+    2
+}
+
+/// The kind of a number written without fraction or exponent.
+///
+/// # Example
+/// ```tuo
+/// let k = web::json::kind_int(); // 3
+/// ```
+pub fn kind_int() -> Int {
+    3
+}
+
+/// The kind of a number written with a fraction or an exponent.
+///
+/// # Example
+/// ```tuo
+/// let k = web::json::kind_float(); // 4
+/// ```
+pub fn kind_float() -> Int {
+    4
+}
+
+/// The kind of a string.
+///
+/// # Example
+/// ```tuo
+/// let k = web::json::kind_string(); // 5
+/// ```
+pub fn kind_string() -> Int {
+    5
+}
+
+/// The kind of an array.
+///
+/// # Example
+/// ```tuo
+/// let k = web::json::kind_array(); // 6
+/// ```
+pub fn kind_array() -> Int {
+    6
+}
+
+/// The kind of an object.
+///
+/// # Example
+/// ```tuo
+/// let k = web::json::kind_object(); // 7
+/// ```
+pub fn kind_object() -> Int {
+    7
+}
+
+// ----------------------------------------------------------------------------
+// The scanner.
+// ----------------------------------------------------------------------------
+
+fn byte_at(in s: String, take i: Int) -> Int {
+    if i < 0 || i >= std::string::len(s) {
+        return 0 - 1;
+    }
+    std::string::byte_at(s, i)
+}
+
+fn skip_ws(in s: String, take from: Int) -> Int {
+    var i = from;
+    var going = true;
+    while going {
+        let b = byte_at(s, i);
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            i = i + 1;
+        } else {
+            going = false;
+        }
+    }
+    i
+}
+
+fn is_digit(take b: Int) -> Bool {
+    b >= 48 && b <= 57
+}
+
+fn is_hex(take b: Int) -> Bool {
+    is_digit(b) || (b >= 97 && b <= 102) || (b >= 65 && b <= 70)
+}
+
+/// Record the first error and return the failure signal.
+fn fail(mut d: Doc, in message: Str, take at: Int) -> Int {
+    if d.ok {
+        d.ok = false;
+        d.error = std::string::from_str(message);
+        d.error_at = at;
+    }
+    0 - 1
+}
+
+/// Append a node and return its index.
+fn push_node(mut d: Doc, take kind: Int, take start: Int, take end: Int, take key_start: Int, take key_end: Int) -> Int {
+    let index = std::array::len(d.nodes) / stride();
+    std::array::push(d.nodes, kind);
+    std::array::push(d.nodes, start);
+    std::array::push(d.nodes, end);
+    std::array::push(d.nodes, key_start);
+    std::array::push(d.nodes, key_end);
+    std::array::push(d.nodes, 0 - 1);
+    std::array::push(d.nodes, index + 1);
+    index
+}
+
+fn set_field(mut d: Doc, take node: Int, take field: Int, take value: Int) {
+    std::array::set(d.nodes, node * stride() + field, value);
+}
+
+/// The offset of the closing quote of the string whose opening quote is
+/// at `open`, or the failure signal.
+fn scan_string(mut d: Doc, take open: Int) -> Int {
+    var i = open + 1;
+    let n = std::string::len(d.source);
+    while i < n {
+        let b = std::string::byte_at(d.source, i);
+        if b == 34 {
+            return i;
+        }
+        if b < 32 {
+            return fail(d, "Invalid control character at", i);
+        }
+        if b == 92 {
+            let esc = byte_at(d.source, i + 1);
+            if esc < 0 {
+                return fail(d, "Unterminated string starting at", open);
+            }
+            if esc == 117 {
+                var k = 0;
+                while k < 4 {
+                    if !is_hex(byte_at(d.source, i + 2 + k)) {
+                        return fail(d, "Invalid \\uXXXX escape", i);
+                    }
+                    k = k + 1;
+                }
+                i = i + 6;
+            } else {
+                if esc != 34 && esc != 92 && esc != 47 && esc != 98 && esc != 102 && esc != 110 && esc != 114 && esc != 116 {
+                    return fail(d, "Invalid \\escape", i);
+                }
+                i = i + 2;
+            }
+        } else {
+            i = i + 1;
+        }
+    }
+    fail(d, "Unterminated string starting at", open)
+}
+
+/// The end of the number starting at `at`, by CPython's pattern, or `at`
+/// itself when no number starts there. `kind_float` is recorded through
+/// the return of `number_is_float`.
+fn number_end(in s: String, take at: Int) -> Int {
+    var i = at;
+    if byte_at(s, i) == 45 {
+        i = i + 1;
+    }
+    if byte_at(s, i) == 48 {
+        i = i + 1;
+    } else if is_digit(byte_at(s, i)) {
+        while is_digit(byte_at(s, i)) {
+            i = i + 1;
+        }
+    } else {
+        return at;
+    }
+    if byte_at(s, i) == 46 && is_digit(byte_at(s, i + 1)) {
+        i = i + 1;
+        while is_digit(byte_at(s, i)) {
+            i = i + 1;
+        }
+    }
+    let e = byte_at(s, i);
+    if e == 101 || e == 69 {
+        var j = i + 1;
+        let sign = byte_at(s, j);
+        if sign == 43 || sign == 45 {
+            j = j + 1;
+        }
+        if is_digit(byte_at(s, j)) {
+            while is_digit(byte_at(s, j)) {
+                j = j + 1;
+            }
+            i = j;
+        }
+    }
+    i
+}
+
+fn span_is_float(in s: String, take from: Int, take to: Int) -> Bool {
+    var i = from;
+    while i < to {
+        let b = std::string::byte_at(s, i);
+        if b == 46 || b == 101 || b == 69 {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn literal_at(in s: String, take at: Int, in word: Str) -> Bool {
+    var i = 0;
+    while i < std::str::len(word) {
+        if byte_at(s, at + i) != std::str::byte_at(word, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// Parse the value at `at` (no leading whitespace). Returns the offset
+/// just past it, or the failure signal with the error recorded.
+fn parse_value(mut d: Doc, take at: Int, take key_start: Int, take key_end: Int, take depth: Int) -> Int {
+    let b = byte_at(d.source, at);
+    if b == 34 {
+        let close = scan_string(d, at);
+        if close < 0 {
+            return close;
+        }
+        let _ = push_node(d, kind_string(), at + 1, close, key_start, key_end);
+        return close + 1;
+    }
+    if b == 123 || b == 91 {
+        if depth >= max_depth() {
+            return fail(d, "Nesting too deep", at);
+        }
+        if b == 123 {
+            return parse_object(d, at, key_start, key_end, depth);
+        }
+        return parse_array(d, at, key_start, key_end, depth);
+    }
+    if literal_at(d.source, at, "null") {
+        let _ = push_node(d, kind_null(), at, at + 4, key_start, key_end);
+        return at + 4;
+    }
+    if literal_at(d.source, at, "true") {
+        let _ = push_node(d, kind_true(), at, at + 4, key_start, key_end);
+        return at + 4;
+    }
+    if literal_at(d.source, at, "false") {
+        let _ = push_node(d, kind_false(), at, at + 5, key_start, key_end);
+        return at + 5;
+    }
+    let end = number_end(d.source, at);
+    if end > at {
+        let kind = if span_is_float(d.source, at, end) {
+            kind_float()
+        } else {
+            kind_int()
+        };
+        let _ = push_node(d, kind, at, end, key_start, key_end);
+        return end;
+    }
+    fail(d, "Expecting value", at)
+}
+
+fn parse_array(mut d: Doc, take open: Int, take key_start: Int, take key_end: Int, take depth: Int) -> Int {
+    let me = push_node(d, kind_array(), open, open, key_start, key_end);
+    var at = skip_ws(d.source, open + 1);
+    if byte_at(d.source, at) == 93 {
+        set_field(d, me, 2, at + 1);
+        return at + 1;
+    }
+    var previous = 0 - 1;
+    var going = true;
+    while going {
+        let child = std::array::len(d.nodes) / stride();
+        let after = parse_value(d, at, 0 - 1, 0 - 1, depth + 1);
+        if after < 0 {
+            return after;
+        }
+        if previous >= 0 {
+            set_field(d, previous, 5, child);
+        }
+        previous = child;
+        at = skip_ws(d.source, after);
+        let next = byte_at(d.source, at);
+        if next == 93 {
+            going = false;
+        } else {
+            if next != 44 {
+                return fail(d, "Expecting ',' delimiter", at);
+            }
+            let comma = at;
+            at = skip_ws(d.source, at + 1);
+            if byte_at(d.source, at) == 93 {
+                return fail(d, "Illegal trailing comma before end of array", comma);
+            }
+        }
+    }
+    set_field(d, me, 2, at + 1);
+    set_field(d, me, 6, std::array::len(d.nodes) / stride());
+    at + 1
+}
+
+fn parse_object(mut d: Doc, take open: Int, take key_start: Int, take key_end: Int, take depth: Int) -> Int {
+    let me = push_node(d, kind_object(), open, open, key_start, key_end);
+    var at = skip_ws(d.source, open + 1);
+    if byte_at(d.source, at) == 125 {
+        set_field(d, me, 2, at + 1);
+        return at + 1;
+    }
+    if byte_at(d.source, at) != 34 {
+        return fail(d, "Expecting property name enclosed in double quotes", at);
+    }
+    var previous = 0 - 1;
+    var going = true;
+    while going {
+        let close = scan_string(d, at);
+        if close < 0 {
+            return close;
+        }
+        let ks = at + 1;
+        let ke = close;
+        at = skip_ws(d.source, close + 1);
+        if byte_at(d.source, at) != 58 {
+            return fail(d, "Expecting ':' delimiter", at);
+        }
+        at = skip_ws(d.source, at + 1);
+        let child = std::array::len(d.nodes) / stride();
+        let after = parse_value(d, at, ks, ke, depth + 1);
+        if after < 0 {
+            return after;
+        }
+        if previous >= 0 {
+            set_field(d, previous, 5, child);
+        }
+        previous = child;
+        at = skip_ws(d.source, after);
+        let next = byte_at(d.source, at);
+        if next == 125 {
+            going = false;
+        } else {
+            if next != 44 {
+                return fail(d, "Expecting ',' delimiter", at);
+            }
+            let comma = at;
+            at = skip_ws(d.source, at + 1);
+            if byte_at(d.source, at) != 34 {
+                if byte_at(d.source, at) == 125 {
+                    return fail(d, "Illegal trailing comma before end of object", comma);
+                }
+                return fail(d, "Expecting property name enclosed in double quotes", at);
+            }
+        }
+    }
+    set_field(d, me, 2, at + 1);
+    set_field(d, me, 6, std::array::len(d.nodes) / stride());
+    at + 1
+}
+
+/// Parse `text` as one JSON document.
+///
+/// # Example
+/// ```tuo
+/// let d = web::json::parse("{\"id\": 7}");
+/// ```
+pub fn parse(in text: Str) -> Doc {
+    var d = Doc { ok: true, error: std::string::empty(), error_at: 0, source: std::string::from_str(text), nodes: std::array::empty() };
+    let start = skip_ws(d.source, 0);
+    let after = parse_value(d, start, 0 - 1, 0 - 1, 0);
+    if after < 0 {
+        d.nodes = std::array::empty();
+        return d;
+    }
+    let end = skip_ws(d.source, after);
+    if end != std::string::len(d.source) {
+        let _ = fail(d, "Extra data", end);
+        d.nodes = std::array::empty();
+    }
+    d
+}
+
+/// The error position in characters rather than bytes, which is how
+/// CPython counts it: UTF-8 continuation bytes before it are not counted.
+///
+/// # Example
+/// ```tuo
+/// let pos = web::json::error_position(d);
+/// ```
+pub fn error_position(in d: Doc) -> Int {
+    var count = 0;
+    var i = 0;
+    while i < d.error_at && i < std::string::len(d.source) {
+        if (std::string::byte_at(d.source, i) & 192) != 128 {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    count
+}
+
+// ----------------------------------------------------------------------------
+// Reading the arena.
+// ----------------------------------------------------------------------------
+
+fn field(in d: Doc, take node: Int, take which: Int) -> Int {
+    let at = node * stride() + which;
+    if node < 0 || at >= std::array::len(d.nodes) {
+        return 0 - 1;
+    }
+    std::array::get(d.nodes, at)
+}
+
+/// The root node, 0, or -1 for a failed document.
+///
+/// # Example
+/// ```tuo
+/// let r = web::json::root(d);
+/// ```
+pub fn root(in d: Doc) -> Int {
+    if d.ok && std::array::len(d.nodes) > 0 {
+        0
+    } else {
+        0 - 1
+    }
+}
+
+/// The kind of `node`, or -1.
+///
+/// # Example
+/// ```tuo
+/// let k = web::json::kind_of(d, node);
+/// ```
+pub fn kind_of(in d: Doc, take node: Int) -> Int {
+    field(d, node, 0)
+}
+
+/// The first child of a container, or -1.
+///
+/// # Example
+/// ```tuo
+/// let c = web::json::first_child(d, node);
+/// ```
+pub fn first_child(in d: Doc, take node: Int) -> Int {
+    let kind = kind_of(d, node);
+    if kind != kind_array() && kind != kind_object() {
+        return 0 - 1;
+    }
+    if field(d, node, 6) > node + 1 {
+        node + 1
+    } else {
+        0 - 1
+    }
+}
+
+/// The next sibling of `node`, or -1.
+///
+/// # Example
+/// ```tuo
+/// let n = web::json::next_sibling(d, node);
+/// ```
+pub fn next_sibling(in d: Doc, take node: Int) -> Int {
+    field(d, node, 5)
+}
+
+/// How many children a container has.
+///
+/// # Example
+/// ```tuo
+/// let n = web::json::child_count(d, node);
+/// ```
+pub fn child_count(in d: Doc, take node: Int) -> Int {
+    var count = 0;
+    var child = first_child(d, node);
+    while child >= 0 {
+        count = count + 1;
+        child = next_sibling(d, child);
+    }
+    count
+}
+
+/// Child `index` of a container, or -1.
+///
+/// # Example
+/// ```tuo
+/// let item = web::json::child_at(d, node, 0);
+/// ```
+pub fn child_at(in d: Doc, take node: Int, take index: Int) -> Int {
+    var seen = 0;
+    var child = first_child(d, node);
+    while child >= 0 {
+        if seen == index {
+            return child;
+        }
+        seen = seen + 1;
+        child = next_sibling(d, child);
+    }
+    0 - 1
+}
+
+fn hex_value(take b: Int) -> Int {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    b - 55
+}
+
+fn hex4(in s: String, take at: Int) -> Int {
+    (hex_value(std::string::byte_at(s, at)) << 12) | (hex_value(std::string::byte_at(s, at + 1)) << 8) | (hex_value(std::string::byte_at(s, at + 2)) << 4) | hex_value(std::string::byte_at(s, at + 3))
+}
+
+fn push_utf8(mut out: String, take cp: Int) {
+    if cp < 128 {
+        std::string::push_byte(out, cp);
+    } else if cp < 2048 {
+        std::string::push_byte(out, 192 | (cp >> 6));
+        std::string::push_byte(out, 128 | (cp & 63));
+    } else if cp < 65536 {
+        std::string::push_byte(out, 224 | (cp >> 12));
+        std::string::push_byte(out, 128 | ((cp >> 6) & 63));
+        std::string::push_byte(out, 128 | (cp & 63));
+    } else {
+        std::string::push_byte(out, 240 | (cp >> 18));
+        std::string::push_byte(out, 128 | ((cp >> 12) & 63));
+        std::string::push_byte(out, 128 | ((cp >> 6) & 63));
+        std::string::push_byte(out, 128 | (cp & 63));
+    }
+}
+
+/// Decode the escaped span `from..to` of the source. A surrogate pair
+/// becomes its code point; a lone surrogate becomes U+FFFD.
+fn decoded(in s: String, take from: Int, take to: Int) -> String {
+    var out = std::string::empty();
+    var i = from;
+    while i < to {
+        let b = std::string::byte_at(s, i);
+        if b != 92 {
+            std::string::push_byte(out, b);
+            i = i + 1;
+        } else {
+            let esc = std::string::byte_at(s, i + 1);
+            if esc == 117 {
+                var cp = hex4(s, i + 2);
+                i = i + 6;
+                if cp >= 55296 && cp <= 56319 {
+                    if i + 6 <= to && std::string::byte_at(s, i) == 92 && std::string::byte_at(s, i + 1) == 117 {
+                        let low = hex4(s, i + 2);
+                        if low >= 56320 && low <= 57343 {
+                            cp = 65536 + ((cp - 55296) << 10) + (low - 56320);
+                            i = i + 6;
+                        } else {
+                            cp = 65533;
+                        }
+                    } else {
+                        cp = 65533;
+                    }
+                } else if cp >= 56320 && cp <= 57343 {
+                    cp = 65533;
+                }
+                push_utf8(out, cp);
+            } else {
+                if esc == 110 {
+                    std::string::push_byte(out, 10);
+                } else if esc == 116 {
+                    std::string::push_byte(out, 9);
+                } else if esc == 114 {
+                    std::string::push_byte(out, 13);
+                } else if esc == 98 {
+                    std::string::push_byte(out, 8);
+                } else if esc == 102 {
+                    std::string::push_byte(out, 12);
+                } else {
+                    std::string::push_byte(out, esc);
+                }
+                i = i + 2;
+            }
+        }
+    }
+    out
+}
+
+/// The decoded text of a string node; the source text of a number or
+/// literal; empty for a container.
+///
+/// # Example
+/// ```tuo
+/// let s = web::json::text_of(d, node);
+/// ```
+pub fn text_of(in d: Doc, take node: Int) -> String {
+    let kind = kind_of(d, node);
+    if kind < 0 || kind == kind_array() || kind == kind_object() {
+        return std::string::empty();
+    }
+    decoded(d.source, field(d, node, 1), field(d, node, 2))
+}
+
+/// The decoded key of an object member, or empty.
+///
+/// # Example
+/// ```tuo
+/// let k = web::json::key_of(d, node);
+/// ```
+pub fn key_of(in d: Doc, take node: Int) -> String {
+    let from = field(d, node, 3);
+    if from < 0 {
+        return std::string::empty();
+    }
+    decoded(d.source, from, field(d, node, 4))
+}
+
+/// The member of object `node` named `key`, or -1. A repeated key
+/// resolves to its last occurrence, as it does in Python.
+///
+/// # Example
+/// ```tuo
+/// let email = web::json::member(d, web::json::root(d), "email");
+/// ```
+pub fn member(in d: Doc, take node: Int, in key: Str) -> Int {
+    if kind_of(d, node) != kind_object() {
+        return 0 - 1;
+    }
+    var found = 0 - 1;
+    var child = first_child(d, node);
+    while child >= 0 {
+        if std::string::as_str(key_of(d, child)) == key {
+            found = child;
+        }
+        child = next_sibling(d, child);
+    }
+    found
+}
+
+// ----------------------------------------------------------------------------
+// Writing.
+// ----------------------------------------------------------------------------
+
+/// Append `text` as a JSON string token, escaped the way Python's
+/// `json.dumps(ensure_ascii=False)` escapes: quotes, backslashes, the
+/// short escapes, and `\u00XX` for other control characters.
+///
+/// # Example
+/// ```tuo
+/// web::json::push_string(out, "a\"b");
+/// ```
+pub fn push_string(mut out: String, in text: Str) {
+    let hex = "0123456789abcdef";
+    std::string::push_byte(out, 34);
+    var i = 0;
+    while i < std::str::len(text) {
+        let b = std::str::byte_at(text, i);
+        if b == 34 || b == 92 {
+            std::string::push_byte(out, 92);
+            std::string::push_byte(out, b);
+        } else if b == 10 {
+            std::string::append(out, "\\n");
+        } else if b == 13 {
+            std::string::append(out, "\\r");
+        } else if b == 9 {
+            std::string::append(out, "\\t");
+        } else if b == 8 {
+            std::string::append(out, "\\b");
+        } else if b == 12 {
+            std::string::append(out, "\\f");
+        } else if b < 32 {
+            std::string::append(out, "\\u00");
+            std::string::push_byte(out, std::str::byte_at(hex, b >> 4));
+            std::string::push_byte(out, std::str::byte_at(hex, b & 15));
+        } else {
+            std::string::push_byte(out, b);
+        }
+        i = i + 1;
+    }
+    std::string::push_byte(out, 34);
+}
+
+/// Append `"key":` to an object under construction, with a leading comma
+/// unless it is the first member.
+///
+/// # Example
+/// ```tuo
+/// web::json::push_key(out, "email");
+/// ```
+pub fn push_key(mut out: String, in key: Str) {
+    let n = std::string::len(out);
+    if n > 0 && std::string::byte_at(out, n - 1) != 123 {
+        std::string::push_byte(out, 44);
+    }
+    push_string(out, key);
+    std::string::push_byte(out, 58);
+}
+
+/// Append the decimal digits of `value`.
+///
+/// # Example
+/// ```tuo
+/// web::json::push_int(out, 0 - 42);
+/// ```
+pub fn push_int(mut out: String, take value: Int) {
+    if value < 0 {
+        std::string::push_byte(out, 45);
+    }
+    var digits = std::array::empty();
+    var v = value;
+    if v == 0 {
+        std::array::push(digits, 0);
+    }
+    while v != 0 {
+        let d = v % 10;
+        std::array::push(digits, if d < 0 {
+            0 - d
+        } else {
+            d
+        });
+        v = v / 10;
+    }
+    var i = std::array::len(digits) - 1;
+    while i >= 0 {
+        std::string::push_byte(out, 48 + std::array::get(digits, i));
+        i = i - 1;
+    }
+}
+
+/// Append `node` and its subtree as compact JSON — the form FastAPI echoes
+/// an offending input in. Numbers keep their source spelling.
+///
+/// # Example
+/// ```tuo
+/// web::json::push_node_text(out, d, node);
+/// ```
+pub fn push_node_text(mut out: String, in d: Doc, take node: Int) {
+    let kind = kind_of(d, node);
+    if kind < 0 {
+        std::string::append(out, "null");
+    } else if kind == kind_string() {
+        push_string(out, std::string::as_str(text_of(d, node)));
+    } else if kind == kind_array() {
+        std::string::push_byte(out, 91);
+        var child = first_child(d, node);
+        var first = true;
+        while child >= 0 {
+            if !first {
+                std::string::push_byte(out, 44);
+            }
+            first = false;
+            push_node_text(out, d, child);
+            child = next_sibling(d, child);
+        }
+        std::string::push_byte(out, 93);
+    } else if kind == kind_object() {
+        std::string::push_byte(out, 123);
+        var child = first_child(d, node);
+        var first = true;
+        while child >= 0 {
+            if !first {
+                std::string::push_byte(out, 44);
+            }
+            first = false;
+            push_string(out, std::string::as_str(key_of(d, child)));
+            std::string::push_byte(out, 58);
+            push_node_text(out, d, child);
+            child = next_sibling(d, child);
+        }
+        std::string::push_byte(out, 125);
+    } else {
+        var i = field(d, node, 1);
+        let end = field(d, node, 2);
+        while i < end {
+            std::string::push_byte(out, std::string::byte_at(d.source, i));
+            i = i + 1;
+        }
+    }
+}
+
+/// `node` and its subtree as compact JSON.
+///
+/// # Example
+/// ```tuo
+/// let text = web::json::node_text(d, node);
+/// ```
+pub fn node_text(in d: Doc, take node: Int) -> String {
+    var out = std::string::empty();
+    push_node_text(out, d, node);
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Specs. The error names and positions are what FastAPI 0.141 on CPython
+// 3.14 returned for the same bodies (`loc: ["body", N]`, `ctx.error`).
+// ----------------------------------------------------------------------------
+
+fn error_is(in text: Str, in message: Str, take at: Int) -> Bool {
+    let d = parse(text);
+    !d.ok && std::string::as_str(d.error) == message && error_position(d) == at
+}
+
+fn parses(in text: Str) -> Bool {
+    let d = parse(text);
+    d.ok
+}
+
+fn round_trip(in text: Str) -> String {
+    let d = parse(text);
+    node_text(d, root(d))
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+fn member_text(in text: Str, in key: Str) -> String {
+    let d = parse(text);
+    text_of(d, member(d, root(d), key))
+}
+
+fn member_kind(in text: Str, in key: Str) -> Int {
+    let d = parse(text);
+    kind_of(d, member(d, root(d), key))
+}
+
+fn nested(take depth: Int) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < depth {
+        std::string::push_byte(out, 91);
+        i = i + 1;
+    }
+    var j = 0;
+    while j < depth {
+        std::string::push_byte(out, 93);
+        j = j + 1;
+    }
+    out
+}
+
+fn written(in text: Str) -> String {
+    var out = std::string::empty();
+    push_string(out, text);
+    out
+}
+
+fn written_int(take value: Int) -> String {
+    var out = std::string::empty();
+    push_int(out, value);
+    out
+}
+
+spec parse {
+    then parses("{}");
+    then parses("[]");
+    then parses(" \t\n\r{ } ");
+    then parses("null");
+    then parses("-0");
+    then parses("0.5e-3");
+    then parses("1E+9");
+    then parses("\"\\u00e9\\ud83d\\ude00\"");
+    then parses("[1,[2,[3,{\"a\":[]}]]]");
+    then parses(std::string::as_str(nested(64)));
+    then !parses(std::string::as_str(nested(65)));
+    then !parses("");
+    then !parses("NaN");
+    then !parses("Infinity");
+    then !parses("-");
+    then !parses("1.");
+    then !parses("1e");
+    then !parses("+1");
+    then !parses(".5");
+    then !parses("[1 2]");
+    then !parses("{\"a\":1,\"a\"}");
+}
+
+spec "errors are CPython's, at CPython's positions" {
+    then error_is("{\"email\":\"a@b.co\",}", "Illegal trailing comma before end of object", 17);
+    then error_is("{\"email\" \"a@b.co\"}", "Expecting ':' delimiter", 9);
+    then error_is("{\"email\":\"a@b.co\" \"password\":\"x\"}", "Expecting ',' delimiter", 18);
+    then error_is("{} {}", "Extra data", 3);
+    then error_is("{\"email\":\"a@b.co", "Unterminated string starting at", 9);
+    then error_is("{\"email\":\"a\\qb\"}", "Invalid \\escape", 11);
+    then error_is("{\"email\":\"a\tb\"}", "Invalid control character at", 11);
+    then error_is("{'email':'a'}", "Expecting property name enclosed in double quotes", 1);
+    then error_is("{\"tags\":[\"a\"", "Expecting ',' delimiter", 12);
+    then error_is("{\"age\":01}", "Expecting ',' delimiter", 8);
+    then error_is("nope", "Expecting value", 0);
+    then error_is("{\"email\": ", "Expecting value", 10);
+    then error_is("[1,]", "Illegal trailing comma before end of array", 2);
+    then error_is("[1,,2]", "Expecting value", 3);
+    then error_is("{\"a\":1,2}", "Expecting property name enclosed in double quotes", 7);
+    then error_is("\"\\u12g4\"", "Invalid \\uXXXX escape", 1);
+    then error_is("  ", "Expecting value", 2);
+    // Positions count characters: the two-byte é before the error is one.
+    then error_is("[\"\u{e9}\",]", "Illegal trailing comma before end of array", 4);
+}
+
+spec member {
+    then text_is(member_text("{\"email\":\"jane@example.com\",\"age\":30}", "email"), "jane@example.com");
+    then text_is(member_text("{\"age\":30}", "age"), "30");
+    then member_kind("{\"age\":30}", "age") == kind_int();
+    then member_kind("{\"age\":30.0}", "age") == kind_float();
+    then member_kind("{\"age\":3e1}", "age") == kind_float();
+    then member_kind("{\"a\":null}", "a") == kind_null();
+    then member_kind("{\"a\":true}", "a") == kind_true();
+    then member_kind("{\"a\":false}", "a") == kind_false();
+    then member_kind("{\"a\":[]}", "a") == kind_array();
+    then member_kind("{\"a\":{}}", "a") == kind_object();
+    then member_kind("{\"a\":1}", "b") == 0 - 1;
+    then member_kind("[1]", "a") == 0 - 1;
+    // A repeated key resolves to the last, as in Python.
+    then text_is(member_text("{\"a\":1,\"a\":2}", "a"), "2");
+    // Keys are compared decoded.
+    then text_is(member_text("{\"\\u0061\":\"x\"}", "a"), "x");
+}
+
+spec text_of {
+    then text_is(member_text("{\"s\":\"a\\\"b\\\\c\\/d\\n\\t\\r\\b\\f\"}", "s"), "a\"b\\c/d\n\t\r\u{8}\u{c}");
+    then text_is(member_text("{\"s\":\"\\u00e9\"}", "s"), "\u{e9}");
+    then text_is(member_text("{\"s\":\"\\ud83d\\ude00\"}", "s"), "\u{1f600}");
+    then text_is(member_text("{\"s\":\"\\ud83d\"}", "s"), "\u{fffd}");
+    then text_is(member_text("{\"s\":\"\\ude00x\"}", "s"), "\u{fffd}x");
+    then text_is(member_text("{\"s\":{}}", "s"), "");
+}
+
+spec child_at {
+    let d = parse("{\"tags\":[\"a\",7,[],{}],\"n\":1}");
+    let tags = member(d, root(d), "tags");
+    then child_count(d, tags) == 4;
+    then child_count(d, root(d)) == 2;
+    then kind_of(d, child_at(d, tags, 0)) == kind_string();
+    then kind_of(d, child_at(d, tags, 1)) == kind_int();
+    then kind_of(d, child_at(d, tags, 2)) == kind_array();
+    then child_count(d, child_at(d, tags, 2)) == 0;
+    then kind_of(d, child_at(d, tags, 3)) == kind_object();
+    then child_at(d, tags, 4) == 0 - 1;
+    then first_child(d, child_at(d, tags, 1)) == 0 - 1;
+    then text_is(text_of(d, member(d, root(d), "n")), "1");
+    then root(parse("nope")) == 0 - 1;
+}
+
+spec node_text {
+    then text_is(round_trip("{ \"email\" : \"jane@example.com\" ,\n \"tags\" : [ 1 , 2 ] }"), "{\"email\":\"jane@example.com\",\"tags\":[1,2]}");
+    then text_is(round_trip("{\"a\":[1,2.5,null,true,false,\"x\"]}"), "{\"a\":[1,2.5,null,true,false,\"x\"]}");
+    then text_is(round_trip("[]"), "[]");
+    then text_is(round_trip("{}"), "{}");
+    then text_is(round_trip("-91"), "-91");
+    then text_is(round_trip("\"a\\u0022b\\n\\u00e9\""), "\"a\\\"b\\n\u{e9}\"");
+    then text_is(round_trip("nope"), "null");
+}
+
+spec push_string {
+    then text_is(written("plain"), "\"plain\"");
+    then text_is(written("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    then text_is(written("\n\r\t\u{8}\u{c}\u{1}\u{1f}"), "\"\\n\\r\\t\\b\\f\\u0001\\u001f\"");
+    then text_is(written("\u{e9}/"), "\"\u{e9}/\"");
+    then text_is(written(""), "\"\"");
+}
+
+spec push_int {
+    then text_is(written_int(0), "0");
+    then text_is(written_int(42), "42");
+    then text_is(written_int(0 - 42), "-42");
+    then text_is(written_int(9007199254740993), "9007199254740993");
+}
+
+spec push_key {
+    var out = std::string::from_str("{");
+    push_key(out, "a");
+    push_int(out, 1);
+    push_key(out, "b");
+    push_int(out, 2);
+    std::string::push_byte(out, 125);
+    then text_is(out, "{\"a\":1,\"b\":2}");
+}

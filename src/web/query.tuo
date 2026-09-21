@@ -1,0 +1,112 @@
+// web::query — a query string as ordered name/value pairs.
+//
+// `application/x-www-form-urlencoded`, read the way Starlette reads it
+// (`parse_qsl` with `keep_blank_values=True`): pairs split on `&`, name
+// from value on the first `=`, `+` a space, `%XX` decoded, a bare name
+// given the empty value, an empty pair skipped. Order and duplicates are
+// kept; `web::schema::validate_pairs` takes the last of a repeated name.
+
+module web::query;
+
+/// Names and values, index for index.
+pub struct Pairs {
+    names: Array[String],
+    values: Array[String],
+}
+
+/// Parse a query string (without its `?`).
+///
+/// # Example
+/// ```tuo
+/// let p = web::query::parse("q=c%2B%2B+dev&page=2");
+/// ```
+pub fn parse(in query: Str) -> Pairs {
+    var p = Pairs { names: std::array::empty(), values: std::array::empty() };
+    let n = std::str::len(query);
+    var start = 0;
+    var i = 0;
+    while i <= n {
+        if i == n || std::str::byte_at(query, i) == 38 {
+            if i > start {
+                var eq = start;
+                while eq < i && std::str::byte_at(query, eq) != 61 {
+                    eq = eq + 1;
+                }
+                let name = http::message::slice(query, start, eq);
+                let value = if eq < i {
+                    http::message::slice(query, eq + 1, i)
+                } else {
+                    std::string::empty()
+                };
+                std::array::push(p.names, http::url::percent_decode(std::string::as_str(name)));
+                std::array::push(p.values, http::url::percent_decode(std::string::as_str(value)));
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    p
+}
+
+/// The last value given for `name`, or empty.
+///
+/// # Example
+/// ```tuo
+/// let q = web::query::get(p, "q");
+/// ```
+pub fn get(in p: Pairs, in name: Str) -> String {
+    var found = std::string::empty();
+    var i = 0;
+    while i < std::array::len(p.names) {
+        if std::string::as_str(std::array::get(p.names, i)) == name {
+            found = std::string::from_str(std::string::as_str(std::array::get(p.values, i)));
+        }
+        i = i + 1;
+    }
+    found
+}
+
+/// Whether `name` was given at all.
+///
+/// # Example
+/// ```tuo
+/// if web::query::has(p, "q") { /* … */ }
+/// ```
+pub fn has(in p: Pairs, in name: Str) -> Bool {
+    var i = 0;
+    while i < std::array::len(p.names) {
+        if std::string::as_str(std::array::get(p.names, i)) == name {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+fn count(in query: Str) -> Int {
+    let p = parse(query);
+    std::array::len(p.names)
+}
+
+spec parse {
+    then count("") == 0;
+    then count("q=python") == 1;
+    then count("q=python&page=2") == 2;
+    then count("&&q=1&&") == 1;
+    then count("page=1&page=3") == 2;
+    then text_is(get(parse("q=c%2B%2B+dev&page=2"), "q"), "c++ dev");
+    then text_is(get(parse("q=c%2B%2B+dev&page=2"), "page"), "2");
+    then text_is(get(parse("page=1&page=3"), "page"), "3");
+    then text_is(get(parse("q=%C3%A9%C3%A9"), "q"), "\u{e9}\u{e9}");
+    then text_is(get(parse("a=b=c"), "a"), "b=c");
+    then text_is(get(parse("q"), "q"), "");
+    then text_is(get(parse("q="), "q"), "");
+    then has(parse("q"), "q");
+    then has(parse("q="), "q");
+    then !has(parse("q=1"), "page");
+    then text_is(get(parse("na%6De=v"), "name"), "v");
+}

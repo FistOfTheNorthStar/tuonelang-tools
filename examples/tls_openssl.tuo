@@ -12,6 +12,12 @@
 // page names the negotiated cipher, and sends session tickets first, so
 // the client's post-handshake handling is exercised too.
 //
+// Two more servers, on 4434 and 4435, present the P-256 and RSA-2048
+// test PKIs (`examples/tls-test/{ec,big}-*.pem`) with their intermediates,
+// and the client validates those chains against the test roots — an
+// ECDSA and an RSA-PSS CertificateVerify from an independent
+// implementation, and a chain walk over bytes OpenSSL framed.
+//
 //     tuo run examples/tls_openssl.tuo src/tls/*.tuo src/http/*.tuo src/dns/*.tuo src/std_*.tuo
 //
 // Loopback only. One line per check; exit is the failure count.
@@ -62,6 +68,20 @@ fn main() -> Int {
 
     let r2 = http::client::get_pinned("https://localhost:4433/", std::hkdf::zeros(32), t);
     failed = failed + report("the same server with a wrong pin is refused", !r2.ok);
+
+    var ec_roots = std::array::empty();
+    x509::chain::push_entry(ec_roots, ec::field::hex_bytes(x509::fixture::ec_root()));
+    var big_roots = std::array::empty();
+    x509::chain::push_entry(big_roots, ec::field::hex_bytes(x509::fixture::big_root()));
+
+    let r3 = http::client::get_with_roots("https://localhost:4434/", ec_roots, t);
+    failed = failed + report("GET https://localhost:4434/ with the P-256 chain validates against the test root", r3.ok && r3.status == 200);
+    failed = failed + report("OpenSSL negotiated ChaCha20 there too", std::str::contains(std::string::as_str(r3.body), "TLS_CHACHA20_POLY1305_SHA256"));
+    let r4 = http::client::get_with_roots("https://localhost:4434/", big_roots, t);
+    failed = failed + report("the P-256 chain is refused under the RSA root", !r4.ok);
+
+    let r5 = http::client::get_with_roots("https://localhost:4435/", big_roots, t);
+    failed = failed + report("GET https://localhost:4435/ with the RSA-2048 chain validates (RSA-PSS CertificateVerify)", r5.ok && r5.status == 200);
 
     failed
 }

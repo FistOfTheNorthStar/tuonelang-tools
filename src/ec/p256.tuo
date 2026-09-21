@@ -1,0 +1,99 @@
+// ec::p256 — NIST P-256 (secp256r1, FIPS 186-4 D.1.2.3), as parameters
+// for `ec::curve`. The values are the standard's; the specs check what
+// the sandbox can afford — the base point is on the curve, `2G` matches
+// its known value, and the Barrett constants are the ones Python computes
+// — and `examples/x509.tuo` verifies RFC 6979's signatures natively.
+
+module ec::p256;
+
+/// The field prime.
+///
+/// # Example
+/// ```tuo
+/// let p = ec::p256::p();
+/// ```
+pub fn p() -> Array[Int] {
+    ec::field::from_hex("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff")
+}
+
+/// The coefficient `a = p - 3`.
+///
+/// # Example
+/// ```tuo
+/// let a = ec::p256::a();
+/// ```
+pub fn a() -> Array[Int] {
+    ec::field::from_hex("ffffffff00000001000000000000000000000000fffffffffffffffffffffffc")
+}
+
+/// The coefficient `b`.
+///
+/// # Example
+/// ```tuo
+/// let b = ec::p256::b();
+/// ```
+pub fn b() -> Array[Int] {
+    ec::field::from_hex("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b")
+}
+
+/// The group order `n`.
+///
+/// # Example
+/// ```tuo
+/// let n = ec::p256::n();
+/// ```
+pub fn n() -> Array[Int] {
+    ec::field::from_hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+}
+
+/// The base point's x.
+///
+/// # Example
+/// ```tuo
+/// let x = ec::p256::gx();
+/// ```
+pub fn gx() -> Array[Int] {
+    ec::field::from_hex("6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296")
+}
+
+/// The base point's y.
+///
+/// # Example
+/// ```tuo
+/// let y = ec::p256::gy();
+/// ```
+pub fn gy() -> Array[Int] {
+    ec::field::from_hex("4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+}
+
+/// The curve, ready for `ec::curve` and `ec::ecdsa`.
+///
+/// # Example
+/// ```tuo
+/// let c = ec::p256::curve();
+/// ```
+pub fn curve() -> ec::curve::Curve {
+    ec::curve::curve(p(), a(), b(), n(), gx(), gy())
+}
+
+fn hex_is(in value: Array[Int], in expected: Str) -> Bool {
+    std::string::as_str(std::bignum::to_hex(value)) == expected
+}
+
+spec curve {
+    let c = curve();
+    then c.bits == 256;
+    then c.width == 32;
+    then c.p.k == 10;
+    then c.n.k == 10;
+    then hex_is(c.p.mu, "100000000fffffffffffffffefffffffefffffffeffffffff0000000000000003000000050000");
+    then hex_is(c.n.mu, "100000000fffffffffffffffeffffffff43190552df1a6c21012ffd85eedf9bfe66e12d955aba");
+    then ec::curve::on_curve(gx(), gy(), c);
+    then !ec::curve::on_curve(gx(), gx(), c);
+    // 2G, compared in Jacobian form: an inversion is more than the sandbox
+    // affords on this curve, but X = x·Z² and Y = y·Z³ cost two products.
+    let two = ec::curve::double(ec::curve::generator(c), c);
+    let zsq = ec::field::square(two.z, c.p);
+    then ec::field::same(two.x, ec::field::mul(ec::field::from_hex("7cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc47669978"), zsq, c.p));
+    then ec::field::same(two.y, ec::field::mul(ec::field::from_hex("07775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1"), ec::field::mul(zsq, two.z, c.p), c.p));
+}

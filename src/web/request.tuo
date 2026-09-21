@@ -1,0 +1,148 @@
+// web::request — one parsed HTTP request, as a handler wants to see it.
+//
+// `http::server` hands a handler the raw bytes of one request, framed and
+// complete. This module is the first thing a handler does with them:
+// method, target split into path and query, headers by name, the body,
+// and the two questions nearly every endpoint asks — is this JSON, and
+// who is asking (`Authorization: Bearer …`).
+
+module web::request;
+
+/// A request. `ok` is false when the head did not parse; the server has
+/// already refused such a request, so a handler sees it only in tests.
+pub struct Request {
+    ok: Bool,
+    method: String,
+    target: String,
+    path: String,
+    query: String,
+    header_names: Array[String],
+    header_values: Array[String],
+    body: String,
+}
+
+/// Parse the raw bytes of one request.
+///
+/// # Example
+/// ```tuo
+/// let req = web::request::parse(raw);
+/// ```
+pub fn parse(in raw: Str) -> Request {
+    let head = http::message::parse_head(raw, false);
+    if !head.ok {
+        return Request { ok: false, method: std::string::empty(), target: std::string::empty(), path: std::string::empty(), query: std::string::empty(), header_names: std::array::empty(), header_values: std::array::empty(), body: std::string::empty() };
+    }
+    var names = std::array::empty();
+    var values = std::array::empty();
+    var i = 0;
+    while i < std::array::len(head.names) {
+        std::array::push(names, std::string::from_str(std::string::as_str(std::array::get(head.names, i))));
+        std::array::push(values, std::string::from_str(std::string::as_str(std::array::get(head.values, i))));
+        i = i + 1;
+    }
+    let target = std::string::from_str(std::string::as_str(head.target));
+    Request { ok: true, method: std::string::from_str(std::string::as_str(head.method)), target: std::string::from_str(std::string::as_str(target)), path: web::route::path_of(std::string::as_str(target)), query: web::route::query_of(std::string::as_str(target)), header_names: names, header_values: values, body: http::message::body(raw, false, false) }
+}
+
+/// The first value of header `name`, compared without case, or empty.
+///
+/// # Example
+/// ```tuo
+/// let ct = web::request::header(req, "content-type");
+/// ```
+pub fn header(in req: Request, in name: Str) -> String {
+    var i = 0;
+    while i < std::array::len(req.header_names) {
+        if http::message::eq_ignore_case(std::string::as_str(std::array::get(req.header_names, i)), name) {
+            return std::string::from_str(std::string::as_str(std::array::get(req.header_values, i)));
+        }
+        i = i + 1;
+    }
+    std::string::empty()
+}
+
+/// Whether the body should be read as JSON, by FastAPI's rule: no
+/// `Content-Type` at all, or `application/json`, or `application/…+json`,
+/// parameters ignored.
+///
+/// # Example
+/// ```tuo
+/// let m = web::schema::validate_body(s, std::string::as_str(req.body), web::request::is_json(req));
+/// ```
+pub fn is_json(in req: Request) -> Bool {
+    let raw = header(req, "Content-Type");
+    if std::string::len(raw) == 0 {
+        return true;
+    }
+    var end = 0;
+    while end < std::string::len(raw) && std::string::byte_at(raw, end) != 59 {
+        end = end + 1;
+    }
+    let media = web::coerce::lowered(std::string::as_str(web::coerce::trimmed(std::string::as_str(http::message::slice(std::string::as_str(raw), 0, end)))));
+    let text = std::string::as_str(media);
+    if text == "application/json" {
+        return true;
+    }
+    std::str::starts_with(text, "application/") && std::str::ends_with(text, "+json")
+}
+
+/// The token of `Authorization: Bearer <token>`, or empty. The scheme is
+/// compared without case, as RFC 9110 §11.1 says.
+///
+/// # Example
+/// ```tuo
+/// let token = web::request::bearer(req);
+/// ```
+pub fn bearer(in req: Request) -> String {
+    let raw = header(req, "Authorization");
+    if std::string::len(raw) < 8 {
+        return std::string::empty();
+    }
+    let scheme = http::message::slice(std::string::as_str(raw), 0, 7);
+    if !http::message::eq_ignore_case(std::string::as_str(scheme), "Bearer ") {
+        return std::string::empty();
+    }
+    web::coerce::trimmed(std::string::as_str(http::message::slice(std::string::as_str(raw), 7, std::string::len(raw))))
+}
+
+fn sample(in content_type: Str, in authorization: Str) -> Request {
+    var extra = std::string::empty();
+    http::message::header_line(extra, "Content-Type", content_type);
+    http::message::header_line(extra, "Authorization", authorization);
+    parse(std::string::as_str(http::message::request("POST", "/jobs/search?q=a%20b&page=2", "localhost", std::string::as_str(extra), "{\"a\":1}")))
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+spec parse {
+    let r = sample("application/json", "Bearer abc.def");
+    then r.ok;
+    then text_is(r.method, "POST");
+    then text_is(r.target, "/jobs/search?q=a%20b&page=2");
+    then text_is(r.path, "/jobs/search");
+    then text_is(r.query, "q=a%20b&page=2");
+    then text_is(r.body, "{\"a\":1}");
+    then text_is(header(r, "HOST"), "localhost");
+    then text_is(header(r, "x-missing"), "");
+    then !parse("garbage").ok;
+}
+
+spec is_json {
+    then is_json(sample("application/json", ""));
+    then is_json(sample("Application/JSON; charset=utf-8", ""));
+    then is_json(sample("application/problem+json", ""));
+    then is_json(sample("", ""));
+    then !is_json(sample("text/plain", ""));
+    then !is_json(sample("application/x-www-form-urlencoded", ""));
+    then !is_json(sample("text/json", ""));
+}
+
+spec bearer {
+    then text_is(bearer(sample("", "Bearer abc.def")), "abc.def");
+    then text_is(bearer(sample("", "bearer   abc ")), "abc");
+    then text_is(bearer(sample("", "Basic abc")), "");
+    then text_is(bearer(sample("", "Bearer")), "");
+    then text_is(bearer(sample("", "")), "");
+}

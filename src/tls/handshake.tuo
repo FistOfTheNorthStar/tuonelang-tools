@@ -8,18 +8,20 @@
 // step is a function of bytes to bytes, so every step is spec'd, and the
 // socket-facing sequence in `tls::client` is a thin loop over these.
 //
-// THE PROFILE IS THE CATALOG'S: X25519, TLS_CHACHA20_POLY1305_SHA256, and
-// Ed25519 certificates. The ClientHello offers exactly that, and a server
-// choosing anything else is refused at `accepted`. That is not a general
-// web client — public servers present ECDSA or RSA certificates this crate
-// cannot yet verify — but it is a complete, checked handshake against any
-// server configured for this profile, including OpenSSL.
+// THE KEY EXCHANGE AND RECORD PROFILE IS THE CATALOG'S: X25519 and
+// TLS_CHACHA20_POLY1305_SHA256. The ClientHello offers exactly that, and
+// a server choosing anything else is refused at `accepted`. Every public
+// server tried accepts it. Signatures are where the web is varied, and
+// the client speaks what it presents: ECDSA on P-256 and P-384, RSA-PSS,
+// and Ed25519 for the CertificateVerify, and the same plus PKCS#1 v1.5
+// inside certificate chains.
 //
-// TRUST IS A PINNED KEY. `std::der` decodes a certificate; nothing here
-// validates a chain, checks names, or reads validity dates. So the caller
-// supplies the Ed25519 public key it expects, and `key_matches` compares
-// the certificate's key to it in constant time. There is no "accept
-// anything" mode: an empty pin matches nothing.
+// TRUST IS EITHER A PINNED KEY OR A VALIDATED CHAIN, and `Trust` says
+// which. A pin is an Ed25519 public key the certificate must carry,
+// compared in constant time; a chain is validated by `x509::chain`
+// against a root store, for a host name, at a Unix time the caller
+// supplies. There is no "accept anything" mode: an empty pin matches
+// nothing, and an empty root store trusts nothing.
 //
 // CORRECTNESS IS EXTERNALLY DEFINED. RFC 8448 prints every secret of one
 // handshake, and `tls::fixture` carries them; the specs derive the same
@@ -70,6 +72,58 @@ pub fn legacy_version() -> Int {
     771
 }
 
+/// The `ecdsa_secp256r1_sha256` signature scheme: 0x0403.
+///
+/// # Example
+/// ```tuo
+/// let s = tls::handshake::scheme_ecdsa_p256(); // 1027
+/// ```
+pub fn scheme_ecdsa_p256() -> Int {
+    1027
+}
+
+/// The `ecdsa_secp384r1_sha384` signature scheme: 0x0503.
+///
+/// # Example
+/// ```tuo
+/// let s = tls::handshake::scheme_ecdsa_p384(); // 1283
+/// ```
+pub fn scheme_ecdsa_p384() -> Int {
+    1283
+}
+
+/// The `rsa_pss_rsae_sha256` signature scheme: 0x0804.
+///
+/// # Example
+/// ```tuo
+/// let s = tls::handshake::scheme_rsa_pss_sha256(); // 2052
+/// ```
+pub fn scheme_rsa_pss_sha256() -> Int {
+    2052
+}
+
+/// The `rsa_pkcs1_sha256` scheme: 0x0401. Offered for certificate chains
+/// only; TLS 1.3 forbids it in a CertificateVerify, and so does
+/// `signature_valid`.
+///
+/// # Example
+/// ```tuo
+/// let s = tls::handshake::scheme_rsa_pkcs1_sha256(); // 1025
+/// ```
+pub fn scheme_rsa_pkcs1_sha256() -> Int {
+    1025
+}
+
+/// The `rsa_pkcs1_sha384` scheme: 0x0501, offered for chains only.
+///
+/// # Example
+/// ```tuo
+/// let s = tls::handshake::scheme_rsa_pkcs1_sha384(); // 1281
+/// ```
+pub fn scheme_rsa_pkcs1_sha384() -> Int {
+    1281
+}
+
 /// The special ServerHello random that marks a HelloRetryRequest (RFC 8446
 /// §4.1.3): SHA-256 of "HelloRetryRequest". A client that does not
 /// support retries must recognise it rather than read a second hello.
@@ -118,8 +172,8 @@ pub fn server_name_data(in name: Str) -> Array[Int] {
 /// `random`, the client's X25519 `key_share`, and `server_name` — which is
 /// omitted when empty, since SNI carries a host name and never an address.
 ///
-/// Offers TLS 1.3 only, one suite, one group, one signature algorithm, and
-/// an empty legacy session id.
+/// Offers TLS 1.3 only, one suite, one group, the six signature schemes
+/// the client verifies, and an empty legacy session id.
 ///
 /// # Example
 /// ```tuo
@@ -144,8 +198,13 @@ pub fn client_hello(in random: Array[Int], in key_share: Array[Int], in server_n
     let _ = std::tls::push_u16(groups, std::tls::group_x25519());
     push_extension(extensions, extension_supported_groups(), groups);
     var algorithms = std::array::empty();
-    let _ = std::tls::push_u16(algorithms, 2);
+    let _ = std::tls::push_u16(algorithms, 12);
+    let _ = std::tls::push_u16(algorithms, scheme_ecdsa_p256());
+    let _ = std::tls::push_u16(algorithms, scheme_ecdsa_p384());
+    let _ = std::tls::push_u16(algorithms, scheme_rsa_pss_sha256());
     let _ = std::tls::push_u16(algorithms, std::tls::signature_ed25519());
+    let _ = std::tls::push_u16(algorithms, scheme_rsa_pkcs1_sha256());
+    let _ = std::tls::push_u16(algorithms, scheme_rsa_pkcs1_sha384());
     push_extension(extensions, extension_signature_algorithms(), algorithms);
     var versions = std::array::empty();
     std::array::push(versions, 2);
@@ -393,55 +452,92 @@ pub fn parse_flight(in buffer: Array[Int]) -> Flight {
 }
 
 /// The first certificate's DER from a Certificate message, or empty when
-/// the message is malformed. Only the first entry — the server's own
-/// certificate — is read; any chain after it is ignored, since nothing
-/// here validates one.
+/// the message is malformed — the server's own certificate.
 ///
 /// # Example
 /// ```tuo
 /// let der = tls::handshake::certificate_der(flight.certificate);
 /// ```
 pub fn certificate_der(in message: Array[Int]) -> Array[Int] {
-    if std::tls::byte_at(message, 0) != std::tls::handshake_certificate() {
-        return std::array::empty();
-    }
-    let context_len = std::tls::byte_at(message, 4);
-    if context_len < 0 {
-        return std::array::empty();
-    }
-    let p = 5 + context_len;
-    let list_len = std::tls::u24_at(message, p);
-    let cert_len = std::tls::u24_at(message, p + 3);
-    if list_len < 0 || cert_len < 0 || cert_len + 3 > list_len {
-        return std::array::empty();
-    }
-    let der = std::tls::slice(message, p + 6, cert_len);
-    if std::array::len(der) != cert_len {
-        return std::array::empty();
-    }
-    der
+    x509::chain::entry_at(certificate_list(message), 0)
 }
 
-/// The Ed25519 signature in a CertificateVerify message, or empty when the
-/// algorithm is anything else or the message is malformed.
+/// Every certificate in a Certificate message as an `x509::chain` list,
+/// in the order sent (the server's own first), with each entry's
+/// extensions dropped. Empty when the message is malformed anywhere.
+///
+/// # Example
+/// ```tuo
+/// let list = tls::handshake::certificate_list(flight.certificate);
+/// ```
+pub fn certificate_list(in message: Array[Int]) -> Array[Int] {
+    var list = std::array::empty();
+    if std::tls::byte_at(message, 0) != std::tls::handshake_certificate() {
+        return list;
+    }
+    let body_len = std::tls::u24_at(message, 1);
+    let context_len = std::tls::byte_at(message, 4);
+    if body_len < 0 || context_len < 0 || 4 + body_len != std::array::len(message) {
+        return list;
+    }
+    var p = 5 + context_len;
+    let list_len = std::tls::u24_at(message, p);
+    if list_len < 0 || p + 3 + list_len != std::array::len(message) {
+        return list;
+    }
+    p = p + 3;
+    let limit = std::array::len(message);
+    while p < limit {
+        let cert_len = std::tls::u24_at(message, p);
+        if cert_len <= 0 || p + 3 + cert_len > limit {
+            return std::array::empty();
+        }
+        let der = std::tls::slice(message, p + 3, cert_len);
+        if std::array::len(der) != cert_len {
+            return std::array::empty();
+        }
+        x509::chain::push_entry(list, der);
+        p = p + 3 + cert_len;
+        let ext_len = std::tls::u16_at(message, p);
+        if ext_len < 0 || p + 2 + ext_len > limit {
+            return std::array::empty();
+        }
+        p = p + 2 + ext_len;
+    }
+    list
+}
+
+/// The signature scheme a CertificateVerify names, or -1 when malformed.
+///
+/// # Example
+/// ```tuo
+/// let scheme = tls::handshake::certificate_verify_scheme(flight.certificate_verify);
+/// ```
+pub fn certificate_verify_scheme(in message: Array[Int]) -> Int {
+    if std::tls::byte_at(message, 0) != std::tls::handshake_certificate_verify() {
+        return 0 - 1;
+    }
+    std::tls::u16_at(message, 4)
+}
+
+/// The signature in a CertificateVerify message, whatever its scheme, or
+/// empty when the message is malformed or the length does not account
+/// for every byte.
 ///
 /// # Example
 /// ```tuo
 /// let sig = tls::handshake::certificate_verify_signature(flight.certificate_verify);
 /// ```
 pub fn certificate_verify_signature(in message: Array[Int]) -> Array[Int] {
-    if std::tls::byte_at(message, 0) != std::tls::handshake_certificate_verify() {
-        return std::array::empty();
-    }
-    if std::tls::u16_at(message, 4) != std::tls::signature_ed25519() {
+    if certificate_verify_scheme(message) < 0 {
         return std::array::empty();
     }
     let len = std::tls::u16_at(message, 6);
-    if len != 64 {
+    if len <= 0 || 8 + len != std::array::len(message) {
         return std::array::empty();
     }
-    let sig = std::tls::slice(message, 8, 64);
-    if std::array::len(sig) != 64 {
+    let sig = std::tls::slice(message, 8, len);
+    if std::array::len(sig) != len {
         return std::array::empty();
     }
     sig
@@ -524,20 +620,97 @@ pub fn key_matches(in der: Array[Int], in pinned: Array[Int]) -> Bool {
     std::crypto::verify(std::der::certificate_public_key(der), pinned)
 }
 
-/// Whether `signature` is the certificate's key's Ed25519 signature over
-/// the CertificateVerify content for `hash` — the transcript hash through
-/// the Certificate message. This is what proves the server holds the key
-/// its certificate names.
+/// Whether `signature` under `scheme` is the certificate's key's signature
+/// over the CertificateVerify content for `transcript` — the transcript
+/// hash through the Certificate message. This is what proves the server holds
+/// the key its certificate names. The scheme must fit the key: Ed25519,
+/// ECDSA on the key's own curve with the matching SHA-2, or RSA-PSS with
+/// SHA-256; anything else is false, including PKCS#1 v1.5, which TLS 1.3
+/// forbids here.
 ///
 /// # Example
 /// ```tuo
-/// let proven = tls::handshake::signature_valid(der, hash, sig);
+/// let proven = tls::handshake::signature_valid(der, hash, scheme, sig);
 /// ```
-pub fn signature_valid(in der: Array[Int], in hash: Array[Int], in signature: Array[Int]) -> Bool {
-    if !std::der::certificate_is_ed25519(der) {
+pub fn signature_valid(in der: Array[Int], in transcript: Array[Int], take scheme: Int, in signature: Array[Int]) -> Bool {
+    let cert = x509::certificate::parse(der);
+    if !cert.ok || std::array::len(signature) == 0 {
         return false;
     }
-    std::ed25519::verify(std::der::certificate_public_key(der), std::tls::certificate_verify_content(hash), signature)
+    let content = std::tls::certificate_verify_content(transcript);
+    if scheme == std::tls::signature_ed25519() {
+        if cert.key_kind != x509::certificate::key_ed25519() {
+            return false;
+        }
+        return std::ed25519::verify(cert.public_key, content, signature);
+    }
+    if scheme == scheme_ecdsa_p256() {
+        if cert.key_kind != x509::certificate::key_p256() {
+            return false;
+        }
+        return ec::ecdsa::verify(ec::p256::curve(), cert.public_key, rsa::verify::sha256(content), signature);
+    }
+    if scheme == scheme_ecdsa_p384() {
+        if cert.key_kind != x509::certificate::key_p384() {
+            return false;
+        }
+        return ec::ecdsa::verify(ec::p384::curve(), cert.public_key, crypto::sha384::hash(content), signature);
+    }
+    if scheme == scheme_rsa_pss_sha256() {
+        if cert.key_kind != x509::certificate::key_rsa() {
+            return false;
+        }
+        return rsa::verify::pss_sha256_valid(rsa::verify::parse_public_key(cert.public_key), rsa::verify::sha256(content), signature);
+    }
+    false
+}
+
+/// What the client trusts: a pinned Ed25519 key (`pinned` of 32 bytes),
+/// or else a chain validated against `roots` for `host` at Unix time
+/// `now`.
+pub struct Trust {
+    pinned: Array[Int],
+    roots: Array[Int],
+    host: String,
+    now: Int,
+}
+
+/// Trust exactly the certificate carrying the Ed25519 key `pinned`.
+///
+/// # Example
+/// ```tuo
+/// let t = tls::handshake::pin(test_public_key);
+/// ```
+pub fn pin(in pinned: Array[Int]) -> Trust {
+    Trust { pinned: std::tls::copy_bytes(pinned), roots: std::array::empty(), host: std::string::empty(), now: 0 }
+}
+
+/// Trust any chain to a root in `roots` that names `host` and is valid
+/// at `now`.
+///
+/// # Example
+/// ```tuo
+/// let t = tls::handshake::trust_roots(x509::roots::store(), "sentry.io", now);
+/// ```
+pub fn trust_roots(in roots: Array[Int], in host: Str, take now: Int) -> Trust {
+    Trust { pinned: std::array::empty(), roots: std::tls::copy_bytes(roots), host: std::string::from_str(host), now: now }
+}
+
+/// Whether the server's certificate list satisfies `trust`: the pinned
+/// key when there is one, else `x509::chain::validate` says `ok`.
+///
+/// # Example
+/// ```tuo
+/// let go = tls::handshake::trusted(trust, tls::handshake::certificate_list(flight.certificate));
+/// ```
+pub fn trusted(in trust: Trust, in list: Array[Int]) -> Bool {
+    if std::array::len(trust.pinned) > 0 {
+        return key_matches(x509::chain::entry_at(list, 0), trust.pinned);
+    }
+    if std::array::len(trust.roots) == 0 {
+        return false;
+    }
+    x509::chain::validate(list, trust.roots, std::string::as_str(trust.host), trust.now) == x509::chain::ok()
 }
 
 /// Whether `verify_data` is the Finished value for `secret` over `hash` —
@@ -575,6 +748,14 @@ fn rfc_shared() -> Array[Int] {
 
 fn rfc_hello_hash() -> Array[Int] {
     transcript_hash(joined(rfc(tls::fixture::client_hello()), rfc(tls::fixture::server_hello())))
+}
+
+/// The transcript through the Certificate — what the CertificateVerify signs.
+fn rfc_transcript_to_certificate() -> Array[Int] {
+    var t = joined(rfc(tls::fixture::client_hello()), rfc(tls::fixture::server_hello()));
+    let _ = std::tls::push_bytes(t, rfc(tls::fixture::encrypted_extensions()));
+    let _ = std::tls::push_bytes(t, rfc(tls::fixture::certificate()));
+    t
 }
 
 /// The transcript through the CertificateVerify.
@@ -643,6 +824,35 @@ fn flight_certificate_der_len() -> Int {
 fn flight_signature_len() -> Int {
     let f = parse_flight(rfc_flight_buffer());
     std::array::len(certificate_verify_signature(f.certificate_verify))
+}
+
+fn flight_verify_scheme() -> Int {
+    let f = parse_flight(rfc_flight_buffer());
+    certificate_verify_scheme(f.certificate_verify)
+}
+
+fn flight_certificate_count() -> Int {
+    let f = parse_flight(rfc_flight_buffer());
+    x509::chain::entry_count(certificate_list(f.certificate))
+}
+
+fn rsa_list() -> Array[Int] {
+    var list = std::array::empty();
+    x509::chain::push_entry(list, ec::field::hex_bytes(x509::fixture::rsa_leaf()));
+    x509::chain::push_entry(list, ec::field::hex_bytes(x509::fixture::rsa_int()));
+    list
+}
+
+fn rsa_roots() -> Array[Int] {
+    var list = std::array::empty();
+    x509::chain::push_entry(list, ec::field::hex_bytes(x509::fixture::rsa_root()));
+    list
+}
+
+fn test_list() -> Array[Int] {
+    var list = std::array::empty();
+    x509::chain::push_entry(list, test_cert());
+    list
 }
 
 fn test_hello() -> Array[Int] {
@@ -720,8 +930,13 @@ spec parse_flight {
     then flight_ok(rfc_flight_buffer());
     then flight_certificate_len() == 445;
     then flight_certificate_der_len() == 432;
-    // RFC 8448 signs with rsa_pss_rsae_sha256, which this client refuses.
-    then flight_signature_len() == 0;
+    // RFC 8448 signs with rsa_pss_rsae_sha256 under a 1024-bit key: 128 bytes under 0x0804.
+    then flight_signature_len() == 128;
+    then flight_verify_scheme() == scheme_rsa_pss_sha256();
+    then flight_certificate_count() == 1;
+    then std::array::len(certificate_list(std::array::empty())) == 0;
+    then std::array::len(certificate_list(std::tls::slice(rfc(tls::fixture::certificate()), 0, 100))) == 0;
+    then std::array::len(certificate_verify_signature(std::tls::slice(rfc(tls::fixture::certificate_verify()), 0, 100))) == 0;
     then hex_is(flight_finished_data(), tls::fixture::server_finished_data());
     // Wrong order, a missing message, trailing bytes, and truncation.
     then flight_ok(joined(rfc(tls::fixture::certificate()), rfc(tls::fixture::encrypted_extensions()))) == false;
@@ -779,7 +994,25 @@ spec signature_valid {
     // that malformed input is answered, never trapped on, before any
     // arithmetic: a wrong-length signature, and a certificate that is not
     // Ed25519 at all.
-    then signature_valid(test_cert(), rfc_hello_hash(), std::array::empty()) == false;
-    then signature_valid(test_cert(), rfc_hello_hash(), std::hkdf::zeros(63)) == false;
-    then signature_valid(certificate_der(rfc(tls::fixture::certificate())), rfc_hello_hash(), std::hkdf::zeros(64)) == false;
+    then signature_valid(test_cert(), rfc_hello_hash(), std::tls::signature_ed25519(), std::array::empty()) == false;
+    then signature_valid(test_cert(), rfc_hello_hash(), std::tls::signature_ed25519(), std::hkdf::zeros(63)) == false;
+    then signature_valid(test_cert(), rfc_hello_hash(), scheme_ecdsa_p256(), std::hkdf::zeros(64)) == false;
+    then signature_valid(certificate_der(rfc(tls::fixture::certificate())), rfc_hello_hash(), std::tls::signature_ed25519(), std::hkdf::zeros(64)) == false;
+    // RFC 8448's own CertificateVerify is RSA-PSS over the transcript
+    // through its Certificate; a 2048-bit verification fits the sandbox.
+    then signature_valid(certificate_der(rfc(tls::fixture::certificate())), transcript_hash(rfc_transcript_to_certificate()), scheme_rsa_pss_sha256(), certificate_verify_signature(rfc(tls::fixture::certificate_verify())));
+    then signature_valid(certificate_der(rfc(tls::fixture::certificate())), rfc_hello_hash(), scheme_rsa_pss_sha256(), certificate_verify_signature(rfc(tls::fixture::certificate_verify()))) == false;
+    // PKCS#1 v1.5 is never accepted in a CertificateVerify.
+    then signature_valid(certificate_der(rfc(tls::fixture::certificate())), transcript_hash(rfc_transcript_to_certificate()), scheme_rsa_pkcs1_sha256(), certificate_verify_signature(rfc(tls::fixture::certificate_verify()))) == false;
+}
+
+spec trusted {
+    then trusted(pin(rfc(tls::fixture::test_public_key())), test_list());
+    then trusted(pin(std::hkdf::zeros(32)), test_list()) == false;
+    then trusted(pin(rfc(tls::fixture::test_public_key())), rsa_list()) == false;
+    then trusted(trust_roots(rsa_roots(), "localhost", 1800000000), rsa_list());
+    then trusted(trust_roots(rsa_roots(), "example.com", 1800000000), rsa_list()) == false;
+    then trusted(trust_roots(rsa_roots(), "localhost", 1700000000), rsa_list()) == false;
+    then trusted(trust_roots(std::array::empty(), "localhost", 1800000000), rsa_list()) == false;
+    then trusted(trust_roots(rsa_roots(), "localhost", 1800000000), test_list()) == false;
 }

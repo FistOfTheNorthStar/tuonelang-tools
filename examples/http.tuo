@@ -195,7 +195,7 @@ fn client_role(take port: Int) -> Int {
 
     // Pure refusals: no connection.
     let r9 = http::client::get("https://127.0.0.1/", t);
-    failed = failed + report("https:// is refused without connecting", !r9.ok);
+    failed = failed + report("https:// to an address literal is refused without connecting", !r9.ok);
     let r10 = http::client::get("not a url", t);
     failed = failed + report("a malformed URL is refused", !r10.ok);
 

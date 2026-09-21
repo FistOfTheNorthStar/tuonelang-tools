@@ -1,0 +1,3008 @@
+// web::fixture — what FastAPI actually answered.
+//
+// 107 requests were sent through Starlette's test client to a FastAPI
+// 0.141 application (Pydantic 2.13, Starlette 1.6, CPython 3.14, from
+// `shallowflaws`'s own virtualenv) on 2026-09-19, and every status, `Allow`,
+// `Location`, and body was recorded. The application is the one
+// `web::demo` reimplements: a registration endpoint shaped like the
+// backend's `JobApplicantRegistrationRequest`, a search with validated
+// query parameters, and routes with path parameters. `web::demo`'s specs
+// replay every request and compare the bytes.
+//
+// The one edit: `Location` values had Starlette's `http://testserver`
+// prefix removed, because `web::route` redirects to a path (see its
+// header). `examples/web_oracle.py` captured it and `examples/web_fixture.py`
+// wrote this file.
+//
+// Generated; do not edit by hand.
+
+module web::fixture;
+
+/// How many cases there are.
+///
+/// # Example
+/// ```tuo
+/// let n = web::fixture::count(); // 107
+/// ```
+pub fn count() -> Int {
+    107
+}
+
+/// The name of case `index`.
+///
+/// # Example
+/// ```tuo
+/// let v = web::fixture::name(0);
+/// ```
+pub fn name(take index: Int) -> Str {
+    if index == 0 {
+        return "ok";
+    }
+    if index == 1 {
+        return "ok_full";
+    }
+    if index == 2 {
+        return "missing_both";
+    }
+    if index == 3 {
+        return "missing_password";
+    }
+    if index == 4 {
+        return "short_password";
+    }
+    if index == 5 {
+        return "long_name";
+    }
+    if index == 6 {
+        return "bad_email";
+    }
+    if index == 7 {
+        return "email_wrong_type";
+    }
+    if index == 8 {
+        return "password_wrong_type";
+    }
+    if index == 9 {
+        return "lat_out_of_range";
+    }
+    if index == 10 {
+        return "lat_low";
+    }
+    if index == 11 {
+        return "lat_string";
+    }
+    if index == 12 {
+        return "age_float";
+    }
+    if index == 13 {
+        return "age_150";
+    }
+    if index == 14 {
+        return "age_negative";
+    }
+    if index == 15 {
+        return "bool_wrong";
+    }
+    if index == 16 {
+        return "tags_not_list";
+    }
+    if index == 17 {
+        return "tags_bad_item";
+    }
+    if index == 18 {
+        return "null_name";
+    }
+    if index == 19 {
+        return "null_password";
+    }
+    if index == 20 {
+        return "extra_field";
+    }
+    if index == 21 {
+        return "body_not_object";
+    }
+    if index == 22 {
+        return "body_invalid_json";
+    }
+    if index == 23 {
+        return "body_empty";
+    }
+    if index == 24 {
+        return "two_errors";
+    }
+    if index == 25 {
+        return "not_found";
+    }
+    if index == 26 {
+        return "method_not_allowed";
+    }
+    if index == 27 {
+        return "method_not_allowed_delete";
+    }
+    if index == 28 {
+        return "trailing_slash";
+    }
+    if index == 29 {
+        return "static_before_param";
+    }
+    if index == 30 {
+        return "path_int_ok";
+    }
+    if index == 31 {
+        return "path_int_bad";
+    }
+    if index == 32 {
+        return "path_int_zero";
+    }
+    if index == 33 {
+        return "query_missing";
+    }
+    if index == 34 {
+        return "query_short";
+    }
+    if index == 35 {
+        return "query_limit_high";
+    }
+    if index == 36 {
+        return "query_page_bad";
+    }
+    if index == 37 {
+        return "query_encoded";
+    }
+    if index == 38 {
+        return "two_params";
+    }
+    if index == 39 {
+        return "param_no_slash";
+    }
+    if index == 40 {
+        return "head_on_get";
+    }
+    if index == 41 {
+        return "json_trailing_comma";
+    }
+    if index == 42 {
+        return "json_missing_colon";
+    }
+    if index == 43 {
+        return "json_missing_comma";
+    }
+    if index == 44 {
+        return "json_extra_data";
+    }
+    if index == 45 {
+        return "json_unterminated_string";
+    }
+    if index == 46 {
+        return "json_bad_escape";
+    }
+    if index == 47 {
+        return "json_control_char";
+    }
+    if index == 48 {
+        return "json_single_quotes";
+    }
+    if index == 49 {
+        return "json_unclosed_array";
+    }
+    if index == 50 {
+        return "json_leading_zero";
+    }
+    if index == 51 {
+        return "json_bare_word";
+    }
+    if index == 52 {
+        return "json_scalar_body";
+    }
+    if index == 53 {
+        return "json_string_body";
+    }
+    if index == 54 {
+        return "json_null_body";
+    }
+    if index == 55 {
+        return "lax_int_from_string";
+    }
+    if index == 56 {
+        return "lax_int_from_float";
+    }
+    if index == 57 {
+        return "lax_int_from_bad_string";
+    }
+    if index == 58 {
+        return "lax_int_from_bool";
+    }
+    if index == 59 {
+        return "lax_float_from_string";
+    }
+    if index == 60 {
+        return "lax_float_from_int";
+    }
+    if index == 61 {
+        return "lax_float_from_bool";
+    }
+    if index == 62 {
+        return "lax_bool_from_string";
+    }
+    if index == 63 {
+        return "lax_bool_from_int";
+    }
+    if index == 64 {
+        return "lax_bool_from_int2";
+    }
+    if index == 65 {
+        return "lax_bool_from_off";
+    }
+    if index == 66 {
+        return "int_wrong_type_list";
+    }
+    if index == 67 {
+        return "float_wrong_type_obj";
+    }
+    if index == 68 {
+        return "bool_wrong_type_list";
+    }
+    if index == 69 {
+        return "str_from_bool";
+    }
+    if index == 70 {
+        return "password_unicode_8";
+    }
+    if index == 71 {
+        return "password_unicode_7";
+    }
+    if index == 72 {
+        return "input_echo_escapes";
+    }
+    if index == 73 {
+        return "input_echo_whitespace";
+    }
+    if index == 74 {
+        return "input_echo_nested";
+    }
+    if index == 75 {
+        return "email_no_local";
+    }
+    if index == 76 {
+        return "email_no_domain";
+    }
+    if index == 77 {
+        return "email_no_dot";
+    }
+    if index == 78 {
+        return "email_two_at";
+    }
+    if index == 79 {
+        return "email_space";
+    }
+    if index == 80 {
+        return "email_dot_start";
+    }
+    if index == 81 {
+        return "email_double_dot";
+    }
+    if index == 82 {
+        return "email_domain_dash";
+    }
+    if index == 83 {
+        return "email_upper";
+    }
+    if index == 84 {
+        return "email_plus";
+    }
+    if index == 85 {
+        return "email_empty";
+    }
+    if index == 86 {
+        return "email_tld_digit";
+    }
+    if index == 87 {
+        return "email_domain_underscore";
+    }
+    if index == 88 {
+        return "query_duplicate";
+    }
+    if index == 89 {
+        return "query_empty_value";
+    }
+    if index == 90 {
+        return "query_no_equals";
+    }
+    if index == 91 {
+        return "query_limit_zero";
+    }
+    if index == 92 {
+        return "query_int_float";
+    }
+    if index == 93 {
+        return "query_int_float_frac";
+    }
+    if index == 94 {
+        return "query_int_plus";
+    }
+    if index == 95 {
+        return "query_int_spaces";
+    }
+    if index == 96 {
+        return "query_int_negative";
+    }
+    if index == 97 {
+        return "query_int_underscore";
+    }
+    if index == 98 {
+        return "query_long";
+    }
+    if index == 99 {
+        return "query_utf8";
+    }
+    if index == 100 {
+        return "path_int_negative";
+    }
+    if index == 101 {
+        return "path_int_float";
+    }
+    if index == 102 {
+        return "root_not_found";
+    }
+    if index == 103 {
+        return "slash_redirect_with_query";
+    }
+    if index == 104 {
+        return "slash_redirect_405";
+    }
+    if index == 105 {
+        return "double_slash";
+    }
+    if index == 106 {
+        return "content_type_missing";
+    }
+    ""
+}
+
+/// The request method of case `index`.
+///
+/// # Example
+/// ```tuo
+/// let v = web::fixture::method(0);
+/// ```
+pub fn method(take index: Int) -> Str {
+    if index == 0 {
+        return "POST";
+    }
+    if index == 1 {
+        return "POST";
+    }
+    if index == 2 {
+        return "POST";
+    }
+    if index == 3 {
+        return "POST";
+    }
+    if index == 4 {
+        return "POST";
+    }
+    if index == 5 {
+        return "POST";
+    }
+    if index == 6 {
+        return "POST";
+    }
+    if index == 7 {
+        return "POST";
+    }
+    if index == 8 {
+        return "POST";
+    }
+    if index == 9 {
+        return "POST";
+    }
+    if index == 10 {
+        return "POST";
+    }
+    if index == 11 {
+        return "POST";
+    }
+    if index == 12 {
+        return "POST";
+    }
+    if index == 13 {
+        return "POST";
+    }
+    if index == 14 {
+        return "POST";
+    }
+    if index == 15 {
+        return "POST";
+    }
+    if index == 16 {
+        return "POST";
+    }
+    if index == 17 {
+        return "POST";
+    }
+    if index == 18 {
+        return "POST";
+    }
+    if index == 19 {
+        return "POST";
+    }
+    if index == 20 {
+        return "POST";
+    }
+    if index == 21 {
+        return "POST";
+    }
+    if index == 22 {
+        return "POST";
+    }
+    if index == 23 {
+        return "POST";
+    }
+    if index == 24 {
+        return "POST";
+    }
+    if index == 25 {
+        return "GET";
+    }
+    if index == 26 {
+        return "GET";
+    }
+    if index == 27 {
+        return "POST";
+    }
+    if index == 28 {
+        return "GET";
+    }
+    if index == 29 {
+        return "GET";
+    }
+    if index == 30 {
+        return "GET";
+    }
+    if index == 31 {
+        return "GET";
+    }
+    if index == 32 {
+        return "GET";
+    }
+    if index == 33 {
+        return "GET";
+    }
+    if index == 34 {
+        return "GET";
+    }
+    if index == 35 {
+        return "GET";
+    }
+    if index == 36 {
+        return "GET";
+    }
+    if index == 37 {
+        return "GET";
+    }
+    if index == 38 {
+        return "GET";
+    }
+    if index == 39 {
+        return "GET";
+    }
+    if index == 40 {
+        return "HEAD";
+    }
+    if index == 41 {
+        return "POST";
+    }
+    if index == 42 {
+        return "POST";
+    }
+    if index == 43 {
+        return "POST";
+    }
+    if index == 44 {
+        return "POST";
+    }
+    if index == 45 {
+        return "POST";
+    }
+    if index == 46 {
+        return "POST";
+    }
+    if index == 47 {
+        return "POST";
+    }
+    if index == 48 {
+        return "POST";
+    }
+    if index == 49 {
+        return "POST";
+    }
+    if index == 50 {
+        return "POST";
+    }
+    if index == 51 {
+        return "POST";
+    }
+    if index == 52 {
+        return "POST";
+    }
+    if index == 53 {
+        return "POST";
+    }
+    if index == 54 {
+        return "POST";
+    }
+    if index == 55 {
+        return "POST";
+    }
+    if index == 56 {
+        return "POST";
+    }
+    if index == 57 {
+        return "POST";
+    }
+    if index == 58 {
+        return "POST";
+    }
+    if index == 59 {
+        return "POST";
+    }
+    if index == 60 {
+        return "POST";
+    }
+    if index == 61 {
+        return "POST";
+    }
+    if index == 62 {
+        return "POST";
+    }
+    if index == 63 {
+        return "POST";
+    }
+    if index == 64 {
+        return "POST";
+    }
+    if index == 65 {
+        return "POST";
+    }
+    if index == 66 {
+        return "POST";
+    }
+    if index == 67 {
+        return "POST";
+    }
+    if index == 68 {
+        return "POST";
+    }
+    if index == 69 {
+        return "POST";
+    }
+    if index == 70 {
+        return "POST";
+    }
+    if index == 71 {
+        return "POST";
+    }
+    if index == 72 {
+        return "POST";
+    }
+    if index == 73 {
+        return "POST";
+    }
+    if index == 74 {
+        return "POST";
+    }
+    if index == 75 {
+        return "POST";
+    }
+    if index == 76 {
+        return "POST";
+    }
+    if index == 77 {
+        return "POST";
+    }
+    if index == 78 {
+        return "POST";
+    }
+    if index == 79 {
+        return "POST";
+    }
+    if index == 80 {
+        return "POST";
+    }
+    if index == 81 {
+        return "POST";
+    }
+    if index == 82 {
+        return "POST";
+    }
+    if index == 83 {
+        return "POST";
+    }
+    if index == 84 {
+        return "POST";
+    }
+    if index == 85 {
+        return "POST";
+    }
+    if index == 86 {
+        return "POST";
+    }
+    if index == 87 {
+        return "POST";
+    }
+    if index == 88 {
+        return "GET";
+    }
+    if index == 89 {
+        return "GET";
+    }
+    if index == 90 {
+        return "GET";
+    }
+    if index == 91 {
+        return "GET";
+    }
+    if index == 92 {
+        return "GET";
+    }
+    if index == 93 {
+        return "GET";
+    }
+    if index == 94 {
+        return "GET";
+    }
+    if index == 95 {
+        return "GET";
+    }
+    if index == 96 {
+        return "GET";
+    }
+    if index == 97 {
+        return "GET";
+    }
+    if index == 98 {
+        return "GET";
+    }
+    if index == 99 {
+        return "GET";
+    }
+    if index == 100 {
+        return "GET";
+    }
+    if index == 101 {
+        return "GET";
+    }
+    if index == 102 {
+        return "GET";
+    }
+    if index == 103 {
+        return "GET";
+    }
+    if index == 104 {
+        return "GET";
+    }
+    if index == 105 {
+        return "GET";
+    }
+    if index == 106 {
+        return "POST";
+    }
+    ""
+}
+
+/// The request target of case `index`.
+///
+/// # Example
+/// ```tuo
+/// let v = web::fixture::target(0);
+/// ```
+pub fn target(take index: Int) -> Str {
+    if index == 0 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 1 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 2 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 3 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 4 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 5 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 6 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 7 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 8 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 9 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 10 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 11 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 12 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 13 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 14 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 15 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 16 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 17 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 18 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 19 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 20 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 21 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 22 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 23 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 24 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 25 {
+        return "/nope";
+    }
+    if index == 26 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 27 {
+        return "/photos/3";
+    }
+    if index == 28 {
+        return "/jobs/5/";
+    }
+    if index == 29 {
+        return "/jobs/search?q=python";
+    }
+    if index == 30 {
+        return "/jobs/5";
+    }
+    if index == 31 {
+        return "/jobs/abc";
+    }
+    if index == 32 {
+        return "/jobs/0";
+    }
+    if index == 33 {
+        return "/jobs/search";
+    }
+    if index == 34 {
+        return "/jobs/search?q=p";
+    }
+    if index == 35 {
+        return "/jobs/search?q=python&limit=101";
+    }
+    if index == 36 {
+        return "/jobs/search?q=python&page=two";
+    }
+    if index == 37 {
+        return "/jobs/search?q=c%2B%2B+dev&page=2";
+    }
+    if index == 38 {
+        return "/files/employer/logo%20one.png";
+    }
+    if index == 39 {
+        return "/files/employer/a/b.png";
+    }
+    if index == 40 {
+        return "/jobs/5";
+    }
+    if index == 41 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 42 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 43 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 44 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 45 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 46 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 47 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 48 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 49 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 50 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 51 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 52 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 53 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 54 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 55 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 56 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 57 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 58 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 59 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 60 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 61 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 62 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 63 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 64 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 65 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 66 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 67 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 68 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 69 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 70 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 71 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 72 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 73 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 74 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 75 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 76 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 77 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 78 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 79 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 80 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 81 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 82 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 83 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 84 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 85 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 86 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 87 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    if index == 88 {
+        return "/jobs/search?q=aa&page=1&page=3";
+    }
+    if index == 89 {
+        return "/jobs/search?q=";
+    }
+    if index == 90 {
+        return "/jobs/search?q";
+    }
+    if index == 91 {
+        return "/jobs/search?q=aa&limit=0";
+    }
+    if index == 92 {
+        return "/jobs/search?q=aa&page=2.0";
+    }
+    if index == 93 {
+        return "/jobs/search?q=aa&page=2.5";
+    }
+    if index == 94 {
+        return "/jobs/search?q=aa&page=+2";
+    }
+    if index == 95 {
+        return "/jobs/search?q=aa&page=%202%20";
+    }
+    if index == 96 {
+        return "/jobs/search?q=aa&page=-2";
+    }
+    if index == 97 {
+        return "/jobs/search?q=aa&page=1_0";
+    }
+    if index == 98 {
+        return "/jobs/search?q=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    }
+    if index == 99 {
+        return "/jobs/search?q=%C3%A9%C3%A9";
+    }
+    if index == 100 {
+        return "/jobs/-5";
+    }
+    if index == 101 {
+        return "/jobs/5.0";
+    }
+    if index == 102 {
+        return "/";
+    }
+    if index == 103 {
+        return "/jobs/search/?q=aa";
+    }
+    if index == 104 {
+        return "/photos/3/";
+    }
+    if index == 105 {
+        return "//jobs/5";
+    }
+    if index == 106 {
+        return "/api/v1/job_applicant/auth/register";
+    }
+    ""
+}
+
+/// The request's Content-Type in case `index`, or empty when it had no body.
+///
+/// # Example
+/// ```tuo
+/// let v = web::fixture::content_type(0);
+/// ```
+pub fn content_type(take index: Int) -> Str {
+    if index == 0 {
+        return "application/json";
+    }
+    if index == 1 {
+        return "application/json";
+    }
+    if index == 2 {
+        return "application/json";
+    }
+    if index == 3 {
+        return "application/json";
+    }
+    if index == 4 {
+        return "application/json";
+    }
+    if index == 5 {
+        return "application/json";
+    }
+    if index == 6 {
+        return "application/json";
+    }
+    if index == 7 {
+        return "application/json";
+    }
+    if index == 8 {
+        return "application/json";
+    }
+    if index == 9 {
+        return "application/json";
+    }
+    if index == 10 {
+        return "application/json";
+    }
+    if index == 11 {
+        return "application/json";
+    }
+    if index == 12 {
+        return "application/json";
+    }
+    if index == 13 {
+        return "application/json";
+    }
+    if index == 14 {
+        return "application/json";
+    }
+    if index == 15 {
+        return "application/json";
+    }
+    if index == 16 {
+        return "application/json";
+    }
+    if index == 17 {
+        return "application/json";
+    }
+    if index == 18 {
+        return "application/json";
+    }
+    if index == 19 {
+        return "application/json";
+    }
+    if index == 20 {
+        return "application/json";
+    }
+    if index == 21 {
+        return "application/json";
+    }
+    if index == 22 {
+        return "application/json";
+    }
+    if index == 23 {
+        return "application/json";
+    }
+    if index == 24 {
+        return "application/json";
+    }
+    if index == 25 {
+        return "";
+    }
+    if index == 26 {
+        return "";
+    }
+    if index == 27 {
+        return "";
+    }
+    if index == 28 {
+        return "";
+    }
+    if index == 29 {
+        return "";
+    }
+    if index == 30 {
+        return "";
+    }
+    if index == 31 {
+        return "";
+    }
+    if index == 32 {
+        return "";
+    }
+    if index == 33 {
+        return "";
+    }
+    if index == 34 {
+        return "";
+    }
+    if index == 35 {
+        return "";
+    }
+    if index == 36 {
+        return "";
+    }
+    if index == 37 {
+        return "";
+    }
+    if index == 38 {
+        return "";
+    }
+    if index == 39 {
+        return "";
+    }
+    if index == 40 {
+        return "";
+    }
+    if index == 41 {
+        return "application/json";
+    }
+    if index == 42 {
+        return "application/json";
+    }
+    if index == 43 {
+        return "application/json";
+    }
+    if index == 44 {
+        return "application/json";
+    }
+    if index == 45 {
+        return "application/json";
+    }
+    if index == 46 {
+        return "application/json";
+    }
+    if index == 47 {
+        return "application/json";
+    }
+    if index == 48 {
+        return "application/json";
+    }
+    if index == 49 {
+        return "application/json";
+    }
+    if index == 50 {
+        return "application/json";
+    }
+    if index == 51 {
+        return "application/json";
+    }
+    if index == 52 {
+        return "application/json";
+    }
+    if index == 53 {
+        return "application/json";
+    }
+    if index == 54 {
+        return "application/json";
+    }
+    if index == 55 {
+        return "application/json";
+    }
+    if index == 56 {
+        return "application/json";
+    }
+    if index == 57 {
+        return "application/json";
+    }
+    if index == 58 {
+        return "application/json";
+    }
+    if index == 59 {
+        return "application/json";
+    }
+    if index == 60 {
+        return "application/json";
+    }
+    if index == 61 {
+        return "application/json";
+    }
+    if index == 62 {
+        return "application/json";
+    }
+    if index == 63 {
+        return "application/json";
+    }
+    if index == 64 {
+        return "application/json";
+    }
+    if index == 65 {
+        return "application/json";
+    }
+    if index == 66 {
+        return "application/json";
+    }
+    if index == 67 {
+        return "application/json";
+    }
+    if index == 68 {
+        return "application/json";
+    }
+    if index == 69 {
+        return "application/json";
+    }
+    if index == 70 {
+        return "application/json";
+    }
+    if index == 71 {
+        return "application/json";
+    }
+    if index == 72 {
+        return "application/json";
+    }
+    if index == 73 {
+        return "application/json";
+    }
+    if index == 74 {
+        return "application/json";
+    }
+    if index == 75 {
+        return "application/json";
+    }
+    if index == 76 {
+        return "application/json";
+    }
+    if index == 77 {
+        return "application/json";
+    }
+    if index == 78 {
+        return "application/json";
+    }
+    if index == 79 {
+        return "application/json";
+    }
+    if index == 80 {
+        return "application/json";
+    }
+    if index == 81 {
+        return "application/json";
+    }
+    if index == 82 {
+        return "application/json";
+    }
+    if index == 83 {
+        return "application/json";
+    }
+    if index == 84 {
+        return "application/json";
+    }
+    if index == 85 {
+        return "application/json";
+    }
+    if index == 86 {
+        return "application/json";
+    }
+    if index == 87 {
+        return "application/json";
+    }
+    if index == 88 {
+        return "";
+    }
+    if index == 89 {
+        return "";
+    }
+    if index == 90 {
+        return "";
+    }
+    if index == 91 {
+        return "";
+    }
+    if index == 92 {
+        return "";
+    }
+    if index == 93 {
+        return "";
+    }
+    if index == 94 {
+        return "";
+    }
+    if index == 95 {
+        return "";
+    }
+    if index == 96 {
+        return "";
+    }
+    if index == 97 {
+        return "";
+    }
+    if index == 98 {
+        return "";
+    }
+    if index == 99 {
+        return "";
+    }
+    if index == 100 {
+        return "";
+    }
+    if index == 101 {
+        return "";
+    }
+    if index == 102 {
+        return "";
+    }
+    if index == 103 {
+        return "";
+    }
+    if index == 104 {
+        return "";
+    }
+    if index == 105 {
+        return "";
+    }
+    if index == 106 {
+        return "text/plain";
+    }
+    ""
+}
+
+/// The request body of case `index`.
+///
+/// # Example
+/// ```tuo
+/// let v = web::fixture::body(0);
+/// ```
+pub fn body(take index: Int) -> Str {
+    if index == 0 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 1 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":\"Jane\",\"location_lat\":40.7128,\"location_lng\":-74.006,\"age\":30,\"newsletter\":true,\"tags\":[\"a\",\"b\"]}";
+    }
+    if index == 2 {
+        return "{}";
+    }
+    if index == 3 {
+        return "{\"email\":\"jane@example.com\"}";
+    }
+    if index == 4 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"short\"}";
+    }
+    if index == 5 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}";
+    }
+    if index == 6 {
+        return "{\"email\":\"not-an-email\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 7 {
+        return "{\"email\":42,\"password\":\"SecurePass123!\"}";
+    }
+    if index == 8 {
+        return "{\"email\":\"jane@example.com\",\"password\":12345678}";
+    }
+    if index == 9 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"location_lat\":91.5}";
+    }
+    if index == 10 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"location_lat\":-91}";
+    }
+    if index == 11 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"location_lat\":\"north\"}";
+    }
+    if index == 12 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"age\":30.5}";
+    }
+    if index == 13 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"age\":150}";
+    }
+    if index == 14 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"age\":-1}";
+    }
+    if index == 15 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"newsletter\":\"maybe\"}";
+    }
+    if index == 16 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"tags\":\"a\"}";
+    }
+    if index == 17 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"tags\":[\"a\",7]}";
+    }
+    if index == 18 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null}";
+    }
+    if index == 19 {
+        return "{\"email\":\"jane@example.com\",\"password\":null}";
+    }
+    if index == 20 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"role\":\"admin\"}";
+    }
+    if index == 21 {
+        return "[1,2]";
+    }
+    if index == 22 {
+        return "{\"email\": ";
+    }
+    if index == 23 {
+        return "";
+    }
+    if index == 24 {
+        return "{\"email\":\"nope\",\"password\":\"x\"}";
+    }
+    if index == 25 {
+        return "";
+    }
+    if index == 26 {
+        return "";
+    }
+    if index == 27 {
+        return "";
+    }
+    if index == 28 {
+        return "";
+    }
+    if index == 29 {
+        return "";
+    }
+    if index == 30 {
+        return "";
+    }
+    if index == 31 {
+        return "";
+    }
+    if index == 32 {
+        return "";
+    }
+    if index == 33 {
+        return "";
+    }
+    if index == 34 {
+        return "";
+    }
+    if index == 35 {
+        return "";
+    }
+    if index == 36 {
+        return "";
+    }
+    if index == 37 {
+        return "";
+    }
+    if index == 38 {
+        return "";
+    }
+    if index == 39 {
+        return "";
+    }
+    if index == 40 {
+        return "";
+    }
+    if index == 41 {
+        return "{\"email\":\"a@b.co\",}";
+    }
+    if index == 42 {
+        return "{\"email\" \"a@b.co\"}";
+    }
+    if index == 43 {
+        return "{\"email\":\"a@b.co\" \"password\":\"x\"}";
+    }
+    if index == 44 {
+        return "{} {}";
+    }
+    if index == 45 {
+        return "{\"email\":\"a@b.co";
+    }
+    if index == 46 {
+        return "{\"email\":\"a\\qb\"}";
+    }
+    if index == 47 {
+        return "{\"email\":\"a\tb\"}";
+    }
+    if index == 48 {
+        return "{'email':'a'}";
+    }
+    if index == 49 {
+        return "{\"tags\":[\"a\"";
+    }
+    if index == 50 {
+        return "{\"age\":01}";
+    }
+    if index == 51 {
+        return "nope";
+    }
+    if index == 52 {
+        return "42";
+    }
+    if index == 53 {
+        return "\"hi\"";
+    }
+    if index == 54 {
+        return "null";
+    }
+    if index == 55 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"age\":\"30\"}";
+    }
+    if index == 56 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"age\":30.0}";
+    }
+    if index == 57 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"age\":\"thirty\"}";
+    }
+    if index == 58 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"age\":true}";
+    }
+    if index == 59 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"location_lat\":\"40.5\"}";
+    }
+    if index == 60 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"location_lat\":40}";
+    }
+    if index == 61 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"location_lat\":true}";
+    }
+    if index == 62 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"newsletter\":\"yes\"}";
+    }
+    if index == 63 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"newsletter\":1}";
+    }
+    if index == 64 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"newsletter\":2}";
+    }
+    if index == 65 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"newsletter\":\"OFF\"}";
+    }
+    if index == 66 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"age\":[1]}";
+    }
+    if index == 67 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"location_lat\":{}}";
+    }
+    if index == 68 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"newsletter\":[]}";
+    }
+    if index == 69 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":true}";
+    }
+    if index == 70 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\"}";
+    }
+    if index == 71 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\"}";
+    }
+    if index == 72 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"a\\\"b\\\\\\n\\u00e9\"}";
+    }
+    if index == 73 {
+        return "{ \"email\" : \"jane@example.com\" ,\n \"tags\" : [ 1 , 2 ] }";
+    }
+    if index == 74 {
+        return "{\"email\":{\"a\":[1,2.5,null,true,false,\"x\"]},\"password\":\"SecurePass123!\"}";
+    }
+    if index == 75 {
+        return "{\"email\":\"@example.com\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 76 {
+        return "{\"email\":\"jane@\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 77 {
+        return "{\"email\":\"jane@example\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 78 {
+        return "{\"email\":\"ja@ne@example.com\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 79 {
+        return "{\"email\":\"ja ne@example.com\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 80 {
+        return "{\"email\":\".jane@example.com\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 81 {
+        return "{\"email\":\"ja..ne@example.com\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 82 {
+        return "{\"email\":\"jane@-example.com\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 83 {
+        return "{\"email\":\"Jane@EXAMPLE.com\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 84 {
+        return "{\"email\":\"jane+tag@sub.example.co.uk\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 85 {
+        return "{\"email\":\"\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 86 {
+        return "{\"email\":\"jane@example.c0m\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 87 {
+        return "{\"email\":\"jane@exa_mple.com\",\"password\":\"SecurePass123!\"}";
+    }
+    if index == 88 {
+        return "";
+    }
+    if index == 89 {
+        return "";
+    }
+    if index == 90 {
+        return "";
+    }
+    if index == 91 {
+        return "";
+    }
+    if index == 92 {
+        return "";
+    }
+    if index == 93 {
+        return "";
+    }
+    if index == 94 {
+        return "";
+    }
+    if index == 95 {
+        return "";
+    }
+    if index == 96 {
+        return "";
+    }
+    if index == 97 {
+        return "";
+    }
+    if index == 98 {
+        return "";
+    }
+    if index == 99 {
+        return "";
+    }
+    if index == 100 {
+        return "";
+    }
+    if index == 101 {
+        return "";
+    }
+    if index == 102 {
+        return "";
+    }
+    if index == 103 {
+        return "";
+    }
+    if index == 104 {
+        return "";
+    }
+    if index == 105 {
+        return "";
+    }
+    if index == 106 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\"}";
+    }
+    ""
+}
+
+/// The status FastAPI answered case `index` with.
+///
+/// # Example
+/// ```tuo
+/// let v = web::fixture::status(0);
+/// ```
+pub fn status(take index: Int) -> Int {
+    if index == 0 {
+        return 200;
+    }
+    if index == 1 {
+        return 200;
+    }
+    if index == 2 {
+        return 422;
+    }
+    if index == 3 {
+        return 422;
+    }
+    if index == 4 {
+        return 422;
+    }
+    if index == 5 {
+        return 422;
+    }
+    if index == 6 {
+        return 422;
+    }
+    if index == 7 {
+        return 422;
+    }
+    if index == 8 {
+        return 422;
+    }
+    if index == 9 {
+        return 422;
+    }
+    if index == 10 {
+        return 422;
+    }
+    if index == 11 {
+        return 422;
+    }
+    if index == 12 {
+        return 422;
+    }
+    if index == 13 {
+        return 422;
+    }
+    if index == 14 {
+        return 422;
+    }
+    if index == 15 {
+        return 422;
+    }
+    if index == 16 {
+        return 422;
+    }
+    if index == 17 {
+        return 422;
+    }
+    if index == 18 {
+        return 200;
+    }
+    if index == 19 {
+        return 422;
+    }
+    if index == 20 {
+        return 200;
+    }
+    if index == 21 {
+        return 422;
+    }
+    if index == 22 {
+        return 422;
+    }
+    if index == 23 {
+        return 422;
+    }
+    if index == 24 {
+        return 422;
+    }
+    if index == 25 {
+        return 404;
+    }
+    if index == 26 {
+        return 405;
+    }
+    if index == 27 {
+        return 405;
+    }
+    if index == 28 {
+        return 307;
+    }
+    if index == 29 {
+        return 200;
+    }
+    if index == 30 {
+        return 200;
+    }
+    if index == 31 {
+        return 422;
+    }
+    if index == 32 {
+        return 422;
+    }
+    if index == 33 {
+        return 422;
+    }
+    if index == 34 {
+        return 422;
+    }
+    if index == 35 {
+        return 422;
+    }
+    if index == 36 {
+        return 422;
+    }
+    if index == 37 {
+        return 200;
+    }
+    if index == 38 {
+        return 200;
+    }
+    if index == 39 {
+        return 404;
+    }
+    if index == 40 {
+        return 405;
+    }
+    if index == 41 {
+        return 422;
+    }
+    if index == 42 {
+        return 422;
+    }
+    if index == 43 {
+        return 422;
+    }
+    if index == 44 {
+        return 422;
+    }
+    if index == 45 {
+        return 422;
+    }
+    if index == 46 {
+        return 422;
+    }
+    if index == 47 {
+        return 422;
+    }
+    if index == 48 {
+        return 422;
+    }
+    if index == 49 {
+        return 422;
+    }
+    if index == 50 {
+        return 422;
+    }
+    if index == 51 {
+        return 422;
+    }
+    if index == 52 {
+        return 422;
+    }
+    if index == 53 {
+        return 422;
+    }
+    if index == 54 {
+        return 422;
+    }
+    if index == 55 {
+        return 200;
+    }
+    if index == 56 {
+        return 200;
+    }
+    if index == 57 {
+        return 422;
+    }
+    if index == 58 {
+        return 200;
+    }
+    if index == 59 {
+        return 200;
+    }
+    if index == 60 {
+        return 200;
+    }
+    if index == 61 {
+        return 200;
+    }
+    if index == 62 {
+        return 200;
+    }
+    if index == 63 {
+        return 200;
+    }
+    if index == 64 {
+        return 422;
+    }
+    if index == 65 {
+        return 200;
+    }
+    if index == 66 {
+        return 422;
+    }
+    if index == 67 {
+        return 422;
+    }
+    if index == 68 {
+        return 422;
+    }
+    if index == 69 {
+        return 422;
+    }
+    if index == 70 {
+        return 200;
+    }
+    if index == 71 {
+        return 422;
+    }
+    if index == 72 {
+        return 422;
+    }
+    if index == 73 {
+        return 422;
+    }
+    if index == 74 {
+        return 422;
+    }
+    if index == 75 {
+        return 422;
+    }
+    if index == 76 {
+        return 422;
+    }
+    if index == 77 {
+        return 422;
+    }
+    if index == 78 {
+        return 422;
+    }
+    if index == 79 {
+        return 422;
+    }
+    if index == 80 {
+        return 422;
+    }
+    if index == 81 {
+        return 422;
+    }
+    if index == 82 {
+        return 422;
+    }
+    if index == 83 {
+        return 200;
+    }
+    if index == 84 {
+        return 200;
+    }
+    if index == 85 {
+        return 422;
+    }
+    if index == 86 {
+        return 200;
+    }
+    if index == 87 {
+        return 422;
+    }
+    if index == 88 {
+        return 200;
+    }
+    if index == 89 {
+        return 422;
+    }
+    if index == 90 {
+        return 422;
+    }
+    if index == 91 {
+        return 422;
+    }
+    if index == 92 {
+        return 200;
+    }
+    if index == 93 {
+        return 422;
+    }
+    if index == 94 {
+        return 200;
+    }
+    if index == 95 {
+        return 200;
+    }
+    if index == 96 {
+        return 422;
+    }
+    if index == 97 {
+        return 200;
+    }
+    if index == 98 {
+        return 422;
+    }
+    if index == 99 {
+        return 200;
+    }
+    if index == 100 {
+        return 422;
+    }
+    if index == 101 {
+        return 200;
+    }
+    if index == 102 {
+        return 404;
+    }
+    if index == 103 {
+        return 307;
+    }
+    if index == 104 {
+        return 307;
+    }
+    if index == 105 {
+        return 404;
+    }
+    if index == 106 {
+        return 422;
+    }
+    0
+}
+
+/// The `Allow` header FastAPI sent in case `index`, or empty.
+///
+/// # Example
+/// ```tuo
+/// let v = web::fixture::allow(0);
+/// ```
+pub fn allow(take index: Int) -> Str {
+    if index == 0 {
+        return "";
+    }
+    if index == 1 {
+        return "";
+    }
+    if index == 2 {
+        return "";
+    }
+    if index == 3 {
+        return "";
+    }
+    if index == 4 {
+        return "";
+    }
+    if index == 5 {
+        return "";
+    }
+    if index == 6 {
+        return "";
+    }
+    if index == 7 {
+        return "";
+    }
+    if index == 8 {
+        return "";
+    }
+    if index == 9 {
+        return "";
+    }
+    if index == 10 {
+        return "";
+    }
+    if index == 11 {
+        return "";
+    }
+    if index == 12 {
+        return "";
+    }
+    if index == 13 {
+        return "";
+    }
+    if index == 14 {
+        return "";
+    }
+    if index == 15 {
+        return "";
+    }
+    if index == 16 {
+        return "";
+    }
+    if index == 17 {
+        return "";
+    }
+    if index == 18 {
+        return "";
+    }
+    if index == 19 {
+        return "";
+    }
+    if index == 20 {
+        return "";
+    }
+    if index == 21 {
+        return "";
+    }
+    if index == 22 {
+        return "";
+    }
+    if index == 23 {
+        return "";
+    }
+    if index == 24 {
+        return "";
+    }
+    if index == 25 {
+        return "";
+    }
+    if index == 26 {
+        return "POST";
+    }
+    if index == 27 {
+        return "DELETE";
+    }
+    if index == 28 {
+        return "";
+    }
+    if index == 29 {
+        return "";
+    }
+    if index == 30 {
+        return "";
+    }
+    if index == 31 {
+        return "";
+    }
+    if index == 32 {
+        return "";
+    }
+    if index == 33 {
+        return "";
+    }
+    if index == 34 {
+        return "";
+    }
+    if index == 35 {
+        return "";
+    }
+    if index == 36 {
+        return "";
+    }
+    if index == 37 {
+        return "";
+    }
+    if index == 38 {
+        return "";
+    }
+    if index == 39 {
+        return "";
+    }
+    if index == 40 {
+        return "GET";
+    }
+    if index == 41 {
+        return "";
+    }
+    if index == 42 {
+        return "";
+    }
+    if index == 43 {
+        return "";
+    }
+    if index == 44 {
+        return "";
+    }
+    if index == 45 {
+        return "";
+    }
+    if index == 46 {
+        return "";
+    }
+    if index == 47 {
+        return "";
+    }
+    if index == 48 {
+        return "";
+    }
+    if index == 49 {
+        return "";
+    }
+    if index == 50 {
+        return "";
+    }
+    if index == 51 {
+        return "";
+    }
+    if index == 52 {
+        return "";
+    }
+    if index == 53 {
+        return "";
+    }
+    if index == 54 {
+        return "";
+    }
+    if index == 55 {
+        return "";
+    }
+    if index == 56 {
+        return "";
+    }
+    if index == 57 {
+        return "";
+    }
+    if index == 58 {
+        return "";
+    }
+    if index == 59 {
+        return "";
+    }
+    if index == 60 {
+        return "";
+    }
+    if index == 61 {
+        return "";
+    }
+    if index == 62 {
+        return "";
+    }
+    if index == 63 {
+        return "";
+    }
+    if index == 64 {
+        return "";
+    }
+    if index == 65 {
+        return "";
+    }
+    if index == 66 {
+        return "";
+    }
+    if index == 67 {
+        return "";
+    }
+    if index == 68 {
+        return "";
+    }
+    if index == 69 {
+        return "";
+    }
+    if index == 70 {
+        return "";
+    }
+    if index == 71 {
+        return "";
+    }
+    if index == 72 {
+        return "";
+    }
+    if index == 73 {
+        return "";
+    }
+    if index == 74 {
+        return "";
+    }
+    if index == 75 {
+        return "";
+    }
+    if index == 76 {
+        return "";
+    }
+    if index == 77 {
+        return "";
+    }
+    if index == 78 {
+        return "";
+    }
+    if index == 79 {
+        return "";
+    }
+    if index == 80 {
+        return "";
+    }
+    if index == 81 {
+        return "";
+    }
+    if index == 82 {
+        return "";
+    }
+    if index == 83 {
+        return "";
+    }
+    if index == 84 {
+        return "";
+    }
+    if index == 85 {
+        return "";
+    }
+    if index == 86 {
+        return "";
+    }
+    if index == 87 {
+        return "";
+    }
+    if index == 88 {
+        return "";
+    }
+    if index == 89 {
+        return "";
+    }
+    if index == 90 {
+        return "";
+    }
+    if index == 91 {
+        return "";
+    }
+    if index == 92 {
+        return "";
+    }
+    if index == 93 {
+        return "";
+    }
+    if index == 94 {
+        return "";
+    }
+    if index == 95 {
+        return "";
+    }
+    if index == 96 {
+        return "";
+    }
+    if index == 97 {
+        return "";
+    }
+    if index == 98 {
+        return "";
+    }
+    if index == 99 {
+        return "";
+    }
+    if index == 100 {
+        return "";
+    }
+    if index == 101 {
+        return "";
+    }
+    if index == 102 {
+        return "";
+    }
+    if index == 103 {
+        return "";
+    }
+    if index == 104 {
+        return "";
+    }
+    if index == 105 {
+        return "";
+    }
+    if index == 106 {
+        return "";
+    }
+    ""
+}
+
+/// The `Location` FastAPI sent in case `index`, as a path, or empty.
+///
+/// # Example
+/// ```tuo
+/// let v = web::fixture::location(0);
+/// ```
+pub fn location(take index: Int) -> Str {
+    if index == 0 {
+        return "";
+    }
+    if index == 1 {
+        return "";
+    }
+    if index == 2 {
+        return "";
+    }
+    if index == 3 {
+        return "";
+    }
+    if index == 4 {
+        return "";
+    }
+    if index == 5 {
+        return "";
+    }
+    if index == 6 {
+        return "";
+    }
+    if index == 7 {
+        return "";
+    }
+    if index == 8 {
+        return "";
+    }
+    if index == 9 {
+        return "";
+    }
+    if index == 10 {
+        return "";
+    }
+    if index == 11 {
+        return "";
+    }
+    if index == 12 {
+        return "";
+    }
+    if index == 13 {
+        return "";
+    }
+    if index == 14 {
+        return "";
+    }
+    if index == 15 {
+        return "";
+    }
+    if index == 16 {
+        return "";
+    }
+    if index == 17 {
+        return "";
+    }
+    if index == 18 {
+        return "";
+    }
+    if index == 19 {
+        return "";
+    }
+    if index == 20 {
+        return "";
+    }
+    if index == 21 {
+        return "";
+    }
+    if index == 22 {
+        return "";
+    }
+    if index == 23 {
+        return "";
+    }
+    if index == 24 {
+        return "";
+    }
+    if index == 25 {
+        return "";
+    }
+    if index == 26 {
+        return "";
+    }
+    if index == 27 {
+        return "";
+    }
+    if index == 28 {
+        return "/jobs/5";
+    }
+    if index == 29 {
+        return "";
+    }
+    if index == 30 {
+        return "";
+    }
+    if index == 31 {
+        return "";
+    }
+    if index == 32 {
+        return "";
+    }
+    if index == 33 {
+        return "";
+    }
+    if index == 34 {
+        return "";
+    }
+    if index == 35 {
+        return "";
+    }
+    if index == 36 {
+        return "";
+    }
+    if index == 37 {
+        return "";
+    }
+    if index == 38 {
+        return "";
+    }
+    if index == 39 {
+        return "";
+    }
+    if index == 40 {
+        return "";
+    }
+    if index == 41 {
+        return "";
+    }
+    if index == 42 {
+        return "";
+    }
+    if index == 43 {
+        return "";
+    }
+    if index == 44 {
+        return "";
+    }
+    if index == 45 {
+        return "";
+    }
+    if index == 46 {
+        return "";
+    }
+    if index == 47 {
+        return "";
+    }
+    if index == 48 {
+        return "";
+    }
+    if index == 49 {
+        return "";
+    }
+    if index == 50 {
+        return "";
+    }
+    if index == 51 {
+        return "";
+    }
+    if index == 52 {
+        return "";
+    }
+    if index == 53 {
+        return "";
+    }
+    if index == 54 {
+        return "";
+    }
+    if index == 55 {
+        return "";
+    }
+    if index == 56 {
+        return "";
+    }
+    if index == 57 {
+        return "";
+    }
+    if index == 58 {
+        return "";
+    }
+    if index == 59 {
+        return "";
+    }
+    if index == 60 {
+        return "";
+    }
+    if index == 61 {
+        return "";
+    }
+    if index == 62 {
+        return "";
+    }
+    if index == 63 {
+        return "";
+    }
+    if index == 64 {
+        return "";
+    }
+    if index == 65 {
+        return "";
+    }
+    if index == 66 {
+        return "";
+    }
+    if index == 67 {
+        return "";
+    }
+    if index == 68 {
+        return "";
+    }
+    if index == 69 {
+        return "";
+    }
+    if index == 70 {
+        return "";
+    }
+    if index == 71 {
+        return "";
+    }
+    if index == 72 {
+        return "";
+    }
+    if index == 73 {
+        return "";
+    }
+    if index == 74 {
+        return "";
+    }
+    if index == 75 {
+        return "";
+    }
+    if index == 76 {
+        return "";
+    }
+    if index == 77 {
+        return "";
+    }
+    if index == 78 {
+        return "";
+    }
+    if index == 79 {
+        return "";
+    }
+    if index == 80 {
+        return "";
+    }
+    if index == 81 {
+        return "";
+    }
+    if index == 82 {
+        return "";
+    }
+    if index == 83 {
+        return "";
+    }
+    if index == 84 {
+        return "";
+    }
+    if index == 85 {
+        return "";
+    }
+    if index == 86 {
+        return "";
+    }
+    if index == 87 {
+        return "";
+    }
+    if index == 88 {
+        return "";
+    }
+    if index == 89 {
+        return "";
+    }
+    if index == 90 {
+        return "";
+    }
+    if index == 91 {
+        return "";
+    }
+    if index == 92 {
+        return "";
+    }
+    if index == 93 {
+        return "";
+    }
+    if index == 94 {
+        return "";
+    }
+    if index == 95 {
+        return "";
+    }
+    if index == 96 {
+        return "";
+    }
+    if index == 97 {
+        return "";
+    }
+    if index == 98 {
+        return "";
+    }
+    if index == 99 {
+        return "";
+    }
+    if index == 100 {
+        return "";
+    }
+    if index == 101 {
+        return "";
+    }
+    if index == 102 {
+        return "";
+    }
+    if index == 103 {
+        return "/jobs/search?q=aa";
+    }
+    if index == 104 {
+        return "/photos/3";
+    }
+    if index == 105 {
+        return "";
+    }
+    if index == 106 {
+        return "";
+    }
+    ""
+}
+
+/// The body FastAPI answered case `index` with.
+///
+/// # Example
+/// ```tuo
+/// let v = web::fixture::response(0);
+/// ```
+pub fn response(take index: Int) -> Str {
+    if index == 0 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 1 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":\"Jane\",\"location_lat\":40.7128,\"location_lng\":-74.006,\"age\":30,\"newsletter\":true,\"tags\":[\"a\",\"b\"]}";
+    }
+    if index == 2 {
+        return "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\",\"email\"],\"msg\":\"Field required\",\"input\":{}},{\"type\":\"missing\",\"loc\":[\"body\",\"password\"],\"msg\":\"Field required\",\"input\":{}}]}";
+    }
+    if index == 3 {
+        return "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\",\"password\"],\"msg\":\"Field required\",\"input\":{\"email\":\"jane@example.com\"}}]}";
+    }
+    if index == 4 {
+        return "{\"detail\":[{\"type\":\"string_too_short\",\"loc\":[\"body\",\"password\"],\"msg\":\"String should have at least 8 characters\",\"input\":\"short\",\"ctx\":{\"min_length\":8}}]}";
+    }
+    if index == 5 {
+        return "{\"detail\":[{\"type\":\"string_too_long\",\"loc\":[\"body\",\"name\"],\"msg\":\"String should have at most 255 characters\",\"input\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\",\"ctx\":{\"max_length\":255}}]}";
+    }
+    if index == 6 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: An email address must have an @-sign.\",\"input\":\"not-an-email\",\"ctx\":{\"reason\":\"An email address must have an @-sign.\"}}]}";
+    }
+    if index == 7 {
+        return "{\"detail\":[{\"type\":\"string_type\",\"loc\":[\"body\",\"email\"],\"msg\":\"Input should be a valid string\",\"input\":42}]}";
+    }
+    if index == 8 {
+        return "{\"detail\":[{\"type\":\"string_type\",\"loc\":[\"body\",\"password\"],\"msg\":\"Input should be a valid string\",\"input\":12345678}]}";
+    }
+    if index == 9 {
+        return "{\"detail\":[{\"type\":\"less_than_equal\",\"loc\":[\"body\",\"location_lat\"],\"msg\":\"Input should be less than or equal to 90\",\"input\":91.5,\"ctx\":{\"le\":90.0}}]}";
+    }
+    if index == 10 {
+        return "{\"detail\":[{\"type\":\"greater_than_equal\",\"loc\":[\"body\",\"location_lat\"],\"msg\":\"Input should be greater than or equal to -90\",\"input\":-91,\"ctx\":{\"ge\":-90.0}}]}";
+    }
+    if index == 11 {
+        return "{\"detail\":[{\"type\":\"float_parsing\",\"loc\":[\"body\",\"location_lat\"],\"msg\":\"Input should be a valid number, unable to parse string as a number\",\"input\":\"north\"}]}";
+    }
+    if index == 12 {
+        return "{\"detail\":[{\"type\":\"int_from_float\",\"loc\":[\"body\",\"age\"],\"msg\":\"Input should be a valid integer, got a number with a fractional part\",\"input\":30.5}]}";
+    }
+    if index == 13 {
+        return "{\"detail\":[{\"type\":\"less_than\",\"loc\":[\"body\",\"age\"],\"msg\":\"Input should be less than 150\",\"input\":150,\"ctx\":{\"lt\":150}}]}";
+    }
+    if index == 14 {
+        return "{\"detail\":[{\"type\":\"greater_than_equal\",\"loc\":[\"body\",\"age\"],\"msg\":\"Input should be greater than or equal to 0\",\"input\":-1,\"ctx\":{\"ge\":0}}]}";
+    }
+    if index == 15 {
+        return "{\"detail\":[{\"type\":\"bool_parsing\",\"loc\":[\"body\",\"newsletter\"],\"msg\":\"Input should be a valid boolean, unable to interpret input\",\"input\":\"maybe\"}]}";
+    }
+    if index == 16 {
+        return "{\"detail\":[{\"type\":\"list_type\",\"loc\":[\"body\",\"tags\"],\"msg\":\"Input should be a valid list\",\"input\":\"a\"}]}";
+    }
+    if index == 17 {
+        return "{\"detail\":[{\"type\":\"string_type\",\"loc\":[\"body\",\"tags\",1],\"msg\":\"Input should be a valid string\",\"input\":7}]}";
+    }
+    if index == 18 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 19 {
+        return "{\"detail\":[{\"type\":\"string_type\",\"loc\":[\"body\",\"password\"],\"msg\":\"Input should be a valid string\",\"input\":null}]}";
+    }
+    if index == 20 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 21 {
+        return "{\"detail\":[{\"type\":\"model_attributes_type\",\"loc\":[\"body\"],\"msg\":\"Input should be a valid dictionary or object to extract fields from\",\"input\":[1,2]}]}";
+    }
+    if index == 22 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",10],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Expecting value\"}}]}";
+    }
+    if index == 23 {
+        return "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\"],\"msg\":\"Field required\",\"input\":null}]}";
+    }
+    if index == 24 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: An email address must have an @-sign.\",\"input\":\"nope\",\"ctx\":{\"reason\":\"An email address must have an @-sign.\"}},{\"type\":\"string_too_short\",\"loc\":[\"body\",\"password\"],\"msg\":\"String should have at least 8 characters\",\"input\":\"x\",\"ctx\":{\"min_length\":8}}]}";
+    }
+    if index == 25 {
+        return "{\"detail\":\"Not Found\"}";
+    }
+    if index == 26 {
+        return "{\"detail\":\"Method Not Allowed\"}";
+    }
+    if index == 27 {
+        return "{\"detail\":\"Method Not Allowed\"}";
+    }
+    if index == 28 {
+        return "";
+    }
+    if index == 29 {
+        return "{\"q\":\"python\",\"page\":1,\"limit\":20}";
+    }
+    if index == 30 {
+        return "{\"job_id\":5}";
+    }
+    if index == 31 {
+        return "{\"detail\":[{\"type\":\"int_parsing\",\"loc\":[\"path\",\"job_id\"],\"msg\":\"Input should be a valid integer, unable to parse string as an integer\",\"input\":\"abc\"}]}";
+    }
+    if index == 32 {
+        return "{\"detail\":[{\"type\":\"greater_than_equal\",\"loc\":[\"path\",\"job_id\"],\"msg\":\"Input should be greater than or equal to 1\",\"input\":\"0\",\"ctx\":{\"ge\":1}}]}";
+    }
+    if index == 33 {
+        return "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"query\",\"q\"],\"msg\":\"Field required\",\"input\":null}]}";
+    }
+    if index == 34 {
+        return "{\"detail\":[{\"type\":\"string_too_short\",\"loc\":[\"query\",\"q\"],\"msg\":\"String should have at least 2 characters\",\"input\":\"p\",\"ctx\":{\"min_length\":2}}]}";
+    }
+    if index == 35 {
+        return "{\"detail\":[{\"type\":\"less_than_equal\",\"loc\":[\"query\",\"limit\"],\"msg\":\"Input should be less than or equal to 100\",\"input\":\"101\",\"ctx\":{\"le\":100}}]}";
+    }
+    if index == 36 {
+        return "{\"detail\":[{\"type\":\"int_parsing\",\"loc\":[\"query\",\"page\"],\"msg\":\"Input should be a valid integer, unable to parse string as an integer\",\"input\":\"two\"}]}";
+    }
+    if index == 37 {
+        return "{\"q\":\"c++ dev\",\"page\":2,\"limit\":20}";
+    }
+    if index == 38 {
+        return "{\"owner_type\":\"employer\",\"filename\":\"logo one.png\"}";
+    }
+    if index == 39 {
+        return "{\"detail\":\"Not Found\"}";
+    }
+    if index == 40 {
+        return "";
+    }
+    if index == 41 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",17],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Illegal trailing comma before end of object\"}}]}";
+    }
+    if index == 42 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",9],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Expecting ':' delimiter\"}}]}";
+    }
+    if index == 43 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",18],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Expecting ',' delimiter\"}}]}";
+    }
+    if index == 44 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",3],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Extra data\"}}]}";
+    }
+    if index == 45 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",9],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Unterminated string starting at\"}}]}";
+    }
+    if index == 46 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",11],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Invalid \\\\escape\"}}]}";
+    }
+    if index == 47 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",11],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Invalid control character at\"}}]}";
+    }
+    if index == 48 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",1],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Expecting property name enclosed in double quotes\"}}]}";
+    }
+    if index == 49 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",12],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Expecting ',' delimiter\"}}]}";
+    }
+    if index == 50 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",8],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Expecting ',' delimiter\"}}]}";
+    }
+    if index == 51 {
+        return "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",0],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Expecting value\"}}]}";
+    }
+    if index == 52 {
+        return "{\"detail\":[{\"type\":\"model_attributes_type\",\"loc\":[\"body\"],\"msg\":\"Input should be a valid dictionary or object to extract fields from\",\"input\":42}]}";
+    }
+    if index == 53 {
+        return "{\"detail\":[{\"type\":\"model_attributes_type\",\"loc\":[\"body\"],\"msg\":\"Input should be a valid dictionary or object to extract fields from\",\"input\":\"hi\"}]}";
+    }
+    if index == 54 {
+        return "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\"],\"msg\":\"Field required\",\"input\":null}]}";
+    }
+    if index == 55 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":30,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 56 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":30,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 57 {
+        return "{\"detail\":[{\"type\":\"int_parsing\",\"loc\":[\"body\",\"age\"],\"msg\":\"Input should be a valid integer, unable to parse string as an integer\",\"input\":\"thirty\"}]}";
+    }
+    if index == 58 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":1,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 59 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":40.5,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 60 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":40.0,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 61 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":1.0,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 62 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":null,\"newsletter\":true,\"tags\":[]}";
+    }
+    if index == 63 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":null,\"newsletter\":true,\"tags\":[]}";
+    }
+    if index == 64 {
+        return "{\"detail\":[{\"type\":\"bool_parsing\",\"loc\":[\"body\",\"newsletter\"],\"msg\":\"Input should be a valid boolean, unable to interpret input\",\"input\":2}]}";
+    }
+    if index == 65 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 66 {
+        return "{\"detail\":[{\"type\":\"int_type\",\"loc\":[\"body\",\"age\"],\"msg\":\"Input should be a valid integer\",\"input\":[1]}]}";
+    }
+    if index == 67 {
+        return "{\"detail\":[{\"type\":\"float_type\",\"loc\":[\"body\",\"location_lat\"],\"msg\":\"Input should be a valid number\",\"input\":{}}]}";
+    }
+    if index == 68 {
+        return "{\"detail\":[{\"type\":\"bool_type\",\"loc\":[\"body\",\"newsletter\"],\"msg\":\"Input should be a valid boolean\",\"input\":[]}]}";
+    }
+    if index == 69 {
+        return "{\"detail\":[{\"type\":\"string_type\",\"loc\":[\"body\",\"name\"],\"msg\":\"Input should be a valid string\",\"input\":true}]}";
+    }
+    if index == 70 {
+        return "{\"email\":\"jane@example.com\",\"password\":\"\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 71 {
+        return "{\"detail\":[{\"type\":\"string_too_short\",\"loc\":[\"body\",\"password\"],\"msg\":\"String should have at least 8 characters\",\"input\":\"\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\",\"ctx\":{\"min_length\":8}}]}";
+    }
+    if index == 72 {
+        return "{\"detail\":[{\"type\":\"string_too_short\",\"loc\":[\"body\",\"password\"],\"msg\":\"String should have at least 8 characters\",\"input\":\"a\\\"b\\\\\\n\u{e9}\",\"ctx\":{\"min_length\":8}}]}";
+    }
+    if index == 73 {
+        return "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\",\"password\"],\"msg\":\"Field required\",\"input\":{\"email\":\"jane@example.com\",\"tags\":[1,2]}},{\"type\":\"string_type\",\"loc\":[\"body\",\"tags\",0],\"msg\":\"Input should be a valid string\",\"input\":1},{\"type\":\"string_type\",\"loc\":[\"body\",\"tags\",1],\"msg\":\"Input should be a valid string\",\"input\":2}]}";
+    }
+    if index == 74 {
+        return "{\"detail\":[{\"type\":\"string_type\",\"loc\":[\"body\",\"email\"],\"msg\":\"Input should be a valid string\",\"input\":{\"a\":[1,2.5,null,true,false,\"x\"]}}]}";
+    }
+    if index == 75 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: There must be something before the @-sign.\",\"input\":\"@example.com\",\"ctx\":{\"reason\":\"There must be something before the @-sign.\"}}]}";
+    }
+    if index == 76 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: There must be something after the @-sign.\",\"input\":\"jane@\",\"ctx\":{\"reason\":\"There must be something after the @-sign.\"}}]}";
+    }
+    if index == 77 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: The part after the @-sign is not valid. It should have a period.\",\"input\":\"jane@example\",\"ctx\":{\"reason\":\"The part after the @-sign is not valid. It should have a period.\"}}]}";
+    }
+    if index == 78 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: The part after the @-sign contains invalid characters: '@'.\",\"input\":\"ja@ne@example.com\",\"ctx\":{\"reason\":\"The part after the @-sign contains invalid characters: '@'.\"}}]}";
+    }
+    if index == 79 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: The email address contains invalid characters before the @-sign: SPACE.\",\"input\":\"ja ne@example.com\",\"ctx\":{\"reason\":\"The email address contains invalid characters before the @-sign: SPACE.\"}}]}";
+    }
+    if index == 80 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: An email address cannot start with a period.\",\"input\":\".jane@example.com\",\"ctx\":{\"reason\":\"An email address cannot start with a period.\"}}]}";
+    }
+    if index == 81 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: An email address cannot have two periods in a row.\",\"input\":\"ja..ne@example.com\",\"ctx\":{\"reason\":\"An email address cannot have two periods in a row.\"}}]}";
+    }
+    if index == 82 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: An email address cannot have a hyphen immediately after the @-sign.\",\"input\":\"jane@-example.com\",\"ctx\":{\"reason\":\"An email address cannot have a hyphen immediately after the @-sign.\"}}]}";
+    }
+    if index == 83 {
+        return "{\"email\":\"Jane@example.com\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 84 {
+        return "{\"email\":\"jane+tag@sub.example.co.uk\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 85 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: An email address must have an @-sign.\",\"input\":\"\",\"ctx\":{\"reason\":\"An email address must have an @-sign.\"}}]}";
+    }
+    if index == 86 {
+        return "{\"email\":\"jane@example.c0m\",\"password\":\"SecurePass123!\",\"name\":null,\"location_lat\":null,\"location_lng\":null,\"age\":null,\"newsletter\":false,\"tags\":[]}";
+    }
+    if index == 87 {
+        return "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"email\"],\"msg\":\"value is not a valid email address: The part after the @-sign contains invalid characters: '_'.\",\"input\":\"jane@exa_mple.com\",\"ctx\":{\"reason\":\"The part after the @-sign contains invalid characters: '_'.\"}}]}";
+    }
+    if index == 88 {
+        return "{\"q\":\"aa\",\"page\":3,\"limit\":20}";
+    }
+    if index == 89 {
+        return "{\"detail\":[{\"type\":\"string_too_short\",\"loc\":[\"query\",\"q\"],\"msg\":\"String should have at least 2 characters\",\"input\":\"\",\"ctx\":{\"min_length\":2}}]}";
+    }
+    if index == 90 {
+        return "{\"detail\":[{\"type\":\"string_too_short\",\"loc\":[\"query\",\"q\"],\"msg\":\"String should have at least 2 characters\",\"input\":\"\",\"ctx\":{\"min_length\":2}}]}";
+    }
+    if index == 91 {
+        return "{\"detail\":[{\"type\":\"greater_than_equal\",\"loc\":[\"query\",\"limit\"],\"msg\":\"Input should be greater than or equal to 1\",\"input\":\"0\",\"ctx\":{\"ge\":1}}]}";
+    }
+    if index == 92 {
+        return "{\"q\":\"aa\",\"page\":2,\"limit\":20}";
+    }
+    if index == 93 {
+        return "{\"detail\":[{\"type\":\"int_parsing\",\"loc\":[\"query\",\"page\"],\"msg\":\"Input should be a valid integer, unable to parse string as an integer\",\"input\":\"2.5\"}]}";
+    }
+    if index == 94 {
+        return "{\"q\":\"aa\",\"page\":2,\"limit\":20}";
+    }
+    if index == 95 {
+        return "{\"q\":\"aa\",\"page\":2,\"limit\":20}";
+    }
+    if index == 96 {
+        return "{\"detail\":[{\"type\":\"greater_than_equal\",\"loc\":[\"query\",\"page\"],\"msg\":\"Input should be greater than or equal to 1\",\"input\":\"-2\",\"ctx\":{\"ge\":1}}]}";
+    }
+    if index == 97 {
+        return "{\"q\":\"aa\",\"page\":10,\"limit\":20}";
+    }
+    if index == 98 {
+        return "{\"detail\":[{\"type\":\"string_too_long\",\"loc\":[\"query\",\"q\"],\"msg\":\"String should have at most 50 characters\",\"input\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"ctx\":{\"max_length\":50}}]}";
+    }
+    if index == 99 {
+        return "{\"q\":\"\u{e9}\u{e9}\",\"page\":1,\"limit\":20}";
+    }
+    if index == 100 {
+        return "{\"detail\":[{\"type\":\"greater_than_equal\",\"loc\":[\"path\",\"job_id\"],\"msg\":\"Input should be greater than or equal to 1\",\"input\":\"-5\",\"ctx\":{\"ge\":1}}]}";
+    }
+    if index == 101 {
+        return "{\"job_id\":5}";
+    }
+    if index == 102 {
+        return "{\"detail\":\"Not Found\"}";
+    }
+    if index == 103 {
+        return "";
+    }
+    if index == 104 {
+        return "";
+    }
+    if index == 105 {
+        return "{\"detail\":\"Not Found\"}";
+    }
+    if index == 106 {
+        return "{\"detail\":[{\"type\":\"model_attributes_type\",\"loc\":[\"body\"],\"msg\":\"Input should be a valid dictionary or object to extract fields from\",\"input\":\"{\\\"email\\\":\\\"jane@example.com\\\",\\\"password\\\":\\\"SecurePass123!\\\"}\"}]}";
+    }
+    ""
+}

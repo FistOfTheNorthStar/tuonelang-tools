@@ -1,0 +1,274 @@
+// web::demo — a FastAPI application, reimplemented, and proven the same.
+//
+// `examples/web_oracle.py` is a small FastAPI app shaped like the
+// backend: a registration endpoint with the constraints of
+// `JobApplicantRegistrationRequest`, a search with validated query
+// parameters, and routes with path parameters registered in an order
+// that matters. This module is the same application on `web::*`, and its
+// specs replay all of `web::fixture`'s captured requests through
+// `handle` and compare status, `Allow`, `Location`, and body with what
+// FastAPI sent — byte for byte.
+//
+// It is also the shape an application takes: a route table built once, a
+// schema per input, `handle` as the one function `http::server` calls,
+// and a `match` on the slot as the dispatch. `examples/web.tuo` serves it
+// on a socket.
+
+module web::demo;
+
+/// The route table. Order is precedence: `/jobs/search` before
+/// `/jobs/{job_id}`.
+///
+/// # Example
+/// ```tuo
+/// let routes = web::demo::routes();
+/// ```
+pub fn routes() -> web::route::Routes {
+    var r = web::route::new();
+    web::route::add(r, "POST", "/api/v1/job_applicant/auth/register", 1);
+    web::route::add(r, "GET", "/jobs/search", 2);
+    web::route::add(r, "GET", "/jobs/{job_id}", 3);
+    web::route::add(r, "DELETE", "/photos/{photo_id}", 4);
+    web::route::add(r, "GET", "/files/{owner_type}/{filename}", 5);
+    r
+}
+
+/// The registration model.
+///
+/// # Example
+/// ```tuo
+/// let s = web::demo::register_schema();
+/// ```
+pub fn register_schema() -> web::schema::Schema {
+    var s = web::schema::new();
+    web::schema::email(s, "email");
+    web::schema::string(s, "password");
+    web::schema::length(s, 8, 128);
+    web::schema::optional_string(s, "name");
+    web::schema::length(s, 0 - 1, 255);
+    web::schema::optional_float(s, "location_lat");
+    web::schema::at_least(s, 0.0 - 90.0);
+    web::schema::at_most(s, 90.0);
+    web::schema::optional_float(s, "location_lng");
+    web::schema::at_least(s, 0.0 - 180.0);
+    web::schema::at_most(s, 180.0);
+    web::schema::optional_int(s, "age");
+    web::schema::at_least(s, 0.0);
+    web::schema::below(s, 150.0);
+    web::schema::defaulted_bool(s, "newsletter");
+    web::schema::defaulted_string_list(s, "tags");
+    s
+}
+
+fn push_optional_text(mut out: String, in m: web::schema::Model, in name: Str, take quoted: Bool) {
+    web::json::push_key(out, name);
+    if !web::schema::has(m, name) {
+        std::string::append(out, "null");
+    } else if quoted {
+        web::json::push_string(out, std::string::as_str(web::schema::text_of(m, name)));
+    } else {
+        std::string::append(out, std::string::as_str(web::schema::text_of(m, name)));
+    }
+}
+
+fn register(in req: web::request::Request) -> String {
+    let m = web::schema::validate_body(register_schema(), std::string::as_str(req.body), web::request::is_json(req));
+    if !web::schema::valid(m) {
+        return web::response::invalid(m.errors);
+    }
+    var out = std::string::from_str("{");
+    push_optional_text(out, m, "email", true);
+    push_optional_text(out, m, "password", true);
+    push_optional_text(out, m, "name", true);
+    push_optional_text(out, m, "location_lat", false);
+    push_optional_text(out, m, "location_lng", false);
+    web::json::push_key(out, "age");
+    if web::schema::has(m, "age") {
+        web::json::push_int(out, web::schema::int_or(m, "age", 0));
+    } else {
+        std::string::append(out, "null");
+    }
+    web::json::push_key(out, "newsletter");
+    std::string::append(out, if web::schema::int_or(m, "newsletter", 0) == 1 {
+        "true"
+    } else {
+        "false"
+    });
+    web::json::push_key(out, "tags");
+    std::string::push_byte(out, 91);
+    var i = 0;
+    while i < web::schema::item_count(m, "tags") {
+        if i > 0 {
+            std::string::push_byte(out, 44);
+        }
+        web::json::push_string(out, std::string::as_str(web::schema::item_at(m, "tags", i)));
+        i = i + 1;
+    }
+    std::string::append(out, "]}");
+    web::response::json(200, std::string::as_str(out))
+}
+
+fn search(in req: web::request::Request) -> String {
+    var s = web::schema::new();
+    web::schema::string(s, "q");
+    web::schema::length(s, 2, 50);
+    web::schema::defaulted_int(s, "page");
+    web::schema::at_least(s, 1.0);
+    web::schema::defaulted_int(s, "limit");
+    web::schema::at_least(s, 1.0);
+    web::schema::at_most(s, 100.0);
+    let pairs = web::query::parse(std::string::as_str(req.query));
+    let m = web::schema::validate_pairs(s, pairs.names, pairs.values, "query");
+    if !web::schema::valid(m) {
+        return web::response::invalid(m.errors);
+    }
+    var out = std::string::from_str("{");
+    web::json::push_key(out, "q");
+    web::json::push_string(out, std::string::as_str(web::schema::text_of(m, "q")));
+    web::json::push_key(out, "page");
+    web::json::push_int(out, web::schema::int_or(m, "page", 1));
+    web::json::push_key(out, "limit");
+    web::json::push_int(out, web::schema::int_or(m, "limit", 20));
+    std::string::push_byte(out, 125);
+    web::response::json(200, std::string::as_str(out))
+}
+
+fn one_int(in found: web::route::Match, in name: Str, in key: Str, take minimum: Int) -> String {
+    var s = web::schema::new();
+    web::schema::int(s, name);
+    if minimum > 0 {
+        web::schema::at_least(s, minimum as Float);
+    }
+    let m = web::schema::validate_pairs(s, found.names, found.values, "path");
+    if !web::schema::valid(m) {
+        return web::response::invalid(m.errors);
+    }
+    var out = std::string::from_str("{");
+    web::json::push_key(out, key);
+    web::json::push_int(out, web::schema::int_or(m, name, 0));
+    std::string::push_byte(out, 125);
+    web::response::json(200, std::string::as_str(out))
+}
+
+fn file(in found: web::route::Match) -> String {
+    var out = std::string::from_str("{");
+    web::json::push_key(out, "owner_type");
+    web::json::push_string(out, std::string::as_str(web::route::param(found, "owner_type")));
+    web::json::push_key(out, "filename");
+    web::json::push_string(out, std::string::as_str(web::route::param(found, "filename")));
+    std::string::push_byte(out, 125);
+    web::response::json(200, std::string::as_str(out))
+}
+
+/// Answer one raw request. This is the function `http::server::serve`
+/// is given.
+///
+/// # Example
+/// ```tuo
+/// let raw = web::demo::handle(request_bytes);
+/// ```
+pub fn handle(in raw: String) -> String {
+    let req = web::request::parse(std::string::as_str(raw));
+    if !req.ok {
+        return web::response::detail(400, "Bad Request");
+    }
+    let found = web::route::resolve(routes(), std::string::as_str(req.method), std::string::as_str(req.target));
+    if found.kind != web::route::found() {
+        let refusal = web::response::unrouted(found);
+        if std::string::as_str(req.method) == "HEAD" {
+            return web::response::for_head(std::string::as_str(refusal));
+        }
+        return refusal;
+    }
+    if found.slot == 1 {
+        return register(req);
+    }
+    if found.slot == 2 {
+        return search(req);
+    }
+    if found.slot == 3 {
+        return one_int(found, "job_id", "job_id", 1);
+    }
+    if found.slot == 4 {
+        return one_int(found, "photo_id", "deleted", 0);
+    }
+    file(found)
+}
+
+// ----------------------------------------------------------------------------
+// Specs: every captured case, replayed.
+// ----------------------------------------------------------------------------
+
+/// The raw request of fixture case `index`.
+///
+/// # Example
+/// ```tuo
+/// let raw = web::demo::request_of(0);
+/// ```
+pub fn request_of(take index: Int) -> String {
+    var extra = std::string::empty();
+    if std::str::len(web::fixture::content_type(index)) > 0 {
+        http::message::header_line(extra, "Content-Type", web::fixture::content_type(index));
+    }
+    http::message::request(web::fixture::method(index), web::fixture::target(index), "testserver", std::string::as_str(extra), web::fixture::body(index))
+}
+
+/// Whether `raw` is what FastAPI answered fixture case `index` with:
+/// status, `Allow`, `Location`, and body. A `HEAD` response's body is not
+/// compared, since it has none on the wire.
+///
+/// # Example
+/// ```tuo
+/// let same = web::demo::answer_agrees(0, raw);
+/// ```
+pub fn answer_agrees(take index: Int, in raw: Str) -> Bool {
+    if web::response::status_of(raw) != web::fixture::status(index) {
+        return false;
+    }
+    if std::string::as_str(web::response::header_of(raw, "Allow")) != web::fixture::allow(index) {
+        return false;
+    }
+    if std::string::as_str(web::response::header_of(raw, "Location")) != web::fixture::location(index) {
+        return false;
+    }
+    if web::fixture::method(index) == "HEAD" {
+        return true;
+    }
+    std::string::as_str(web::response::body_of(raw)) == web::fixture::response(index)
+}
+
+fn agrees(take index: Int) -> Bool {
+    let raw = handle(request_of(index));
+    answer_agrees(index, std::string::as_str(raw))
+}
+
+/// The first case at or after `from` and before `to` that disagrees, or -1.
+fn first_disagreement(take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to && i < web::fixture::count() {
+        if !agrees(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+spec "every captured FastAPI response is reproduced" {
+    then web::fixture::count() == 107;
+    then first_disagreement(0, 10) == 0 - 1;
+    then first_disagreement(10, 20) == 0 - 1;
+    then first_disagreement(20, 30) == 0 - 1;
+    then first_disagreement(30, 40) == 0 - 1;
+    then first_disagreement(40, 50) == 0 - 1;
+    then first_disagreement(50, 60) == 0 - 1;
+    then first_disagreement(60, 70) == 0 - 1;
+    then first_disagreement(70, 80) == 0 - 1;
+    then first_disagreement(80, 90) == 0 - 1;
+    then first_disagreement(90, 100) == 0 - 1;
+    then first_disagreement(100, 107) == 0 - 1;
+}
+
+spec handle {
+    then web::response::status_of(std::string::as_str(handle(std::string::from_str("garbage")))) == 400;
+}

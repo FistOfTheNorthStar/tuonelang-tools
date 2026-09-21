@@ -1,0 +1,96 @@
+// ec::p384 — NIST P-384 (secp384r1, FIPS 186-4 D.1.2.4), as parameters
+// for `ec::curve`. Needed because the roots that sign today's ECDSA
+// intermediates — ISRG Root X2, GTS Root R4 — are P-384 keys. Checked as
+// `ec::p256` is: cheap identities here, RFC 6979's signatures natively.
+
+module ec::p384;
+
+/// The field prime.
+///
+/// # Example
+/// ```tuo
+/// let p = ec::p384::p();
+/// ```
+pub fn p() -> Array[Int] {
+    ec::field::from_hex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000ffffffff")
+}
+
+/// The coefficient `a = p - 3`.
+///
+/// # Example
+/// ```tuo
+/// let a = ec::p384::a();
+/// ```
+pub fn a() -> Array[Int] {
+    ec::field::from_hex("fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffeffffffff0000000000000000fffffffc")
+}
+
+/// The coefficient `b`.
+///
+/// # Example
+/// ```tuo
+/// let b = ec::p384::b();
+/// ```
+pub fn b() -> Array[Int] {
+    ec::field::from_hex("b3312fa7e23ee7e4988e056be3f82d19181d9c6efe8141120314088f5013875ac656398d8a2ed19d2a85c8edd3ec2aef")
+}
+
+/// The group order `n`.
+///
+/// # Example
+/// ```tuo
+/// let n = ec::p384::n();
+/// ```
+pub fn n() -> Array[Int] {
+    ec::field::from_hex("ffffffffffffffffffffffffffffffffffffffffffffffffc7634d81f4372ddf581a0db248b0a77aecec196accc52973")
+}
+
+/// The base point's x.
+///
+/// # Example
+/// ```tuo
+/// let x = ec::p384::gx();
+/// ```
+pub fn gx() -> Array[Int] {
+    ec::field::from_hex("aa87ca22be8b05378eb1c71ef320ad746e1d3b628ba79b9859f741e082542a385502f25dbf55296c3a545e3872760ab7")
+}
+
+/// The base point's y.
+///
+/// # Example
+/// ```tuo
+/// let y = ec::p384::gy();
+/// ```
+pub fn gy() -> Array[Int] {
+    ec::field::from_hex("3617de4a96262c6f5d9e98bf9292dc29f8f41dbd289a147ce9da3113b5f0b8c00a60b1ce1d7e819d7a431d7c90ea0e5f")
+}
+
+/// The curve, ready for `ec::curve` and `ec::ecdsa`.
+///
+/// # Example
+/// ```tuo
+/// let c = ec::p384::curve();
+/// ```
+pub fn curve() -> ec::curve::Curve {
+    ec::curve::curve(p(), a(), b(), n(), gx(), gy())
+}
+
+fn hex_is(in value: Array[Int], in expected: Str) -> Bool {
+    std::string::as_str(std::bignum::to_hex(value)) == expected
+}
+
+spec curve {
+    let c = curve();
+    then c.bits == 384;
+    then c.width == 48;
+    then c.p.k == 14;
+    then hex_is(c.p.mu, "1000000000000000000000000000000000000000000000000000000000000000100000000ffffffffffffffff000000010000");
+    then hex_is(c.n.mu, "1000000000000000000000000000000000000000000000000389cb27e0bc8d220a7e5f24db74f58851313e695333ad68d0c84");
+    then ec::curve::on_curve(gx(), gy(), c);
+    // 2G, compared in Jacobian form: an inversion is more than the sandbox
+    // affords on this curve, but X = x·Z² and Y = y·Z³ cost two products.
+    let two = ec::curve::double(ec::curve::generator(c), c);
+    let zsq = ec::field::square(two.z, c.p);
+    then ec::field::same(two.x, ec::field::mul(ec::field::from_hex("08d999057ba3d2d969260045c55b97f089025959a6f434d651d207d19fb96e9e4fe0e86ebe0e64f85b96a9c75295df61"), zsq, c.p));
+    then ec::field::same(two.y, ec::field::mul(ec::field::from_hex("8e80f1fa5b1b3cedb7bfe8dffd6dba74b275d875bc6cc43e904e505f256ab4255ffd43e94d39e22d61501e700a940e80"), ec::field::mul(zsq, two.z, c.p), c.p));
+}

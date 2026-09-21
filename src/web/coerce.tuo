@@ -1,0 +1,969 @@
+// web::coerce — Pydantic's lax conversions, and the email check.
+//
+// A FastAPI endpoint does not see JSON; it sees what Pydantic made of it,
+// and Pydantic in its default "lax" mode is generous in ways a client
+// comes to rely on: `"30"` is an int, `30.0` is an int, `30.5` is not;
+// `"yes"`, `"on"`, `1`, and `1.0` are all `True`; `" 2.5 "` is a float and
+// so is `true`. Query and path parameters arrive as text and go through
+// the same doors. This module is those doors, each pinned against what
+// Pydantic 2.13 did with the same input.
+//
+// The email check follows the `email-validator` package, which is what
+// `EmailStr` calls, reason by reason and in its order, because the reason
+// is part of the 422 body a frontend may show. It is the ASCII subset
+// plus a pass for non-ASCII bytes: no IDNA normalisation, no display
+// names, no quoted local parts — those spellings are refused here with
+// the nearest reason rather than accepted.
+//
+// WHAT DIFFERS, ON PURPOSE: integers beyond 64 bits are refused rather
+// than carried (Pydantic would accept them and let `le=` decide); `nan`
+// and `inf` are refused as floats; a float's text is its source spelling
+// tidied, not CPython's shortest round-trip `repr`, which agrees for every
+// number a person types and can differ past fifteen significant digits.
+
+module web::coerce;
+
+/// The result of an integer conversion.
+pub struct IntResult {
+    ok: Bool,
+    value: Int,
+}
+
+/// The result of a float conversion: the value, and the text a response
+/// should render it as.
+pub struct FloatResult {
+    ok: Bool,
+    value: Float,
+    text: String,
+}
+
+fn no_int() -> IntResult {
+    IntResult { ok: false, value: 0 }
+}
+
+fn no_float() -> FloatResult {
+    FloatResult { ok: false, value: 0.0, text: std::string::empty() }
+}
+
+fn is_space(take b: Int) -> Bool {
+    b == 32 || (b >= 9 && b <= 13)
+}
+
+fn is_digit(take b: Int) -> Bool {
+    b >= 48 && b <= 57
+}
+
+/// How many characters `text` holds: UTF-8 code points, which is what
+/// `min_length` and `max_length` count.
+///
+/// # Example
+/// ```tuo
+/// let n = web::coerce::char_count("\u{e9}\u{e9}"); // 2
+/// ```
+pub fn char_count(in text: Str) -> Int {
+    var count = 0;
+    var i = 0;
+    while i < std::str::len(text) {
+        if (std::str::byte_at(text, i) & 192) != 128 {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    count
+}
+
+/// `text` without leading and trailing ASCII whitespace.
+///
+/// # Example
+/// ```tuo
+/// let t = web::coerce::trimmed(" 7\n"); // "7"
+/// ```
+pub fn trimmed(in text: Str) -> String {
+    var from = 0;
+    var to = std::str::len(text);
+    while from < to && is_space(std::str::byte_at(text, from)) {
+        from = from + 1;
+    }
+    while to > from && is_space(std::str::byte_at(text, to - 1)) {
+        to = to - 1;
+    }
+    var out = std::string::empty();
+    var i = from;
+    while i < to {
+        std::string::push_byte(out, std::str::byte_at(text, i));
+        i = i + 1;
+    }
+    out
+}
+
+/// `text` with ASCII letters lowercased.
+///
+/// # Example
+/// ```tuo
+/// let t = web::coerce::lowered("YES"); // "yes"
+/// ```
+pub fn lowered(in text: Str) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::str::len(text) {
+        var b = std::str::byte_at(text, i);
+        if b >= 65 && b <= 90 {
+            b = b + 32;
+        }
+        std::string::push_byte(out, b);
+        i = i + 1;
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Integers.
+// ----------------------------------------------------------------------------
+
+/// An `Int` from text, the way Pydantic reads a string for an `int`
+/// field: surrounding whitespace, a sign, digits with single underscores
+/// between them, and an optional all-zero fraction (`"2.00"`). No
+/// exponent, no hex, no thousands separators. Beyond 64 bits is refused.
+///
+/// # Example
+/// ```tuo
+/// let r = web::coerce::int_from_text(" +1_0 "); // ok, 10
+/// ```
+pub fn int_from_text(in raw: Str) -> IntResult {
+    let text = trimmed(raw);
+    let n = std::string::len(text);
+    var i = 0;
+    var negative = false;
+    if i < n && (std::string::byte_at(text, i) == 43 || std::string::byte_at(text, i) == 45) {
+        negative = std::string::byte_at(text, i) == 45;
+        i = i + 1;
+    }
+    var digits = 0;
+    var magnitude = 0;
+    var last_was_digit = false;
+    var scanning = true;
+    while scanning && i < n {
+        let b = std::string::byte_at(text, i);
+        if is_digit(b) {
+            // 9223372036854775807 is the limit; the negative side gets the
+            // same bound, which refuses only i64::MIN itself.
+            if magnitude > 922337203685477580 || (magnitude == 922337203685477580 && b - 48 > 7) {
+                return no_int();
+            }
+            magnitude = magnitude * 10 + (b - 48);
+            digits = digits + 1;
+            last_was_digit = true;
+            i = i + 1;
+        } else if b == 95 && last_was_digit && i + 1 < n && is_digit(std::string::byte_at(text, i + 1)) {
+            last_was_digit = false;
+            i = i + 1;
+        } else {
+            scanning = false;
+        }
+    }
+    if digits == 0 {
+        return no_int();
+    }
+    if i < n {
+        if std::string::byte_at(text, i) != 46 || i + 1 >= n {
+            return no_int();
+        }
+        i = i + 1;
+        while i < n {
+            if std::string::byte_at(text, i) != 48 {
+                return no_int();
+            }
+            i = i + 1;
+        }
+    }
+    IntResult { ok: true, value: if negative {
+        0 - magnitude
+    } else {
+        magnitude
+    } }
+}
+
+/// An `Int` from a JSON number written with a fraction or exponent, when
+/// its value is whole: `30.0` and `3e1` are 30, `30.5` is refused.
+///
+/// # Example
+/// ```tuo
+/// let r = web::coerce::int_from_float_token("30.0"); // ok, 30
+/// ```
+pub fn int_from_float_token(in token: Str) -> IntResult {
+    let f = float_from_text(token);
+    if !f.ok {
+        return no_int();
+    }
+    if f.value > 9.0e18 || f.value < 0.0 - 9.0e18 {
+        return no_int();
+    }
+    let whole = f.value as Int;
+    if (whole as Float) != f.value {
+        return no_int();
+    }
+    IntResult { ok: true, value: whole }
+}
+
+// ----------------------------------------------------------------------------
+// Floats.
+// ----------------------------------------------------------------------------
+
+/// The digits of `value`, as text.
+fn int_text(take value: Int) -> String {
+    var out = std::string::empty();
+    if value < 0 {
+        std::string::push_byte(out, 45);
+    }
+    var digits = std::array::empty();
+    var v = value;
+    if v == 0 {
+        std::array::push(digits, 0);
+    }
+    while v != 0 {
+        let d = v % 10;
+        std::array::push(digits, if d < 0 {
+            0 - d
+        } else {
+            d
+        });
+        v = v / 10;
+    }
+    var i = std::array::len(digits) - 1;
+    while i >= 0 {
+        std::string::push_byte(out, 48 + std::array::get(digits, i));
+        i = i - 1;
+    }
+    out
+}
+
+/// `value` as decimal text with no trailing zeros: `90`, `0.5`, `-74.006`.
+/// `point_zero` appends `.0` to a whole number, which is how Python
+/// renders a float (`90.0`); without it the number reads as it does in a
+/// Pydantic message (`90`). Six decimal places at most.
+///
+/// # Example
+/// ```tuo
+/// let t = web::coerce::number_text(90.0, true); // "90.0"
+/// ```
+pub fn number_text(take value: Float, take point_zero: Bool) -> String {
+    var v = value;
+    var out = std::string::empty();
+    if v < 0.0 {
+        std::string::push_byte(out, 45);
+        v = 0.0 - v;
+    }
+    if v > 9.0e15 {
+        // Past the range where six decimals mean anything; whole digits only.
+        std::string::append(out, std::string::as_str(int_text(v as Int)));
+        if point_zero {
+            std::string::append(out, ".0");
+        }
+        return out;
+    }
+    var whole = v as Int;
+    var scaled = (((v - (whole as Float)) * 1000000.0) + 0.5) as Int;
+    if scaled >= 1000000 {
+        whole = whole + 1;
+        scaled = 0;
+    }
+    std::string::append(out, std::string::as_str(int_text(whole)));
+    if scaled == 0 {
+        if point_zero {
+            std::string::append(out, ".0");
+        }
+        return out;
+    }
+    var digits = 6;
+    while scaled % 10 == 0 {
+        scaled = scaled / 10;
+        digits = digits - 1;
+    }
+    let frac = int_text(scaled);
+    std::string::push_byte(out, 46);
+    var pad = digits - std::string::len(frac);
+    while pad > 0 {
+        std::string::push_byte(out, 48);
+        pad = pad - 1;
+    }
+    std::string::append(out, std::string::as_str(frac));
+    out
+}
+
+/// A float from text, the way Pydantic reads a string for a `float`
+/// field, which is also every JSON number: whitespace, a sign, digits
+/// with single underscores, `.5` and `5.`, an exponent. `nan` and `inf`
+/// are refused. The result's `text` is the spelling a response should
+/// use: the source digits tidied (`40` → `40.0`, `2.50` → `2.5`), or
+/// `number_text` of the value when there was an exponent.
+///
+/// # Example
+/// ```tuo
+/// let r = web::coerce::float_from_text(" 2.50 "); // ok, 2.5, "2.5"
+/// ```
+pub fn float_from_text(in raw: Str) -> FloatResult {
+    let text = trimmed(raw);
+    let n = std::string::len(text);
+    var i = 0;
+    var negative = false;
+    if i < n && (std::string::byte_at(text, i) == 43 || std::string::byte_at(text, i) == 45) {
+        negative = std::string::byte_at(text, i) == 45;
+        i = i + 1;
+    }
+    var whole = std::string::empty();
+    var frac = std::string::empty();
+    var last_was_digit = false;
+    var scanning = true;
+    while scanning && i < n {
+        let b = std::string::byte_at(text, i);
+        if is_digit(b) {
+            std::string::push_byte(whole, b);
+            last_was_digit = true;
+            i = i + 1;
+        } else if b == 95 && last_was_digit && i + 1 < n && is_digit(std::string::byte_at(text, i + 1)) {
+            last_was_digit = false;
+            i = i + 1;
+        } else {
+            scanning = false;
+        }
+    }
+    if i < n && std::string::byte_at(text, i) == 46 {
+        i = i + 1;
+        last_was_digit = false;
+        scanning = true;
+        while scanning && i < n {
+            let b = std::string::byte_at(text, i);
+            if is_digit(b) {
+                std::string::push_byte(frac, b);
+                last_was_digit = true;
+                i = i + 1;
+            } else if b == 95 && last_was_digit && i + 1 < n && is_digit(std::string::byte_at(text, i + 1)) {
+                last_was_digit = false;
+                i = i + 1;
+            } else {
+                scanning = false;
+            }
+        }
+    }
+    if std::string::len(whole) == 0 && std::string::len(frac) == 0 {
+        return no_float();
+    }
+    var exponent = 0;
+    var has_exponent = false;
+    if i < n && (std::string::byte_at(text, i) == 101 || std::string::byte_at(text, i) == 69) {
+        i = i + 1;
+        var exp_negative = false;
+        if i < n && (std::string::byte_at(text, i) == 43 || std::string::byte_at(text, i) == 45) {
+            exp_negative = std::string::byte_at(text, i) == 45;
+            i = i + 1;
+        }
+        var exp_digits = 0;
+        while i < n && is_digit(std::string::byte_at(text, i)) {
+            if exponent < 10000 {
+                exponent = exponent * 10 + (std::string::byte_at(text, i) - 48);
+            }
+            exp_digits = exp_digits + 1;
+            i = i + 1;
+        }
+        if exp_digits == 0 {
+            return no_float();
+        }
+        if exp_negative {
+            exponent = 0 - exponent;
+        }
+        has_exponent = true;
+    }
+    if i != n {
+        return no_float();
+    }
+    // The value: digits accumulated as a float, then scaled.
+    var value = 0.0;
+    var k = 0;
+    while k < std::string::len(whole) {
+        value = value * 10.0 + ((std::string::byte_at(whole, k) - 48) as Float);
+        k = k + 1;
+    }
+    var scale = 1.0;
+    var f = 0;
+    while f < std::string::len(frac) {
+        value = value * 10.0 + ((std::string::byte_at(frac, f) - 48) as Float);
+        scale = scale * 10.0;
+        f = f + 1;
+    }
+    value = value / scale;
+    var e = exponent;
+    while e > 0 && value < 1.0e300 {
+        value = value * 10.0;
+        e = e - 1;
+    }
+    if e > 0 {
+        // Overflow to infinity, which is refused like `inf` itself.
+        return no_float();
+    }
+    while e < 0 && value > 0.0 {
+        value = value / 10.0;
+        e = e + 1;
+    }
+    if negative {
+        value = 0.0 - value;
+    }
+    if has_exponent {
+        return FloatResult { ok: true, value: value, text: number_text(value, true) };
+    }
+    // The tidy spelling: no leading zeros, no trailing fraction zeros.
+    var out = std::string::empty();
+    var lead = 0;
+    while lead + 1 < std::string::len(whole) && std::string::byte_at(whole, lead) == 48 {
+        lead = lead + 1;
+    }
+    var frac_end = std::string::len(frac);
+    while frac_end > 0 && std::string::byte_at(frac, frac_end - 1) == 48 {
+        frac_end = frac_end - 1;
+    }
+    if negative {
+        std::string::push_byte(out, 45);
+    }
+    if std::string::len(whole) == 0 {
+        std::string::push_byte(out, 48);
+    }
+    var w = lead;
+    while w < std::string::len(whole) {
+        std::string::push_byte(out, std::string::byte_at(whole, w));
+        w = w + 1;
+    }
+    std::string::push_byte(out, 46);
+    if frac_end == 0 {
+        std::string::push_byte(out, 48);
+    }
+    var q = 0;
+    while q < frac_end {
+        std::string::push_byte(out, std::string::byte_at(frac, q));
+        q = q + 1;
+    }
+    FloatResult { ok: true, value: value, text: out }
+}
+
+// ----------------------------------------------------------------------------
+// Booleans.
+// ----------------------------------------------------------------------------
+
+/// A boolean from text: 1 for `1 on t true y yes`, 0 for `0 off f false n
+/// no`, compared without case and without trimming; -1 otherwise.
+///
+/// # Example
+/// ```tuo
+/// let b = web::coerce::bool_from_text("On"); // 1
+/// ```
+pub fn bool_from_text(in raw: Str) -> Int {
+    let t = lowered(raw);
+    let s = std::string::as_str(t);
+    if s == "1" || s == "on" || s == "t" || s == "true" || s == "y" || s == "yes" {
+        return 1;
+    }
+    if s == "0" || s == "off" || s == "f" || s == "false" || s == "n" || s == "no" {
+        return 0;
+    }
+    0 - 1
+}
+
+/// A boolean from a JSON number token: 1 for one, 0 for zero (in either
+/// spelling, `1` or `1.0`), -1 otherwise.
+///
+/// # Example
+/// ```tuo
+/// let b = web::coerce::bool_from_number("1.0"); // 1
+/// ```
+pub fn bool_from_number(in token: Str) -> Int {
+    let f = float_from_text(token);
+    if !f.ok {
+        return 0 - 1;
+    }
+    if f.value == 1.0 {
+        return 1;
+    }
+    if f.value == 0.0 {
+        return 0;
+    }
+    0 - 1
+}
+
+// ----------------------------------------------------------------------------
+// Email addresses, after the `email-validator` package.
+// ----------------------------------------------------------------------------
+
+fn is_atext(take b: Int) -> Bool {
+    if b >= 128 {
+        return true;
+    }
+    if (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || is_digit(b) {
+        return true;
+    }
+    // ! # $ % & ' * + - / = ? ^ _ ` { | } ~
+    b == 33 || (b >= 35 && b <= 39) || b == 42 || b == 43 || b == 45 || b == 47 || b == 61 || b == 63 || (b >= 94 && b <= 96) || (b >= 123 && b <= 126)
+}
+
+fn is_domain_byte(take b: Int) -> Bool {
+    b >= 128 || (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || is_digit(b) || b == 45 || b == 46
+}
+
+/// The unique offending bytes of `part` in byte order, displayed the way
+/// the package does: `'x'`, or `SPACE`.
+fn bad_characters(in part: String, take local: Bool) -> String {
+    var seen = std::array::empty();
+    var b = 0;
+    while b < 128 {
+        var i = 0;
+        var found = false;
+        while i < std::string::len(part) && !found {
+            let c = std::string::byte_at(part, i);
+            if c == b {
+                let fine = if local {
+                    is_atext(c) || c == 46
+                } else {
+                    is_domain_byte(c)
+                };
+                if !fine {
+                    found = true;
+                }
+            }
+            i = i + 1;
+        }
+        if found {
+            std::array::push(seen, b);
+        }
+        b = b + 1;
+    }
+    var out = std::string::empty();
+    var k = 0;
+    while k < std::array::len(seen) {
+        if k > 0 {
+            std::string::append(out, ", ");
+        }
+        let c = std::array::get(seen, k);
+        if c == 32 {
+            std::string::append(out, "SPACE");
+        } else {
+            std::string::push_byte(out, 39);
+            std::string::push_byte(out, c);
+            std::string::push_byte(out, 39);
+        }
+        k = k + 1;
+    }
+    out
+}
+
+fn contains_pair(in text: String, take a: Int, take b: Int) -> Bool {
+    var i = 0;
+    while i + 1 < std::string::len(text) {
+        if std::string::byte_at(text, i) == a && std::string::byte_at(text, i + 1) == b {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn ends_with(in text: String, in suffix: Str) -> Bool {
+    let n = std::string::len(text);
+    let m = std::str::len(suffix);
+    if m > n {
+        return false;
+    }
+    var i = 0;
+    while i < m {
+        if std::string::byte_at(text, n - m + i) != std::str::byte_at(suffix, i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// Why `raw` is not an email address, in the package's words, or empty
+/// when it is one.
+///
+/// # Example
+/// ```tuo
+/// let why = web::coerce::email_problem("jane@"); // "There must be something after the @-sign."
+/// ```
+pub fn email_problem(in raw: Str) -> String {
+    let text = trimmed(raw);
+    let n = std::string::len(text);
+    var at = 0 - 1;
+    var i = 0;
+    while i < n && at < 0 {
+        if std::string::byte_at(text, i) == 64 {
+            at = i;
+        }
+        i = i + 1;
+    }
+    if at < 0 {
+        return std::string::from_str("An email address must have an @-sign.");
+    }
+    var local = std::string::empty();
+    var domain = std::string::empty();
+    var j = 0;
+    while j < n {
+        if j < at {
+            std::string::push_byte(local, std::string::byte_at(text, j));
+        } else if j > at {
+            std::string::push_byte(domain, std::string::byte_at(text, j));
+        }
+        j = j + 1;
+    }
+    if std::string::len(local) == 0 {
+        return std::string::from_str("There must be something before the @-sign.");
+    }
+    if std::string::len(domain) == 0 {
+        return std::string::from_str("There must be something after the @-sign.");
+    }
+    let bad_local = bad_characters(local, true);
+    if std::string::len(bad_local) > 0 {
+        var out = std::string::from_str("The email address contains invalid characters before the @-sign: ");
+        std::string::append(out, std::string::as_str(bad_local));
+        std::string::push_byte(out, 46);
+        return out;
+    }
+    if std::string::byte_at(local, std::string::len(local) - 1) == 46 {
+        return std::string::from_str("An email address cannot have a period immediately before the @-sign.");
+    }
+    if std::string::byte_at(local, 0) == 46 {
+        return std::string::from_str("An email address cannot start with a period.");
+    }
+    if contains_pair(local, 46, 46) {
+        return std::string::from_str("An email address cannot have two periods in a row.");
+    }
+    let dn = std::string::len(domain);
+    if std::string::byte_at(domain, 0) == 91 && std::string::byte_at(domain, dn - 1) == 93 {
+        return std::string::from_str("A bracketed IP address after the @-sign is not allowed here.");
+    }
+    let bad_domain = bad_characters(domain, false);
+    if std::string::len(bad_domain) > 0 {
+        var out = std::string::from_str("The part after the @-sign contains invalid characters: ");
+        std::string::append(out, std::string::as_str(bad_domain));
+        std::string::push_byte(out, 46);
+        return out;
+    }
+    if std::string::byte_at(domain, dn - 1) == 46 {
+        return std::string::from_str("An email address cannot end with a period.");
+    }
+    if std::string::byte_at(domain, 0) == 46 {
+        return std::string::from_str("An email address cannot have a period immediately after the @-sign.");
+    }
+    if contains_pair(domain, 46, 46) {
+        return std::string::from_str("An email address cannot have two periods in a row.");
+    }
+    if std::string::byte_at(domain, dn - 1) == 45 {
+        return std::string::from_str("An email address cannot end with a hyphen.");
+    }
+    if std::string::byte_at(domain, 0) == 45 {
+        return std::string::from_str("An email address cannot have a hyphen immediately after the @-sign.");
+    }
+    if contains_pair(domain, 46, 45) || contains_pair(domain, 45, 46) {
+        return std::string::from_str("An email address cannot have a period and a hyphen next to each other.");
+    }
+    // No label longer than 63 characters.
+    var label = 0;
+    var longest = 0;
+    var dots = 0;
+    var d = 0;
+    while d < dn {
+        if std::string::byte_at(domain, d) == 46 {
+            dots = dots + 1;
+            label = 0;
+        } else {
+            label = label + 1;
+            if label > longest {
+                longest = label;
+            }
+        }
+        d = d + 1;
+    }
+    if longest > 63 {
+        var out = std::string::from_str("After the @-sign, periods cannot be separated by so many characters (");
+        std::string::append(out, std::string::as_str(int_text(longest - 63)));
+        std::string::append(out, if longest - 63 == 1 {
+            " character too many)."
+        } else {
+            " characters too many)."
+        });
+        return out;
+    }
+    if n > 254 {
+        var out = std::string::from_str("The email address is too long (");
+        std::string::append(out, std::string::as_str(int_text(n - 254)));
+        std::string::append(out, if n - 254 == 1 {
+            " character too many)."
+        } else {
+            " characters too many)."
+        });
+        return out;
+    }
+    if dots == 0 {
+        return std::string::from_str("The part after the @-sign is not valid. It should have a period.");
+    }
+    let last = std::string::byte_at(domain, dn - 1);
+    if last < 128 && !((last >= 97 && last <= 122) || (last >= 65 && last <= 90)) {
+        return std::string::from_str("The part after the @-sign is not valid. It is not within a valid top-level domain.");
+    }
+    let low = lowered(std::string::as_str(domain));
+    if ends_with(low, ".arpa") || ends_with(low, ".invalid") || ends_with(low, ".local") || ends_with(low, ".localhost") || ends_with(low, ".onion") || ends_with(low, ".test") {
+        return std::string::from_str("The part after the @-sign is a special-use or reserved name that cannot be used with email.");
+    }
+    std::string::empty()
+}
+
+/// The normal form of a valid address: trimmed, the domain lowercased,
+/// the local part untouched.
+///
+/// # Example
+/// ```tuo
+/// let e = web::coerce::email_normalized(" Jane@EXAMPLE.com"); // "Jane@example.com"
+/// ```
+pub fn email_normalized(in raw: Str) -> String {
+    let text = trimmed(raw);
+    var out = std::string::empty();
+    var past_at = false;
+    var i = 0;
+    while i < std::string::len(text) {
+        var b = std::string::byte_at(text, i);
+        if past_at && b >= 65 && b <= 90 {
+            b = b + 32;
+        }
+        if b == 64 {
+            past_at = true;
+        }
+        std::string::push_byte(out, b);
+        i = i + 1;
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Specs: every expectation is what Pydantic 2.13 / email-validator did.
+// ----------------------------------------------------------------------------
+
+fn int_is(in text: Str, take expected: Int) -> Bool {
+    let r = int_from_text(text);
+    r.ok && r.value == expected
+}
+
+fn int_refused(in text: Str) -> Bool {
+    let r = int_from_text(text);
+    !r.ok
+}
+
+fn whole_is(in token: Str, take expected: Int) -> Bool {
+    let r = int_from_float_token(token);
+    r.ok && r.value == expected
+}
+
+fn whole_refused(in token: Str) -> Bool {
+    let r = int_from_float_token(token);
+    !r.ok
+}
+
+fn float_is(in text: Str, in expected: Str) -> Bool {
+    let r = float_from_text(text);
+    r.ok && std::string::as_str(r.text) == expected
+}
+
+fn float_refused(in text: Str) -> Bool {
+    let r = float_from_text(text);
+    !r.ok
+}
+
+fn float_value(in text: Str) -> Float {
+    let r = float_from_text(text);
+    r.value
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+fn email_ok(in text: Str) -> Bool {
+    std::string::len(email_problem(text)) == 0
+}
+
+fn repeated(take byte: Int, take count: Int) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < count {
+        std::string::push_byte(out, byte);
+        i = i + 1;
+    }
+    out
+}
+
+fn long_label_address() -> String {
+    var out = std::string::from_str("a@");
+    std::string::append(out, std::string::as_str(repeated(98, 64)));
+    std::string::append(out, ".co");
+    out
+}
+
+spec char_count {
+    then char_count("") == 0;
+    then char_count("abc") == 3;
+    then char_count("\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}\u{e9}") == 7;
+    then char_count("\u{1f600}") == 1;
+}
+
+spec trimmed {
+    then text_is(trimmed(" 7\n"), "7");
+    then text_is(trimmed("\t a b \r"), "a b");
+    then text_is(trimmed("   "), "");
+    then text_is(lowered("YeS"), "yes");
+}
+
+spec int_from_text {
+    then int_is("30", 30);
+    then int_is("2.00", 2);
+    then int_is("-0", 0);
+    then int_is("+2", 2);
+    then int_is("-2", 0 - 2);
+    then int_is("\t7\n", 7);
+    then int_is(" 2 ", 2);
+    then int_is("00012", 12);
+    then int_is("1_0", 10);
+    then int_is("9223372036854775807", 9223372036854775807);
+    then int_refused("9223372036854775808");
+    then int_refused("2.");
+    then int_refused("2.5");
+    then int_refused("1__0");
+    then int_refused("_1");
+    then int_refused("1_");
+    then int_refused(" ");
+    then int_refused("");
+    then int_refused("0x10");
+    then int_refused("1e3");
+    then int_refused("+ 2");
+    then int_refused("1.0e0");
+    then int_refused("1,000");
+    then int_refused("thirty");
+    then int_refused("two");
+}
+
+spec int_from_float_token {
+    then whole_is("30.0", 30);
+    then whole_is("3e1", 30);
+    then whole_is("1e3", 1000);
+    then whole_is("-0.0", 0);
+    then whole_is("-5.0", 0 - 5);
+    then whole_refused("30.5");
+    then whole_refused("1e-1");
+    then whole_refused("1e30");
+}
+
+spec float_from_text {
+    then float_is("40.7128", "40.7128");
+    then float_is("-74.006", "-74.006");
+    then float_is("40", "40.0");
+    then float_is("40.5", "40.5");
+    then float_is(" 2.50 ", "2.5");
+    then float_is("+.5", "0.5");
+    then float_is("5.", "5.0");
+    then float_is("1_0.5", "10.5");
+    then float_is("1e3", "1000.0");
+    then float_is("2.5e-1", "0.25");
+    then float_is("-91", "-91.0");
+    then float_is("007.10", "7.1");
+    then float_is("0", "0.0");
+    then float_value("91.5") > 90.0;
+    then float_value("-91") < 0.0 - 90.0;
+    then float_value("1e3") == 1000.0;
+    then float_value("0.5") == 0.5;
+    then float_refused("");
+    then float_refused("abc");
+    then float_refused("north");
+    then float_refused("nan");
+    then float_refused("inf");
+    then float_refused("0x1p3");
+    then float_refused("1e");
+    then float_refused(".");
+    then float_refused("1e999");
+    then float_refused("1.5x");
+}
+
+spec number_text {
+    then text_is(number_text(90.0, true), "90.0");
+    then text_is(number_text(90.0, false), "90");
+    then text_is(number_text(0.0 - 90.0, true), "-90.0");
+    then text_is(number_text(0.0 - 180.0, false), "-180");
+    then text_is(number_text(0.5, true), "0.5");
+    then text_is(number_text(0.05, false), "0.05");
+    then text_is(number_text(0.0 - 74.006, true), "-74.006");
+    then text_is(number_text(0.0, true), "0.0");
+    then text_is(number_text(0.9999999, true), "1.0");
+}
+
+spec bool_from_text {
+    then bool_from_text("YES") == 1;
+    then bool_from_text("On") == 1;
+    then bool_from_text("t") == 1;
+    then bool_from_text("y") == 1;
+    then bool_from_text("1") == 1;
+    then bool_from_text("true") == 1;
+    then bool_from_text("n") == 0;
+    then bool_from_text("f") == 0;
+    then bool_from_text("OFF") == 0;
+    then bool_from_text("0") == 0;
+    then bool_from_text("no") == 0;
+    then bool_from_text(" yes ") == 0 - 1;
+    then bool_from_text("false ") == 0 - 1;
+    then bool_from_text("2") == 0 - 1;
+    then bool_from_text("") == 0 - 1;
+    then bool_from_text("maybe") == 0 - 1;
+    then bool_from_number("1") == 1;
+    then bool_from_number("0") == 0;
+    then bool_from_number("1.0") == 1;
+    then bool_from_number("0.0") == 0;
+    then bool_from_number("2") == 0 - 1;
+    then bool_from_number("2.0") == 0 - 1;
+}
+
+spec email_problem {
+    then email_ok("jane@example.com");
+    then email_ok("a@b.co");
+    then email_ok("a@b.c");
+    then email_ok("jane+tag@sub.example.co.uk");
+    then email_ok("Jane@EXAMPLE.com");
+    then email_ok("jane@example.c0m");
+    then email_ok("a@b.co ");
+    then email_ok(" a@b.co");
+    then email_ok("\u{e9}@b.co");
+    then email_ok("a@b\u{e9}.co");
+    then email_ok(std::string::as_str(repeated(120, 65))) == false;
+    then text_is(email_problem("not-an-email"), "An email address must have an @-sign.");
+    then text_is(email_problem(""), "An email address must have an @-sign.");
+    then text_is(email_problem("@example.com"), "There must be something before the @-sign.");
+    then text_is(email_problem("jane@"), "There must be something after the @-sign.");
+    then text_is(email_problem("jane@example"), "The part after the @-sign is not valid. It should have a period.");
+    then text_is(email_problem("a@localhost"), "The part after the @-sign is not valid. It should have a period.");
+    then text_is(email_problem("ja@ne@example.com"), "The part after the @-sign contains invalid characters: '@'.");
+    then text_is(email_problem("ja ne@example.com"), "The email address contains invalid characters before the @-sign: SPACE.");
+    then text_is(email_problem("a(b)@b.co"), "The email address contains invalid characters before the @-sign: '(', ')'.");
+    then text_is(email_problem("a,b@b.co"), "The email address contains invalid characters before the @-sign: ','.");
+    then text_is(email_problem(".jane@example.com"), "An email address cannot start with a period.");
+    then text_is(email_problem("a.@b.co"), "An email address cannot have a period immediately before the @-sign.");
+    then text_is(email_problem("ja..ne@example.com"), "An email address cannot have two periods in a row.");
+    then text_is(email_problem("a@b..co"), "An email address cannot have two periods in a row.");
+    then text_is(email_problem("a@.b.co"), "An email address cannot have a period immediately after the @-sign.");
+    then text_is(email_problem("a@b.co."), "An email address cannot end with a period.");
+    then text_is(email_problem("jane@-example.com"), "An email address cannot have a hyphen immediately after the @-sign.");
+    then text_is(email_problem("a@b-.co"), "An email address cannot have a period and a hyphen next to each other.");
+    then text_is(email_problem("a@b.-co"), "An email address cannot have a period and a hyphen next to each other.");
+    then text_is(email_problem("jane@exa_mple.com"), "The part after the @-sign contains invalid characters: '_'.");
+    then text_is(email_problem("a@b,c.co"), "The part after the @-sign contains invalid characters: ','.");
+    then text_is(email_problem("a@[1.2.3.4]"), "A bracketed IP address after the @-sign is not allowed here.");
+    then text_is(email_problem("a@b.123"), "The part after the @-sign is not valid. It is not within a valid top-level domain.");
+    then text_is(email_problem(std::string::as_str(long_label_address())), "After the @-sign, periods cannot be separated by so many characters (1 character too many).");
+    then text_is(email_problem("a@b.test"), "The part after the @-sign is a special-use or reserved name that cannot be used with email.");
+}
+
+spec email_normalized {
+    then text_is(email_normalized("Jane@EXAMPLE.com"), "Jane@example.com");
+    then text_is(email_normalized("A@B.CO"), "A@b.co");
+    then text_is(email_normalized(" a@b.co "), "a@b.co");
+}

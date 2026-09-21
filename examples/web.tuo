@@ -1,0 +1,96 @@
+// examples/web — the FastAPI-shaped application, served on a socket.
+//
+// `web::demo`'s specs replay FastAPI's captured responses through the
+// handler as a pure function. This program puts the same handler behind
+// `http::server` on an ephemeral loopback port and replays every case
+// again as bytes on a wire — all of them down one kept-alive connection,
+// so the framing of 107 consecutive responses (a bodiless 307, a `HEAD`,
+// 422s of every size) is proven along with their content.
+//
+//     tuo run examples/web.tuo src/web/*.tuo src/http/*.tuo src/tls/*.tuo src/dns/*.tuo …
+//
+// No network beyond loopback. One line per failure and a summary; exit is
+// the failure count.
+
+module web_check;
+
+fn timeout() -> Int {
+    5000
+}
+
+fn say(in text: Str) -> Int {
+    var line = std::string::from_str(text);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    0
+}
+
+fn server_role(take listener: Int) -> Int {
+    http::server::serve(listener, web::demo::handle, 1, timeout())
+}
+
+fn client_role(take port: Int) -> Int {
+    var failed = 0;
+    let fd = std::net::connect_timeout("127.0.0.1", port, timeout());
+    if fd < 0 {
+        let _ = say("FAIL  connect to the loopback server");
+        return 1;
+    }
+    var i = 0;
+    while i < web::fixture::count() {
+        let _ = std::rt::write_string(fd, web::demo::request_of(i));
+        let raw = http::client::read_response(fd, web::fixture::method(i) == "HEAD", timeout());
+        if !web::demo::answer_agrees(i, std::string::as_str(raw)) {
+            var line = std::string::from_str("FAIL  ");
+            std::str::push(line, web::fixture::name(i));
+            std::str::push(line, ": got ");
+            std::str::push_int(line, web::response::status_of(std::string::as_str(raw)));
+            std::str::push(line, " ");
+            std::str::push(line, std::string::as_str(web::response::body_of(std::string::as_str(raw))));
+            let _ = say(std::string::as_str(line));
+            failed = failed + 1;
+        }
+        i = i + 1;
+    }
+    let _ = std::net::close(fd);
+    var summary = std::string::from_str(if failed == 0 {
+        "ok    "
+    } else {
+        "FAIL  "
+    });
+    std::str::push_int(summary, web::fixture::count() - failed);
+    std::str::push(summary, " of ");
+    std::str::push_int(summary, web::fixture::count());
+    std::str::push(summary, " captured FastAPI responses reproduced over one kept-alive connection");
+    let _ = say(std::string::as_str(summary));
+    failed
+}
+
+fn role(take task: Int) -> Int {
+    if task >= 100000 {
+        client_role(task - 100000)
+    } else {
+        server_role(task)
+    }
+}
+
+fn main() -> Int {
+    let listener = std::net::listen(0);
+    if listener < 0 {
+        let _ = say("FAIL  listen on an ephemeral port");
+        return 1;
+    }
+    let port = std::net::bound_port(listener);
+    var tasks = std::array::empty();
+    std::array::push(tasks, listener);
+    std::array::push(tasks, port + 100000);
+    let results = std::sync::par_map(role, tasks, 2);
+    let _ = std::net::close(listener);
+    let served = std::array::get(results, 0);
+    var failed = std::array::get(results, 1);
+    if served != web::fixture::count() {
+        let _ = say("FAIL  the server did not answer every request it was sent");
+        failed = failed + 1;
+    }
+    failed
+}
