@@ -1,0 +1,316 @@
+// sql::scram — SCRAM-SHA-256 (RFC 5802, RFC 7677), the client's side.
+//
+// PostgreSQL 14 and later store passwords as SCRAM verifiers by default
+// and ask for this exchange on every TCP connection, so a client without
+// it cannot log in to a stock server at all. The exchange proves the
+// password to the server without sending it, and — in the last message —
+// proves to the client that the server knew the verifier, so an impostor
+// that merely accepts any proof is caught.
+//
+// The cryptography is `std::crypto`'s (`scram_salted_password`,
+// `scram_client_proof`, `scram_server_signature`); what is here is the
+// message grammar around it, pure and spec'd against RFC 7677 §3. The
+// salted password costs 4096 HMAC iterations, more than a spec assertion
+// may spend, so the specs start from the RFC's salted password and
+// `examples/sql.tuo` runs the derivation natively.
+//
+// Channel binding is not offered (`n,,`): it needs TLS, which this
+// connection does not use. User names and passwords are sent as written,
+// without SASLprep normalization; ASCII credentials are unaffected.
+
+module sql::scram;
+
+/// The server's first message, parsed.
+pub struct Challenge {
+    ok: Bool,
+    nonce: String,
+    salt: Array[Int],
+    iterations: Int,
+}
+
+/// A fresh client nonce: 18 random bytes, base64.
+///
+/// # Example
+/// ```tuo
+/// let nonce = sql::scram::fresh_nonce();
+/// ```
+pub fn fresh_nonce() -> String {
+    std::crypto::base64_encode(std::crypto::nonce(18))
+}
+
+// RFC 5802 §5.1: `=` and `,` in a user name travel as `=3D` and `=2C`.
+fn escaped(in user: Str) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::str::len(user) {
+        let b = std::str::byte_at(user, i);
+        if b == 61 {
+            std::string::append(out, "=3D");
+        } else if b == 44 {
+            std::string::append(out, "=2C");
+        } else {
+            std::string::push_byte(out, b);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// `client-first-message-bare`: `n=user,r=nonce`. PostgreSQL ignores the
+/// name here — it took the user from the startup packet — and libpq sends
+/// it empty.
+///
+/// # Example
+/// ```tuo
+/// let bare = sql::scram::client_first_bare("", "rOprNGfwEbeRWgbNEkqO");
+/// ```
+pub fn client_first_bare(in user: Str, in nonce: Str) -> String {
+    var out = std::string::from_str("n=");
+    std::string::append(out, std::string::as_str(escaped(user)));
+    std::string::append(out, ",r=");
+    std::string::append(out, nonce);
+    out
+}
+
+/// `client-first-message`: the GS2 header for "no channel binding", then
+/// the bare message.
+///
+/// # Example
+/// ```tuo
+/// let first = sql::scram::client_first("", nonce);
+/// ```
+pub fn client_first(in user: Str, in nonce: Str) -> String {
+    var out = std::string::from_str("n,,");
+    std::string::append(out, std::string::as_str(client_first_bare(user, nonce)));
+    out
+}
+
+// The value of attribute `key` (one letter) in a comma-separated message.
+fn attribute(in message: Str, take key: Int) -> String {
+    let n = std::str::len(message);
+    var at = 0;
+    while at < n {
+        var end = at;
+        while end < n && std::str::byte_at(message, end) != 44 {
+            end = end + 1;
+        }
+        if end - at >= 2 && std::str::byte_at(message, at) == key && std::str::byte_at(message, at + 1) == 61 {
+            var out = std::string::empty();
+            var i = at + 2;
+            while i < end {
+                std::string::push_byte(out, std::str::byte_at(message, i));
+                i = i + 1;
+            }
+            return out;
+        }
+        at = end + 1;
+    }
+    std::string::empty()
+}
+
+fn refused() -> Challenge {
+    Challenge { ok: false, nonce: std::string::empty(), salt: std::array::empty(), iterations: 0 }
+}
+
+/// Parse `server-first-message` (`r=…,s=…,i=…`). It is refused unless the
+/// server's nonce extends the client's — the check that ties the reply to
+/// this exchange — and the iteration count is a positive number.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::scram::challenge(server_first, client_nonce);
+/// ```
+pub fn challenge(in server_first: Str, in client_nonce: Str) -> Challenge {
+    let nonce = attribute(server_first, 114);
+    let salt = attribute(server_first, 115);
+    let count = attribute(server_first, 105);
+    if !std::str::starts_with(std::string::as_str(nonce), client_nonce) {
+        return refused();
+    }
+    if std::string::len(nonce) <= std::str::len(client_nonce) || std::string::len(salt) == 0 {
+        return refused();
+    }
+    let parsed = std::str::parse_int(std::string::as_str(count));
+    let iterations = match parsed {
+        Ok { value } => value,
+        Err { error } => 0,
+    };
+    if iterations < 1 {
+        return refused();
+    }
+    Challenge { ok: true, nonce: nonce, salt: std::crypto::base64_decode(std::string::as_str(salt)), iterations: iterations }
+}
+
+/// Was the server's first message acceptable?
+///
+/// # Example
+/// ```tuo
+/// let fine = sql::scram::is_ok(c);
+/// ```
+pub fn is_ok(in c: Challenge) -> Bool {
+    c.ok
+}
+
+/// The iteration count the server asked for.
+///
+/// # Example
+/// ```tuo
+/// let n = sql::scram::iterations(c);
+/// ```
+pub fn iterations(in c: Challenge) -> Int {
+    c.iterations
+}
+
+/// `Hi(password, salt, i)` for this challenge — the expensive step.
+///
+/// # Example
+/// ```tuo
+/// let salted = sql::scram::salted_password("pencil", c);
+/// ```
+pub fn salted_password(in password: Str, in c: Challenge) -> Array[Int] {
+    std::crypto::scram_salted_password(password, c.salt, c.iterations)
+}
+
+/// `client-final-message-without-proof`: `c=biws,r=nonce`, where `biws`
+/// is base64 of the GS2 header `n,,`.
+///
+/// # Example
+/// ```tuo
+/// let tail = sql::scram::client_final_without_proof(c);
+/// ```
+pub fn client_final_without_proof(in c: Challenge) -> String {
+    var out = std::string::from_str("c=biws,r=");
+    std::string::append(out, std::string::as_str(c.nonce));
+    out
+}
+
+/// `AuthMessage`: the three messages both proofs are computed over.
+///
+/// # Example
+/// ```tuo
+/// let am = sql::scram::auth_message(bare, server_first, c);
+/// ```
+pub fn auth_message(in bare: Str, in server_first: Str, in c: Challenge) -> String {
+    var out = std::string::from_str(bare);
+    std::string::push_byte(out, 44);
+    std::string::append(out, server_first);
+    std::string::push_byte(out, 44);
+    std::string::append(out, std::string::as_str(client_final_without_proof(c)));
+    out
+}
+
+/// `client-final-message`, proof included.
+///
+/// # Example
+/// ```tuo
+/// let last = sql::scram::client_final(salted, bare, server_first, c);
+/// ```
+pub fn client_final(in salted: Array[Int], in bare: Str, in server_first: Str, in c: Challenge) -> String {
+    var out = client_final_without_proof(c);
+    std::string::append(out, ",p=");
+    let message = auth_message(bare, server_first, c);
+    std::string::append(out, std::string::as_str(std::crypto::scram_client_proof(salted, std::string::as_str(message))));
+    out
+}
+
+/// Does `server-final-message` (`v=…`) carry the signature only a server
+/// holding the verifier could compute? Compared in constant time.
+///
+/// # Example
+/// ```tuo
+/// let genuine = sql::scram::server_final_valid(salted, bare, server_first, c, server_final);
+/// ```
+pub fn server_final_valid(in salted: Array[Int], in bare: Str, in server_first: Str, in c: Challenge, in server_final: Str) -> Bool {
+    let claimed = attribute(server_final, 118);
+    if std::string::len(claimed) == 0 {
+        return false;
+    }
+    let message = auth_message(bare, server_first, c);
+    let expected = std::crypto::scram_server_signature(salted, std::string::as_str(message));
+    std::crypto::verify(std::crypto::bytes_of_str(std::string::as_str(expected)), std::crypto::bytes_of_str(std::string::as_str(claimed)))
+}
+
+/// RFC 7677 §3's server-first message.
+///
+/// # Example
+/// ```tuo
+/// let m = sql::scram::rfc_server_first();
+/// ```
+pub fn rfc_server_first() -> Str {
+    "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
+}
+
+/// RFC 7677 §3's client nonce.
+///
+/// # Example
+/// ```tuo
+/// let n = sql::scram::rfc_nonce();
+/// ```
+pub fn rfc_nonce() -> Str {
+    "rOprNGfwEbeRWgbNEkqO"
+}
+
+// Hi("pencil", salt, 4096) for the RFC's salt, computed with CPython's
+// hashlib.pbkdf2_hmac; `examples/sql.tuo` re-derives it natively.
+fn rfc_salted() -> Array[Int] {
+    var out = std::array::empty();
+    let hex = "c4a49510323ab4f952cac1fa99441939e78ea74d6be81ddf7096e87513dc615d";
+    var i = 0;
+    while i < 32 {
+        std::array::push(out, nibble(std::str::byte_at(hex, 2 * i)) * 16 + nibble(std::str::byte_at(hex, 2 * i + 1)));
+        i = i + 1;
+    }
+    out
+}
+
+fn nibble(take b: Int) -> Int {
+    if b >= 97 {
+        b - 87
+    } else {
+        b - 48
+    }
+}
+
+fn rfc_challenge() -> Challenge {
+    challenge(rfc_server_first(), rfc_nonce())
+}
+
+fn rfc_bare() -> String {
+    client_first_bare("user", rfc_nonce())
+}
+
+fn rfc_final_is(in expected: Str) -> Bool {
+    std::string::as_str(client_final(rfc_salted(), std::string::as_str(rfc_bare()), rfc_server_first(), rfc_challenge())) == expected
+}
+
+fn rfc_server_accepts(in server_final: Str) -> Bool {
+    server_final_valid(rfc_salted(), std::string::as_str(rfc_bare()), rfc_server_first(), rfc_challenge(), server_final)
+}
+
+spec client_first {
+    then std::string::as_str(client_first("user", rfc_nonce())) == "n,,n=user,r=rOprNGfwEbeRWgbNEkqO";
+    then std::string::as_str(client_first("", "abc")) == "n,,n=,r=abc";
+    then std::string::as_str(client_first_bare("a=b,c", "x")) == "n=a=3Db=2Cc,r=x";
+}
+
+spec challenge {
+    then is_ok(rfc_challenge());
+    then iterations(rfc_challenge()) == 4096;
+    then std::array::len(rfc_challenge().salt) == 16;
+    then !is_ok(challenge(rfc_server_first(), "someOtherNonce"));
+    then !is_ok(challenge("r=rOprNGfwEbeRWgbNEkqO,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096", rfc_nonce()));
+    then !is_ok(challenge("r=rOprNGfwEbeRWgbNEkqOx,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=0", rfc_nonce()));
+    then !is_ok(challenge("r=rOprNGfwEbeRWgbNEkqOx,i=4096", rfc_nonce()));
+    then !is_ok(challenge("", rfc_nonce()));
+}
+
+spec client_final {
+    then rfc_final_is("c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+}
+
+spec server_final_valid {
+    then rfc_server_accepts("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
+    then !rfc_server_accepts("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G5=");
+    then !rfc_server_accepts("e=invalid-proof");
+    then !rfc_server_accepts("");
+}

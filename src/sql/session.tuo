@@ -1,0 +1,611 @@
+// sql::session — a connection that can log in, bind NULL, and hold a
+// transaction.
+//
+// `pg::conn` opens the socket and frames the messages. Three things the
+// backend's `AsyncSession` does are added here:
+//
+//   * Authentication as a stock server demands it. PostgreSQL 14+ asks
+//     every TCP client for SCRAM-SHA-256; `pg::conn::handshake` answers
+//     only cleartext. This handshake answers cleartext, MD5, and SCRAM
+//     (through `sql::scram`), and refuses a server whose final SCRAM
+//     message does not prove it knew the password's verifier.
+//   * NULL parameters. A `Compiled` statement marks which parameters are
+//     NULL, and Bind sends those with length -1, which no text can spell.
+//   * Transactions that nest. `begin` inside a transaction is a
+//     SAVEPOINT named as SQLAlchemy names it (`sa_savepoint_1`), so
+//     `rollback` undoes one level and the outer work survives —
+//     `begin_nested()`.
+//
+// And one thing Alembic does: `migrate` reads `alembic_version`, plans
+// with `sql::migrate`, and runs the plan in one transaction, rolling all
+// of it back if any statement fails. PostgreSQL's DDL is transactional,
+// so a failed migration leaves no half-built schema.
+//
+// Every read is bounded by the session's timeout. The connection is
+// plaintext; a URL that demands TLS is refused rather than downgraded.
+
+module sql::session;
+
+/// An open connection and its transaction depth. `fd < 0` means the
+/// connection could not be made, and `problem` says why.
+pub struct Session {
+    fd: Int,
+    timeout_ms: Int,
+    depth: Int,
+    problem: String,
+}
+
+/// A session that is not connected, carrying the reason.
+///
+/// # Example
+/// ```tuo
+/// let s = sql::session::refused("the pool is exhausted");
+/// ```
+pub fn refused(in problem: Str) -> Session {
+    Session { fd: -1, timeout_ms: 0, depth: 0, problem: std::string::from_str(problem) }
+}
+
+/// Is the session connected?
+///
+/// # Example
+/// ```tuo
+/// let up = sql::session::is_open(s);
+/// ```
+pub fn is_open(in s: Session) -> Bool {
+    s.fd >= 0
+}
+
+/// Why the session is not connected; empty when it is.
+///
+/// # Example
+/// ```tuo
+/// let why = sql::session::problem(s);
+/// ```
+pub fn problem(in s: Session) -> String {
+    std::string::from_str(std::string::as_str(s.problem))
+}
+
+/// The socket, for `sql::pool` to keep.
+///
+/// # Example
+/// ```tuo
+/// let fd = sql::session::descriptor(s);
+/// ```
+pub fn descriptor(in s: Session) -> Int {
+    s.fd
+}
+
+/// How many transaction levels are open: 0 outside a transaction, 1 in
+/// one, 2 inside its first savepoint.
+///
+/// # Example
+/// ```tuo
+/// let d = sql::session::depth(s);
+/// ```
+pub fn depth(in s: Session) -> Int {
+    s.depth
+}
+
+/// A session over a socket that is already authenticated — how the pool
+/// hands a kept connection back out.
+///
+/// # Example
+/// ```tuo
+/// let s = sql::session::adopt(fd, 30000);
+/// ```
+pub fn adopt(take fd: Int, take timeout_ms: Int) -> Session {
+    Session { fd: fd, timeout_ms: timeout_ms, depth: 0, problem: std::string::empty() }
+}
+
+fn offers_scram(in mechanisms: String) -> Bool {
+    std::str::contains(std::string::as_str(mechanisms), "SCRAM-SHA-256")
+}
+
+// EFFECT: the startup exchange, authentication included. Empty on
+// success, else what went wrong.
+fn handshake(take fd: Int, in user: Str, in database: Str, in password: Str, take timeout_ms: Int) -> String {
+    if pg::conn::write_message(fd, pg::proto::startup(user, database)) < 0 {
+        return std::string::from_str("the connection failed while sending the startup packet");
+    }
+    let nonce = sql::scram::fresh_nonce();
+    let bare = sql::scram::client_first_bare("", std::string::as_str(nonce));
+    var server_first = std::string::empty();
+    var challenge = sql::scram::challenge("", "x");
+    var salted = std::array::empty();
+    var server_proved = true;
+
+    var guard = 0;
+    while guard < 1000 {
+        guard = guard + 1;
+        let type_result = pg::conn::read_type(fd, timeout_ms);
+        if !pg::conn::is_ok_int(type_result) {
+            return db::error::render(pg::conn::unwrap_err_int(type_result));
+        }
+        let type_byte = pg::conn::unwrap_ok_int(type_result);
+        let payload_result = pg::conn::read_message_payload(fd, timeout_ms);
+        if !pg::conn::is_ok_string(payload_result) {
+            return db::error::render(pg::conn::unwrap_err_string(payload_result));
+        }
+        let payload = pg::conn::unwrap_ok_string(payload_result);
+
+        if type_byte == pg::proto::be_error_response() {
+            return db::error::render(pg::conn::error_from_payload(payload));
+        }
+        if type_byte == pg::proto::be_ready_for_query() {
+            if !server_proved {
+                return std::string::from_str("the server skipped the final SCRAM message, so it never proved it knew the password");
+            }
+            return std::string::empty();
+        }
+        if type_byte == pg::proto::be_authentication() {
+            let kind = pg::message::auth_kind(payload);
+            var sent = 0;
+            if kind == pg::proto::auth_cleartext() {
+                sent = pg::conn::write_message(fd, pg::proto::password(password));
+            } else if kind == pg::proto::auth_md5() {
+                let answer = std::crypto::md5_password(password, user, pg::message::auth_md5_salt(payload));
+                sent = pg::conn::write_message(fd, pg::proto::password(std::string::as_str(answer)));
+            } else if kind == pg::proto::auth_sasl() {
+                if !offers_scram(pg::message::auth_sasl_body(payload)) {
+                    return std::string::from_str("the server offers no SASL mechanism this client speaks (SCRAM-SHA-256)");
+                }
+                server_proved = false;
+                let first = sql::scram::client_first("", std::string::as_str(nonce));
+                sent = pg::conn::write_message(fd, pg::proto::sasl_initial("SCRAM-SHA-256", std::string::as_str(first)));
+            } else if kind == pg::proto::auth_sasl_continue() {
+                server_first = pg::message::auth_sasl_body(payload);
+                challenge = sql::scram::challenge(std::string::as_str(server_first), std::string::as_str(nonce));
+                if !sql::scram::is_ok(challenge) {
+                    return std::string::from_str("the server's SCRAM challenge is malformed or answers a different nonce");
+                }
+                salted = sql::scram::salted_password(password, challenge);
+                let last = sql::scram::client_final(salted, std::string::as_str(bare), std::string::as_str(server_first), challenge);
+                sent = pg::conn::write_message(fd, pg::proto::sasl_response(std::string::as_str(last)));
+            } else if kind == pg::proto::auth_sasl_final() {
+                let server_final = pg::message::auth_sasl_body(payload);
+                if !sql::scram::server_final_valid(salted, std::string::as_str(bare), std::string::as_str(server_first), challenge, std::string::as_str(server_final)) {
+                    return std::string::from_str("the server's SCRAM signature is wrong: it does not hold this password's verifier");
+                }
+                server_proved = true;
+            } else if kind != pg::proto::auth_ok() {
+                return db::error::render(pg::auth::unsupported_error(kind));
+            }
+            if sent < 0 {
+                return std::string::from_str("the connection failed while answering the authentication request");
+            }
+        }
+    }
+    std::string::from_str("the server sent too many messages without completing the handshake")
+}
+
+/// EFFECT: connect to a numeric address and log in.
+///
+/// # Example
+/// ```tuo
+/// var s = sql::session::connect("127.0.0.1", 5432, "app", "appdb", "secret", 30000);
+/// ```
+pub fn connect(in address: Str, take port: Int, in user: Str, in database: Str, in password: Str, take timeout_ms: Int) -> Session {
+    let opened = pg::conn::open(address, port, timeout_ms);
+    if !pg::conn::is_ok_int(opened) {
+        return refused(std::string::as_str(db::error::render(pg::conn::unwrap_err_int(opened))));
+    }
+    let fd = pg::conn::unwrap_ok_int(opened);
+    let trouble = handshake(fd, user, database, password, timeout_ms);
+    if std::string::len(trouble) > 0 {
+        let _ = pg::conn::close(fd);
+        return refused(std::string::as_str(trouble));
+    }
+    Session { fd: fd, timeout_ms: timeout_ms, depth: 0, problem: std::string::empty() }
+}
+
+/// Is `host` a dotted IPv4 literal?
+///
+/// # Example
+/// ```tuo
+/// let yes = sql::session::is_address("10.0.0.5");
+/// ```
+pub fn is_address(in host: Str) -> Bool {
+    let n = std::str::len(host);
+    var dots = 0;
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(host, i);
+        if b == 46 {
+            dots = dots + 1;
+        } else if b < 48 || b > 57 {
+            return false;
+        }
+        i = i + 1;
+    }
+    n > 0 && dots == 3
+}
+
+/// EFFECT: the address to connect to for `host`: the literal itself,
+/// `127.0.0.1` for `localhost`, otherwise what `resolver` answers — empty
+/// when it answers nothing.
+///
+/// # Example
+/// ```tuo
+/// let a = sql::session::address_of("db.internal", "1.1.1.1", 3000);
+/// ```
+pub fn address_of(in host: Str, in resolver: Str, take timeout_ms: Int) -> String {
+    if is_address(host) {
+        return std::string::from_str(host);
+    }
+    if host == "localhost" {
+        return std::string::from_str("127.0.0.1");
+    }
+    dns::resolver::lookup(resolver, host, timeout_ms)
+}
+
+/// EFFECT: connect as `DATABASE_URL` says. Names are resolved through
+/// `resolver` (a DNS server's address).
+///
+/// # Example
+/// ```tuo
+/// var s = sql::session::connect_url("postgresql+asyncpg://app:secret@localhost/appdb", "1.1.1.1", 30000);
+/// ```
+pub fn connect_url(in url: Str, in resolver: Str, take timeout_ms: Int) -> Session {
+    let parts = sql::url::parse(url);
+    if !sql::url::is_ok(parts) {
+        return refused("the database URL is malformed");
+    }
+    if sql::url::wants_tls(parts) {
+        return refused("the database URL demands TLS, which this connection cannot provide");
+    }
+    let address = address_of(std::string::as_str(sql::url::host(parts)), resolver, timeout_ms);
+    if std::string::len(address) == 0 {
+        return refused("the database host did not resolve");
+    }
+    connect(std::string::as_str(address), sql::url::port(parts), std::string::as_str(sql::url::user(parts)), std::string::as_str(sql::url::database(parts)), std::string::as_str(sql::url::password(parts)), timeout_ms)
+}
+
+/// EFFECT: say goodbye and close the socket.
+///
+/// # Example
+/// ```tuo
+/// sql::session::close(s);
+/// ```
+pub fn close(mut s: Session) {
+    if s.fd >= 0 {
+        let _ = pg::conn::shutdown(s.fd);
+        s.fd = -1;
+        s.depth = 0;
+    }
+}
+
+/// The Bind message for the unnamed statement: every parameter as text,
+/// and those flagged in `nulls` as SQL NULL (length -1, no bytes).
+///
+/// # Example
+/// ```tuo
+/// let m = sql::session::bind_message(values, nulls);
+/// ```
+pub fn bind_message(in values: Array[String], in nulls: Array[Int]) -> String {
+    var body = std::string::empty();
+    db::bytes::put_cstr(body, "");
+    db::bytes::put_cstr(body, "");
+    db::bytes::put_i16(body, 0);
+    let n = std::array::len(values);
+    db::bytes::put_i16(body, n);
+    var i = 0;
+    while i < n {
+        if i < std::array::len(nulls) && std::array::get(nulls, i) == 1 {
+            db::bytes::put_i32(body, -1);
+        } else {
+            let v = std::array::get(values, i);
+            db::bytes::put_i32(body, std::string::len(v));
+            db::bytes::put_bytes(body, std::string::as_str(v));
+        }
+        i = i + 1;
+    }
+    db::bytes::put_i16(body, 0);
+    pg::proto::finish(pg::proto::msg_bind(), body)
+}
+
+fn lost(in what: Str) -> Result[pg::query::ResultSet, db::error::PgError] {
+    Err { error: db::error::new(db::error::kind_connection(), what) }
+}
+
+/// EFFECT: run a compiled statement. Parameters travel out of band
+/// through the extended protocol, so no value is ever parsed as SQL.
+///
+/// # Example
+/// ```tuo
+/// let result = sql::session::execute(s, sql::select::render(q));
+/// ```
+pub fn execute(in s: Session, in ready: sql::clause::Compiled) -> Result[pg::query::ResultSet, db::error::PgError] {
+    if s.fd < 0 {
+        return lost("the session is not connected");
+    }
+    let statement = sql::clause::statement(ready);
+    if pg::conn::write_message(s.fd, pg::proto::parse("", std::string::as_str(statement))) < 0 {
+        return lost("failed to send Parse");
+    }
+    if pg::conn::write_message(s.fd, bind_message(ready.values, ready.nulls)) < 0 {
+        return lost("failed to send Bind");
+    }
+    if pg::conn::write_message(s.fd, pg::proto::describe_statement("")) < 0 {
+        return lost("failed to send Describe");
+    }
+    if pg::conn::write_message(s.fd, pg::proto::execute("", 0)) < 0 {
+        return lost("failed to send Execute");
+    }
+    if pg::conn::write_message(s.fd, pg::proto::sync()) < 0 {
+        return lost("failed to send Sync");
+    }
+    pg::query::collect(s.fd, s.timeout_ms)
+}
+
+/// EFFECT: run literal SQL with no parameters — DDL, or several
+/// statements at once — through the simple protocol.
+///
+/// # Example
+/// ```tuo
+/// let result = sql::session::run(s, "CREATE TABLE notes (id SERIAL PRIMARY KEY)");
+/// ```
+pub fn run(in s: Session, in statement: Str) -> Result[pg::query::ResultSet, db::error::PgError] {
+    if s.fd < 0 {
+        return lost("the session is not connected");
+    }
+    pg::query::run(s.fd, statement, s.timeout_ms)
+}
+
+/// EFFECT: `run`, reduced to "did it work": empty on success, otherwise
+/// the rendered error.
+///
+/// # Example
+/// ```tuo
+/// let trouble = sql::session::run_or_problem(s, "DROP TABLE notes");
+/// ```
+pub fn run_or_problem(in s: Session, in statement: Str) -> String {
+    let result = run(s, statement);
+    if pg::query::is_ok_result(result) {
+        return std::string::empty();
+    }
+    db::error::render(pg::query::unwrap_err_result(result))
+}
+
+/// SQLAlchemy's name for the savepoint opened at transaction depth
+/// `depth` (1 is the first `begin_nested`).
+///
+/// # Example
+/// ```tuo
+/// let n = sql::session::savepoint_name(1); // "sa_savepoint_1"
+/// ```
+pub fn savepoint_name(take depth: Int) -> String {
+    var out = std::string::from_str("sa_savepoint_");
+    std::str::push_int(out, depth);
+    out
+}
+
+/// The statement `begin` issues when `depth` levels are already open.
+///
+/// # Example
+/// ```tuo
+/// let b = sql::session::begin_statement(0); // "BEGIN"
+/// ```
+pub fn begin_statement(take depth: Int) -> String {
+    if depth == 0 {
+        return std::string::from_str("BEGIN");
+    }
+    var out = std::string::from_str("SAVEPOINT ");
+    std::string::append(out, std::string::as_str(savepoint_name(depth)));
+    out
+}
+
+/// The statement `commit` issues with `depth` levels open.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::session::commit_statement(2); // "RELEASE SAVEPOINT sa_savepoint_1"
+/// ```
+pub fn commit_statement(take depth: Int) -> String {
+    if depth <= 1 {
+        return std::string::from_str("COMMIT");
+    }
+    var out = std::string::from_str("RELEASE SAVEPOINT ");
+    std::string::append(out, std::string::as_str(savepoint_name(depth - 1)));
+    out
+}
+
+/// The statement `rollback` issues with `depth` levels open.
+///
+/// # Example
+/// ```tuo
+/// let r = sql::session::rollback_statement(2); // "ROLLBACK TO SAVEPOINT sa_savepoint_1"
+/// ```
+pub fn rollback_statement(take depth: Int) -> String {
+    if depth <= 1 {
+        return std::string::from_str("ROLLBACK");
+    }
+    var out = std::string::from_str("ROLLBACK TO SAVEPOINT ");
+    std::string::append(out, std::string::as_str(savepoint_name(depth - 1)));
+    out
+}
+
+/// EFFECT: open a transaction, or a savepoint inside the open one.
+///
+/// # Example
+/// ```tuo
+/// let began = sql::session::begin(s);
+/// ```
+pub fn begin(mut s: Session) -> Bool {
+    let trouble = run_or_problem(s, std::string::as_str(begin_statement(s.depth)));
+    if std::string::len(trouble) > 0 {
+        return false;
+    }
+    s.depth = s.depth + 1;
+    true
+}
+
+/// EFFECT: commit the innermost level: release its savepoint, or COMMIT.
+///
+/// # Example
+/// ```tuo
+/// let kept = sql::session::commit(s);
+/// ```
+pub fn commit(mut s: Session) -> Bool {
+    if s.depth == 0 {
+        return false;
+    }
+    let trouble = run_or_problem(s, std::string::as_str(commit_statement(s.depth)));
+    s.depth = s.depth - 1;
+    std::string::len(trouble) == 0
+}
+
+/// EFFECT: undo the innermost level: back to its savepoint, or ROLLBACK.
+///
+/// # Example
+/// ```tuo
+/// let undone = sql::session::rollback(s);
+/// ```
+pub fn rollback(mut s: Session) -> Bool {
+    if s.depth == 0 {
+        return false;
+    }
+    let trouble = run_or_problem(s, std::string::as_str(rollback_statement(s.depth)));
+    s.depth = s.depth - 1;
+    std::string::len(trouble) == 0
+}
+
+/// EFFECT: the revision `alembic_version` records; empty for a database
+/// that has never been migrated.
+///
+/// # Example
+/// ```tuo
+/// let at = sql::session::current_revision(s);
+/// ```
+pub fn current_revision(in s: Session) -> String {
+    let probe = run(s, "SELECT to_regclass('alembic_version') IS NOT NULL");
+    if !pg::query::is_ok_result(probe) {
+        return std::string::empty();
+    }
+    let present = pg::query::unwrap_ok_result(probe);
+    if pg::query::row_count(present) == 0 || !pg::query::cell_bool(present, 0, 0) {
+        return std::string::empty();
+    }
+    let result = run(s, sql::migrate::current_query());
+    if !pg::query::is_ok_result(result) {
+        return std::string::empty();
+    }
+    let rows = pg::query::unwrap_ok_result(result);
+    if pg::query::row_count(rows) == 0 {
+        return std::string::empty();
+    }
+    pg::query::cell(rows, 0, 0)
+}
+
+fn version_table_exists(in s: Session) -> Bool {
+    let probe = run(s, "SELECT to_regclass('alembic_version') IS NOT NULL");
+    if !pg::query::is_ok_result(probe) {
+        return false;
+    }
+    let present = pg::query::unwrap_ok_result(probe);
+    pg::query::row_count(present) > 0 && pg::query::cell_bool(present, 0, 0)
+}
+
+// EFFECT: run a plan in one transaction. Empty on success.
+fn apply(mut s: Session, in plan: sql::migrate::Plan) -> String {
+    if !sql::migrate::is_ok(plan) {
+        return std::string::from_str("there is no path between the database's revision and the target");
+    }
+    if s.depth != 0 {
+        return std::string::from_str("a migration must start outside a transaction");
+    }
+    if !begin(s) {
+        return std::string::from_str("BEGIN failed");
+    }
+    var trouble = std::string::empty();
+    if sql::migrate::needs_version_table(plan) && !version_table_exists(s) {
+        trouble = run_or_problem(s, sql::migrate::version_table());
+    }
+    let todo = sql::migrate::statements(plan);
+    var i = 0;
+    while i < std::array::len(todo) && std::string::len(trouble) == 0 {
+        trouble = run_or_problem(s, std::string::as_str(std::array::get(todo, i)));
+        i = i + 1;
+    }
+    if std::string::len(trouble) > 0 {
+        let _ = rollback(s);
+        return trouble;
+    }
+    if !commit(s) {
+        return std::string::from_str("COMMIT failed");
+    }
+    trouble
+}
+
+/// EFFECT: `alembic upgrade <target>` — from wherever the database is.
+/// Empty on success; otherwise the error, with nothing applied.
+///
+/// # Example
+/// ```tuo
+/// let trouble = sql::session::upgrade(s, revisions, std::string::as_str(sql::migrate::head(revisions)));
+/// ```
+pub fn upgrade(mut s: Session, in revisions: sql::migrate::Revisions, in target: Str) -> String {
+    let at = current_revision(s);
+    apply(s, sql::migrate::upgrade(revisions, std::string::as_str(at), target))
+}
+
+/// EFFECT: `alembic downgrade <target>`; an empty target is `base`.
+///
+/// # Example
+/// ```tuo
+/// let trouble = sql::session::downgrade(s, revisions, "");
+/// ```
+pub fn downgrade(mut s: Session, in revisions: sql::migrate::Revisions, in target: Str) -> String {
+    let at = current_revision(s);
+    apply(s, sql::migrate::downgrade(revisions, std::string::as_str(at), target))
+}
+
+fn two_values() -> Array[String] {
+    var out = std::array::empty();
+    std::array::push(out, std::string::from_str("ab"));
+    std::array::push(out, std::string::from_str("ignored"));
+    out
+}
+
+fn second_null() -> Array[Int] {
+    var out = std::array::empty();
+    std::array::push(out, 0);
+    std::array::push(out, 1);
+    out
+}
+
+fn bind_byte(take at: Int) -> Int {
+    std::string::byte_at(bind_message(two_values(), second_null()), at)
+}
+
+spec bind_message {
+    // 'B', Int32 length, "" "", Int16 0 formats, Int16 2 parameters,
+    // Int32 2 "ab", Int32 -1, Int16 0 result formats.
+    then std::string::len(bind_message(two_values(), second_null())) == 23;
+    then pg::proto::framing_ok(bind_message(two_values(), second_null()));
+    then bind_byte(0) == 66;
+    then bind_byte(10) == 2;
+    then bind_byte(14) == 2;
+    then bind_byte(15) == 97;
+    then bind_byte(17) == 255;
+    then bind_byte(20) == 255;
+    then std::string::len(bind_message(two_values(), std::array::empty())) == 30;
+}
+
+spec begin_statement {
+    then std::string::as_str(begin_statement(0)) == "BEGIN";
+    then std::string::as_str(begin_statement(1)) == "SAVEPOINT sa_savepoint_1";
+    then std::string::as_str(begin_statement(2)) == "SAVEPOINT sa_savepoint_2";
+    then std::string::as_str(commit_statement(1)) == "COMMIT";
+    then std::string::as_str(commit_statement(2)) == "RELEASE SAVEPOINT sa_savepoint_1";
+    then std::string::as_str(rollback_statement(1)) == "ROLLBACK";
+    then std::string::as_str(rollback_statement(3)) == "ROLLBACK TO SAVEPOINT sa_savepoint_2";
+}
+
+spec is_address {
+    then is_address("127.0.0.1");
+    then is_address("10.0.0.5");
+    then !is_address("localhost");
+    then !is_address("db.internal");
+    then !is_address("1.2.3");
+    then !is_address("");
+}

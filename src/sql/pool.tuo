@@ -1,0 +1,252 @@
+// sql::pool — SQLAlchemy's QueuePool, for one thread.
+//
+// Opening a PostgreSQL connection costs a TCP handshake, a process fork
+// on the server, and 4096 rounds of HMAC for SCRAM — far more than the
+// query a request makes. The backend's engine therefore keeps connections
+// (`pool_size=5`) and lends them out; this is that pool.
+//
+// `acquire` hands out an idle connection if there is one, after the check
+// `pool_pre_ping=True` makes — a connection the server has dropped is
+// replaced rather than handed to a request to fail on. Otherwise it opens
+// a new one, up to `size`; beyond that it refuses at once, where
+// QueuePool would block for `pool_timeout`, because in one thread nobody
+// could return a connection while it waited. `release` rolls back
+// whatever transaction was left open — reset-on-return — so one request's
+// abandoned work can never be committed by the next.
+//
+// Which slot to use is a pure decision (`pick`), spec'd below; the
+// effects around it are exercised by `examples/sql_live.tuo`.
+
+module sql::pool;
+
+/// A pool of connections to one database.
+pub struct Pool {
+    address: String,
+    port: Int,
+    user: String,
+    database: String,
+    password: String,
+    timeout_ms: Int,
+    size: Int,
+    fds: Array[Int],
+    busy: Array[Int],
+    opened: Int,
+}
+
+/// A pool that will hold up to `size` connections. Nothing is opened
+/// until the first `acquire`.
+///
+/// # Example
+/// ```tuo
+/// var pool = sql::pool::new("127.0.0.1", 5432, "app", "appdb", "secret", 5, 30000);
+/// ```
+pub fn new(in address: Str, take port: Int, in user: Str, in database: Str, in password: Str, take size: Int, take timeout_ms: Int) -> Pool {
+    Pool { address: std::string::from_str(address), port: port, user: std::string::from_str(user), database: std::string::from_str(database), password: std::string::from_str(password), timeout_ms: timeout_ms, size: size, fds: std::array::empty(), busy: std::array::empty(), opened: 0 }
+}
+
+/// `pick`: open a new connection.
+///
+/// # Example
+/// ```tuo
+/// let grow = sql::pool::pick(busy, 5) == sql::pool::open_new();
+/// ```
+pub fn open_new() -> Int {
+    -1
+}
+
+/// `pick`: every connection is lent out and the pool is full.
+///
+/// # Example
+/// ```tuo
+/// let full = sql::pool::pick(busy, 5) == sql::pool::exhausted();
+/// ```
+pub fn exhausted() -> Int {
+    -2
+}
+
+/// Which slot serves the next `acquire`: the first idle one, else
+/// `open_new()` while fewer than `size` exist, else `exhausted()`.
+///
+/// # Example
+/// ```tuo
+/// let slot = sql::pool::pick(busy, 5);
+/// ```
+pub fn pick(in busy: Array[Int], take size: Int) -> Int {
+    var i = 0;
+    while i < std::array::len(busy) {
+        if std::array::get(busy, i) == 0 {
+            return i;
+        }
+        i = i + 1;
+    }
+    if std::array::len(busy) < size {
+        open_new()
+    } else {
+        exhausted()
+    }
+}
+
+fn slot_of(in p: Pool, take fd: Int) -> Int {
+    var i = 0;
+    while i < std::array::len(p.fds) {
+        if std::array::get(p.fds, i) == fd {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+fn forget(mut p: Pool, take slot: Int) {
+    var fds = std::array::empty();
+    var busy = std::array::empty();
+    var i = 0;
+    while i < std::array::len(p.fds) {
+        if i != slot {
+            std::array::push(fds, std::array::get(p.fds, i));
+            std::array::push(busy, std::array::get(p.busy, i));
+        }
+        i = i + 1;
+    }
+    p.fds = fds;
+    p.busy = busy;
+}
+
+/// How many connections the pool holds, lent out or idle.
+///
+/// # Example
+/// ```tuo
+/// let n = sql::pool::held(pool);
+/// ```
+pub fn held(in p: Pool) -> Int {
+    std::array::len(p.fds)
+}
+
+/// How many connections are lent out.
+///
+/// # Example
+/// ```tuo
+/// let n = sql::pool::lent(pool);
+/// ```
+pub fn lent(in p: Pool) -> Int {
+    var n = 0;
+    var i = 0;
+    while i < std::array::len(p.busy) {
+        n = n + std::array::get(p.busy, i);
+        i = i + 1;
+    }
+    n
+}
+
+/// How many connections the pool has opened over its life — the number a
+/// pool exists to keep small.
+///
+/// # Example
+/// ```tuo
+/// let n = sql::pool::opened(pool);
+/// ```
+pub fn opened(in p: Pool) -> Int {
+    p.opened
+}
+
+fn alive(in s: sql::session::Session) -> Bool {
+    let probe = sql::session::run(s, "SELECT 1");
+    pg::query::is_ok_result(probe)
+}
+
+/// EFFECT: borrow a connection. The session is not open when the pool is
+/// exhausted or the database refuses; `sql::session::problem` says which.
+///
+/// # Example
+/// ```tuo
+/// var s = sql::pool::acquire(pool);
+/// ```
+pub fn acquire(mut p: Pool) -> sql::session::Session {
+    var guard = 0;
+    while guard <= p.size {
+        guard = guard + 1;
+        let slot = pick(p.busy, p.size);
+        if slot == exhausted() {
+            return sql::session::refused("the pool is exhausted: every connection is lent out");
+        }
+        if slot == open_new() {
+            let fresh = sql::session::connect(std::string::as_str(p.address), p.port, std::string::as_str(p.user), std::string::as_str(p.database), std::string::as_str(p.password), p.timeout_ms);
+            if sql::session::is_open(fresh) {
+                std::array::push(p.fds, sql::session::descriptor(fresh));
+                std::array::push(p.busy, 1);
+                p.opened = p.opened + 1;
+            }
+            return fresh;
+        }
+        // Pre-ping: a kept connection may have died while it sat idle.
+        let kept = sql::session::adopt(std::array::get(p.fds, slot), p.timeout_ms);
+        if alive(kept) {
+            std::array::set(p.busy, slot, 1);
+            return kept;
+        }
+        let _ = pg::conn::close(std::array::get(p.fds, slot));
+        forget(p, slot);
+    }
+    sql::session::refused("the pool could not find a live connection")
+}
+
+/// EFFECT: return a borrowed connection. An open transaction is rolled
+/// back first; a connection that no longer answers is dropped.
+///
+/// # Example
+/// ```tuo
+/// sql::pool::release(pool, s);
+/// ```
+pub fn release(mut p: Pool, mut s: sql::session::Session) {
+    let slot = slot_of(p, sql::session::descriptor(s));
+    if slot < 0 {
+        sql::session::close(s);
+        return;
+    }
+    var healthy = true;
+    while sql::session::depth(s) > 0 && healthy {
+        healthy = sql::session::rollback(s);
+    }
+    if healthy {
+        std::array::set(p.busy, slot, 0);
+    } else {
+        let _ = pg::conn::close(std::array::get(p.fds, slot));
+        forget(p, slot);
+    }
+}
+
+/// EFFECT: close every connection — `engine.dispose()`.
+///
+/// # Example
+/// ```tuo
+/// sql::pool::dispose(pool);
+/// ```
+pub fn dispose(mut p: Pool) {
+    var i = 0;
+    while i < std::array::len(p.fds) {
+        let _ = pg::conn::shutdown(std::array::get(p.fds, i));
+        i = i + 1;
+    }
+    p.fds = std::array::empty();
+    p.busy = std::array::empty();
+}
+
+fn slots(take a: Int, take b: Int, take count: Int) -> Array[Int] {
+    var out = std::array::empty();
+    if count > 0 {
+        std::array::push(out, a);
+    }
+    if count > 1 {
+        std::array::push(out, b);
+    }
+    out
+}
+
+spec pick {
+    then pick(slots(0, 0, 0), 2) == open_new();
+    then pick(slots(1, 0, 1), 2) == open_new();
+    then pick(slots(0, 0, 1), 2) == 0;
+    then pick(slots(1, 0, 2), 2) == 1;
+    then pick(slots(1, 1, 2), 2) == exhausted();
+    then pick(slots(0, 0, 0), 0) == exhausted();
+}

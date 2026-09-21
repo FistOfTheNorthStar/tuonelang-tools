@@ -1,0 +1,311 @@
+// sql::url — `postgresql+driver://user:password@host:port/database`.
+//
+// The backend is configured by `DATABASE_URL`, and SQLAlchemy's
+// `make_url` takes it apart. This is that taking-apart: the driver suffix
+// (`+asyncpg`, `+psycopg2`) is accepted and ignored, since there is one
+// driver here; user and password are percent-decoded, as `make_url` does,
+// because a generated password is rarely URL-safe; and a URL that asks
+// for TLS (`sslmode=require`, `ssl=true`) is refused at parse time, since
+// the connection this port opens is plaintext and silently downgrading
+// would be the wrong failure.
+//
+// The host is not resolved here. `sql::session::connect_url` does that,
+// through this crate's own resolver.
+
+module sql::url;
+
+/// A database URL, taken apart.
+pub struct Url {
+    ok: Bool,
+    wants_tls: Bool,
+    user: String,
+    password: String,
+    host: String,
+    port: Int,
+    database: String,
+}
+
+/// PostgreSQL's port.
+///
+/// # Example
+/// ```tuo
+/// let p = sql::url::default_port(); // 5432
+/// ```
+pub fn default_port() -> Int {
+    5432
+}
+
+fn malformed() -> Url {
+    Url { ok: false, wants_tls: false, user: std::string::empty(), password: std::string::empty(), host: std::string::empty(), port: 0, database: std::string::empty() }
+}
+
+fn hex_value(take b: Int) -> Int {
+    if b >= 48 && b <= 57 {
+        return b - 48;
+    }
+    if b >= 65 && b <= 70 {
+        return b - 55;
+    }
+    if b >= 97 && b <= 102 {
+        return b - 87;
+    }
+    -1
+}
+
+// Bytes [from, to) of `s`, percent-decoded.
+fn decoded(in s: Str, take from: Int, take to: Int) -> String {
+    var out = std::string::empty();
+    var i = from;
+    while i < to {
+        let b = std::str::byte_at(s, i);
+        var high = -1;
+        var low = -1;
+        if b == 37 && i + 2 < to {
+            high = hex_value(std::str::byte_at(s, i + 1));
+            low = hex_value(std::str::byte_at(s, i + 2));
+        }
+        if high >= 0 && low >= 0 {
+            std::string::push_byte(out, high * 16 + low);
+            i = i + 3;
+        } else {
+            std::string::push_byte(out, b);
+            i = i + 1;
+        }
+    }
+    out
+}
+
+fn index_from(in s: Str, take needle: Int, take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to {
+        if std::str::byte_at(s, i) == needle {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+fn last_index(in s: Str, take needle: Int, take from: Int, take to: Int) -> Int {
+    var i = to - 1;
+    while i >= from {
+        if std::str::byte_at(s, i) == needle {
+            return i;
+        }
+        i = i - 1;
+    }
+    -1
+}
+
+fn port_of(in s: Str, take from: Int, take to: Int) -> Int {
+    if to <= from || to - from > 5 {
+        return -1;
+    }
+    var value = 0;
+    var i = from;
+    while i < to {
+        let b = std::str::byte_at(s, i);
+        if b < 48 || b > 57 {
+            return -1;
+        }
+        value = value * 10 + (b - 48);
+        i = i + 1;
+    }
+    if value < 1 || value > 65535 {
+        return -1;
+    }
+    value
+}
+
+fn asks_for_tls(in query: Str) -> Bool {
+    let pairs = std::str::split(query, "&");
+    var i = 0;
+    while i < std::array::len(pairs) {
+        let pair = std::string::as_str(std::array::get(pairs, i));
+        if std::str::starts_with(pair, "sslmode=") {
+            if pair != "sslmode=disable" && pair != "sslmode=allow" && pair != "sslmode=prefer" {
+                return true;
+            }
+        }
+        if pair == "ssl=true" || pair == "ssl=require" || pair == "ssl=verify-ca" || pair == "ssl=verify-full" {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+/// Take a database URL apart. Not `ok` when the scheme is not PostgreSQL's
+/// or a part is missing or malformed.
+///
+/// # Example
+/// ```tuo
+/// let u = sql::url::parse("postgresql+asyncpg://app:secret@localhost:5432/appdb");
+/// ```
+pub fn parse(in text: Str) -> Url {
+    let mark = std::str::find(text, "://");
+    let scheme_end = match mark {
+        Some { value } => value,
+        None => -1,
+    };
+    if scheme_end < 0 {
+        return malformed();
+    }
+    let plus = index_from(text, 43, 0, scheme_end);
+    var dialect_end = scheme_end;
+    if plus >= 0 {
+        dialect_end = plus;
+    }
+    let dialect = decoded(text, 0, dialect_end);
+    if std::string::as_str(dialect) != "postgresql" && std::string::as_str(dialect) != "postgres" {
+        return malformed();
+    }
+
+    let n = std::str::len(text);
+    let start = scheme_end + 3;
+    var authority_end = index_from(text, 47, start, n);
+    var query_at = index_from(text, 63, start, n);
+    if query_at < 0 {
+        query_at = n;
+    }
+    if authority_end < 0 || authority_end > query_at {
+        authority_end = query_at;
+    }
+
+    var user = std::string::empty();
+    var password = std::string::empty();
+    var host_from = start;
+    let at = last_index(text, 64, start, authority_end);
+    if at >= 0 {
+        let colon = index_from(text, 58, start, at);
+        if colon >= 0 {
+            user = decoded(text, start, colon);
+            password = decoded(text, colon + 1, at);
+        } else {
+            user = decoded(text, start, at);
+        }
+        host_from = at + 1;
+    }
+
+    var port = default_port();
+    var host_end = authority_end;
+    let port_colon = last_index(text, 58, host_from, authority_end);
+    if port_colon >= 0 {
+        port = port_of(text, port_colon + 1, authority_end);
+        host_end = port_colon;
+    }
+    if port < 0 || host_end <= host_from {
+        return malformed();
+    }
+
+    var database = std::string::empty();
+    if authority_end < query_at {
+        database = decoded(text, authority_end + 1, query_at);
+    }
+    var wants_tls = false;
+    if query_at < n {
+        wants_tls = asks_for_tls(std::string::as_str(decoded(text, query_at + 1, n)));
+    }
+    Url { ok: true, wants_tls: wants_tls, user: user, password: password, host: decoded(text, host_from, host_end), port: port, database: database }
+}
+
+/// Did the URL parse?
+///
+/// # Example
+/// ```tuo
+/// let fine = sql::url::is_ok(u);
+/// ```
+pub fn is_ok(in u: Url) -> Bool {
+    u.ok
+}
+
+/// Does the URL demand TLS, which this port's connection cannot give?
+///
+/// # Example
+/// ```tuo
+/// let refused = sql::url::wants_tls(u);
+/// ```
+pub fn wants_tls(in u: Url) -> Bool {
+    u.wants_tls
+}
+
+/// The user name.
+///
+/// # Example
+/// ```tuo
+/// let who = sql::url::user(u);
+/// ```
+pub fn user(in u: Url) -> String {
+    std::string::from_str(std::string::as_str(u.user))
+}
+
+/// The password, percent-decoded.
+///
+/// # Example
+/// ```tuo
+/// let secret = sql::url::password(u);
+/// ```
+pub fn password(in u: Url) -> String {
+    std::string::from_str(std::string::as_str(u.password))
+}
+
+/// The host, as written — a name or an address.
+///
+/// # Example
+/// ```tuo
+/// let h = sql::url::host(u);
+/// ```
+pub fn host(in u: Url) -> String {
+    std::string::from_str(std::string::as_str(u.host))
+}
+
+/// The port; 5432 when the URL names none.
+///
+/// # Example
+/// ```tuo
+/// let p = sql::url::port(u);
+/// ```
+pub fn port(in u: Url) -> Int {
+    u.port
+}
+
+/// The database name.
+///
+/// # Example
+/// ```tuo
+/// let d = sql::url::database(u);
+/// ```
+pub fn database(in u: Url) -> String {
+    std::string::from_str(std::string::as_str(u.database))
+}
+
+fn backend() -> Url {
+    parse("postgresql+asyncpg://shallowflaws:half123@localhost:5432/deepflaws")
+}
+
+spec parse {
+    then is_ok(backend());
+    then std::string::as_str(user(backend())) == "shallowflaws";
+    then std::string::as_str(password(backend())) == "half123";
+    then std::string::as_str(host(backend())) == "localhost";
+    then port(backend()) == 5432;
+    then std::string::as_str(database(backend())) == "deepflaws";
+    then !wants_tls(backend());
+    then port(parse("postgresql://u@db.internal/app")) == 5432;
+    then std::string::as_str(host(parse("postgresql://u@db.internal/app"))) == "db.internal";
+    then std::string::as_str(password(parse("postgresql://u@db.internal/app"))) == "";
+    then std::string::as_str(password(parse("postgres://u:p%40ss%3Aw%2Frd@10.0.0.5:6543/app"))) == "p@ss:w/rd";
+    then port(parse("postgres://u:p%40ss%3Aw%2Frd@10.0.0.5:6543/app")) == 6543;
+    then std::string::as_str(host(parse("postgresql://127.0.0.1/app"))) == "127.0.0.1";
+    then std::string::as_str(user(parse("postgresql://127.0.0.1/app"))) == "";
+    then std::string::as_str(database(parse("postgresql+psycopg2://u:p@h/app?application_name=x"))) == "app";
+    then wants_tls(parse("postgresql://u:p@h/app?sslmode=require"));
+    then wants_tls(parse("postgresql+asyncpg://u:p@h/app?ssl=true"));
+    then !wants_tls(parse("postgresql://u:p@h/app?sslmode=disable"));
+    then !is_ok(parse("mysql://u:p@h/app"));
+    then !is_ok(parse("postgresql:/u:p@h/app"));
+    then !is_ok(parse("postgresql://u:p@h:port/app"));
+    then !is_ok(parse("postgresql://u:p@h:70000/app"));
+    then !is_ok(parse("postgresql://u:p@/app"));
+    then !is_ok(parse(""));
+}

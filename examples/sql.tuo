@@ -1,0 +1,435 @@
+// examples/sql — the live oracle for the query layer.
+//
+// The builder's text is pinned to SQLAlchemy's by specs. What specs cannot
+// show is that PostgreSQL accepts that text, that the parameters land in
+// the right placeholders, that SCRAM convinces a real server, and that
+// transactions, migrations, and the pool behave against one. This program
+// shows it, against the throwaway cluster `examples/sql-test/server.sh`
+// starts on 127.0.0.1:54329:
+//
+//     examples/sql-test/server.sh start /tmp/tuo-sql
+//     tuo run examples/sql.tuo <the SQL_SRC list in run-tests.sh>
+//     examples/sql-test/server.sh stop /tmp/tuo-sql
+//
+// It first derives RFC 7677's SCRAM exchange from the password itself —
+// 4096 HMAC rounds, more than a spec may spend. It prints one line per
+// check and exits with the number that failed.
+
+module sql_check;
+
+fn address() -> Str {
+    "127.0.0.1"
+}
+
+fn port() -> Int {
+    54329
+}
+
+fn timeout() -> Int {
+    5000
+}
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn note(in text: String) {
+    var line = std::string::from_str("      ");
+    std::string::append(line, std::string::as_str(text));
+    std::string::push_byte(line, 10);
+    let _ = std::rt::write_string(1, line);
+}
+
+fn open_session() -> sql::session::Session {
+    sql::session::connect(address(), port(), "tuo", "tuo_oracle", "tuo-oracle-pw", timeout())
+}
+
+// Run a statement; an error is printed and reads as an empty result.
+fn rows(in s: sql::session::Session, in ready: sql::clause::Compiled) -> pg::query::ResultSet {
+    let result = sql::session::execute(s, ready);
+    if pg::query::is_ok_result(result) {
+        return pg::query::unwrap_ok_result(result);
+    }
+    note(db::error::render(pg::query::unwrap_err_result(result)));
+    pg::query::empty_result()
+}
+
+fn sqlstate_of(in s: sql::session::Session, in ready: sql::clause::Compiled) -> String {
+    let result = sql::session::execute(s, ready);
+    if pg::query::is_ok_result(result) {
+        return std::string::empty();
+    }
+    db::error::sqlstate(pg::query::unwrap_err_result(result))
+}
+
+fn u(in name: Str) -> sql::clause::Clause {
+    sql::clause::col(sql::demo::users(), name)
+}
+
+fn j(in name: Str) -> sql::clause::Clause {
+    sql::clause::col(sql::demo::jobs(), name)
+}
+
+fn int(take v: Int) -> sql::clause::Clause {
+    sql::clause::int(v)
+}
+
+fn text(in v: Str) -> sql::clause::Clause {
+    sql::clause::text(v)
+}
+
+fn count_users(in s: sql::session::Session) -> Int {
+    var q = sql::select::new();
+    sql::select::column(q, sql::clause::count_star());
+    sql::select::from(q, sql::demo::users());
+    sql::row::scalar_int(rows(s, sql::select::render(q)), -1)
+}
+
+fn add_user(in s: sql::session::Session, in email: Str, in name: Str, take age: Int) -> Int {
+    var q = sql::write::insert(sql::demo::users());
+    sql::write::value(q, "email", text(email));
+    sql::write::value(q, "name", text(name));
+    sql::write::value(q, "age", int(age));
+    sql::row::int(rows(s, sql::write::render_insert(q)), 0, "id", -1)
+}
+
+fn add_job(in s: sql::session::Session, take owner: Int, in title: Str, take salary: Int) -> Int {
+    var q = sql::write::insert(sql::demo::jobs());
+    sql::write::value(q, "owner_id", int(owner));
+    sql::write::value(q, "title", text(title));
+    sql::write::value(q, "salary", int(salary));
+    sql::write::value(q, "published", sql::clause::boolean(true));
+    sql::write::value(q, "posted_at", sql::clause::call0("now"));
+    sql::row::int(rows(s, sql::write::render_insert(q)), 0, "id", -1)
+}
+
+fn scram_checks() -> Int {
+    var failed = 0;
+    let c = sql::scram::challenge(sql::scram::rfc_server_first(), sql::scram::rfc_nonce());
+    let salted = sql::scram::salted_password("pencil", c);
+    let bare = sql::scram::client_first_bare("user", sql::scram::rfc_nonce());
+    let last = sql::scram::client_final(salted, std::string::as_str(bare), sql::scram::rfc_server_first(), c);
+    failed = failed + report("scram: RFC 7677 client proof, derived from the password", std::string::as_str(last) == "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=");
+    failed = failed + report("scram: RFC 7677 server signature accepted", sql::scram::server_final_valid(salted, std::string::as_str(bare), sql::scram::rfc_server_first(), c, "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="));
+    failed
+}
+
+fn login_checks() -> Int {
+    var failed = 0;
+    var s = open_session();
+    failed = failed + report("login: SCRAM-SHA-256 against PostgreSQL", sql::session::is_open(s));
+    sql::session::close(s);
+
+    let wrong = sql::session::connect(address(), port(), "tuo", "tuo_oracle", "not-the-password", timeout());
+    failed = failed + report("login: a wrong password is refused (28P01)", !sql::session::is_open(wrong) && std::str::contains(std::string::as_str(sql::session::problem(wrong)), "28P01"));
+
+    var md5 = sql::session::connect(address(), port(), "tuo_md5", "tuo_oracle", "md5-pw", timeout());
+    failed = failed + report("login: MD5", sql::session::is_open(md5));
+    sql::session::close(md5);
+
+    var clear = sql::session::connect(address(), port(), "tuo_clear", "tuo_oracle", "clear-pw", timeout());
+    failed = failed + report("login: cleartext", sql::session::is_open(clear));
+    sql::session::close(clear);
+
+    var by_url = sql::session::connect_url("postgresql+asyncpg://tuo:tuo-oracle-pw@localhost:54329/tuo_oracle", "1.1.1.1", timeout());
+    failed = failed + report("login: from a DATABASE_URL naming localhost", sql::session::is_open(by_url));
+    sql::session::close(by_url);
+
+    let tls = sql::session::connect_url("postgresql://tuo:tuo-oracle-pw@localhost:54329/tuo_oracle?sslmode=require", "1.1.1.1", timeout());
+    failed = failed + report("login: a URL demanding TLS is refused, not downgraded", !sql::session::is_open(tls));
+
+    let nobody = sql::session::connect(address(), 54328, "tuo", "tuo_oracle", "x", 1000);
+    failed = failed + report("login: a closed port is an error, not a hang", !sql::session::is_open(nobody));
+    failed
+}
+
+fn schema_checks(in s: sql::session::Session) -> Int {
+    var failed = 0;
+    let _ = sql::session::run_or_problem(s, "DROP TABLE IF EXISTS profiles, events, jobs, users, notes, alembic_version CASCADE");
+    failed = failed + report("ddl: CREATE TABLE users", std::string::len(sql::session::run_or_problem(s, std::string::as_str(sql::table::create(sql::demo::users())))) == 0);
+    failed = failed + report("ddl: CREATE TABLE jobs, with its foreign key", std::string::len(sql::session::run_or_problem(s, std::string::as_str(sql::table::create(sql::demo::jobs())))) == 0);
+    failed = failed + report("ddl: CREATE TABLE events (uuid, date, numeric, json)", std::string::len(sql::session::run_or_problem(s, std::string::as_str(sql::table::create(sql::demo::events())))) == 0);
+    failed = failed + report("ddl: CREATE TABLE profiles (two uniques, two foreign keys)", std::string::len(sql::session::run_or_problem(s, std::string::as_str(sql::table::create(sql::demo::profiles())))) == 0);
+    failed = failed + report("ddl: CREATE UNIQUE INDEX", std::string::len(sql::session::run_or_problem(s, std::string::as_str(sql::table::create_index(sql::demo::jobs(), "ix_jobs_owner_title", "owner_id,title", true)))) == 0);
+    failed
+}
+
+fn statement_checks(in s: sql::session::Session) -> Int {
+    var failed = 0;
+    let ada = add_user(s, "ada@example.com", "Ada", 36);
+    let bob = add_user(s, "bob@example.com", "Bob", 17);
+    let cy = add_user(s, "cy@example.com", "Cy", 70);
+    failed = failed + report("insert: RETURNING hands back the serial ids", ada == 1 && bob == 2 && cy == 3);
+
+    var every = sql::write::insert(sql::demo::users());
+    sql::write::value(every, "email", text("dee@example.com"));
+    sql::write::value(every, "name", sql::clause::null());
+    sql::write::value(every, "age", int(40));
+    sql::write::value(every, "active", sql::clause::boolean(false));
+    sql::write::value(every, "score", sql::clause::number("2.5"));
+    sql::write::value(every, "balance", int(5000000000));
+    sql::write::value(every, "bio", text("'; DROP TABLE users; --"));
+    sql::write::value(every, "created_at", text("2026-09-21T12:30:00+00:00"));
+    sql::write::returning(every, "id");
+    let dee = sql::row::int(rows(s, sql::write::render_insert(every)), 0, "id", -1);
+    failed = failed + report("insert: every column kind, one of them NULL", dee == 4);
+
+    var by_id = sql::select::new();
+    sql::select::all_columns(by_id, sql::demo::users());
+    sql::select::filter(by_id, sql::clause::eq(u("id"), int(dee)));
+    let row = rows(s, sql::select::render(by_id));
+    failed = failed + report("select: scalar_one_or_none finds the row", sql::row::one_or_none(row) == sql::row::found());
+    failed = failed + report("select: the NULL came back as NULL, not as ''", sql::row::is_null(row, 0, "name"));
+    failed = failed + report("select: bigint, boolean, and float read back typed", sql::row::int(row, 0, "balance", 0) == 5000000000 && !sql::row::boolean(row, 0, "active") && sql::row::float(row, 0, "score", 0.0) == 2.5);
+    failed = failed + report("select: hostile text was stored as data", std::string::as_str(sql::row::text(row, 0, "bio")) == "'; DROP TABLE users; --" && count_users(s) == 4);
+
+    var adults = sql::select::new();
+    sql::select::column(adults, u("name"));
+    sql::select::filter(adults, sql::clause::is_true(u("active")));
+    sql::select::filter(adults, sql::clause::between(u("age"), int(18), int(65)));
+    let grown = rows(s, sql::select::render(adults));
+    failed = failed + report("select: IS true AND BETWEEN", pg::query::row_count(grown) == 1 && std::string::as_str(sql::row::text(grown, 0, "name")) == "Ada");
+
+    // IN members are numbered after LIMIT and OFFSET; the values must
+    // still land on the right placeholders.
+    var ids = std::array::empty();
+    std::array::push(ids, ada);
+    std::array::push(ids, bob);
+    std::array::push(ids, cy);
+    var paged = sql::select::new();
+    sql::select::column(paged, u("id"));
+    sql::select::filter(paged, sql::clause::in_ints(u("id"), ids));
+    sql::select::filter(paged, sql::clause::ilike(u("email"), "%@EXAMPLE.com"));
+    sql::select::order_by(paged, sql::clause::desc(u("id")));
+    sql::select::limit(paged, 2);
+    sql::select::offset(paged, 1);
+    let page = rows(s, sql::select::render(paged));
+    failed = failed + report("select: IN + ILIKE + ORDER BY + LIMIT/OFFSET, parameters late-numbered", pg::query::row_count(page) == 2 && sql::row::int(page, 0, "id", 0) == bob && sql::row::int(page, 1, "id", 0) == ada);
+
+    var none_in = sql::select::new();
+    sql::select::column(none_in, u("id"));
+    sql::select::filter(none_in, sql::clause::in_ints(u("id"), std::array::empty()));
+    failed = failed + report("select: an empty IN list is valid SQL and matches nothing", pg::query::row_count(rows(s, sql::select::render(none_in))) == 0);
+
+    let _ = add_job(s, ada, "Engineer", 5000);
+    let _ = add_job(s, ada, "Analyst", 3000);
+    let _ = add_job(s, cy, "Gardener", 1000);
+
+    var totals = sql::select::new();
+    sql::select::column(totals, sql::clause::call2("coalesce", sql::clause::call1("sum", j("salary")), int(0)));
+    sql::select::filter(totals, sql::clause::eq(j("owner_id"), int(ada)));
+    let total = rows(s, sql::select::render(totals));
+    failed = failed + report("select: coalesce(sum(...), 0), read under its anonymous label", sql::row::int(total, 0, "coalesce_1", -1) == 8000);
+
+    var empty_total = sql::select::new();
+    sql::select::column(empty_total, sql::clause::call2("coalesce", sql::clause::call1("sum", j("salary")), int(0)));
+    sql::select::filter(empty_total, sql::clause::eq(j("owner_id"), int(bob)));
+    failed = failed + report("select: coalesce falls back to the bound 0", sql::row::scalar_int(rows(s, sql::select::render(empty_total)), -1) == 0);
+
+    var per_owner = sql::select::new();
+    sql::select::column(per_owner, u("name"));
+    sql::select::column(per_owner, sql::clause::label(sql::clause::call1("count", j("id")), "jobs"));
+    sql::select::outer_join(per_owner, sql::demo::jobs(), sql::clause::eq(j("owner_id"), u("id")));
+    sql::select::group_by(per_owner, u("name"));
+    sql::select::having(per_owner, sql::clause::gt(sql::clause::call1("count", j("id")), int(1)));
+    let busy = rows(s, sql::select::render(per_owner));
+    failed = failed + report("select: LEFT OUTER JOIN + GROUP BY + HAVING", pg::query::row_count(busy) == 1 && sql::row::int(busy, 0, "jobs", 0) == 2);
+
+    var owners = sql::select::new();
+    sql::select::column(owners, u("name"));
+    sql::select::filter(owners, sql::select::exists(sql::demo::jobs(), sql::clause::eq(j("owner_id"), u("id"))));
+    sql::select::order_by(owners, u("name"));
+    failed = failed + report("select: correlated EXISTS", pg::query::row_count(rows(s, sql::select::render(owners))) == 2);
+
+    var idle = sql::select::new();
+    sql::select::column(idle, u("name"));
+    sql::select::filter(idle, sql::clause::not_(sql::select::exists(sql::demo::jobs(), sql::clause::eq(j("owner_id"), u("id")))));
+    failed = failed + report("select: NOT (EXISTS ...)", pg::query::row_count(rows(s, sql::select::render(idle))) == 2);
+
+    var counted = sql::select::new();
+    sql::select::column(counted, sql::clause::call1("count", j("id")));
+    sql::select::filter(counted, sql::clause::eq(j("owner_id"), u("id")));
+    var with_counts = sql::select::new();
+    sql::select::column(with_counts, u("name"));
+    sql::select::column(with_counts, sql::clause::label(sql::clause::scalar(sql::select::as_clause(counted)), "jobs"));
+    sql::select::filter(with_counts, sql::clause::eq(u("id"), int(ada)));
+    failed = failed + report("select: scalar subquery as a column", sql::row::int(rows(s, sql::select::render(with_counts)), 0, "jobs", 0) == 2);
+
+    var older = sql::write::update(sql::demo::users());
+    sql::write::set(older, "age", sql::clause::plus(u("age"), int(1)));
+    sql::write::set(older, "name", sql::clause::null());
+    sql::write::update_filter(older, sql::clause::eq(u("id"), int(bob)));
+    sql::write::update_returning(older, "age");
+    sql::write::update_returning(older, "name");
+    let aged = rows(s, sql::write::render_update(older));
+    failed = failed + report("update: SET age=(age + $1), name=NULL ... RETURNING", sql::row::int(aged, 0, "age", 0) == 18 && sql::row::is_null(aged, 0, "name"));
+
+    var again = sql::write::insert(sql::demo::users());
+    sql::write::value(again, "email", text("ada@example.com"));
+    sql::write::value(again, "name", text("Impostor"));
+    failed = failed + report("insert: a duplicate email is a unique violation (23505)", std::string::as_str(sqlstate_of(s, sql::write::render_insert(again))) == "23505");
+    failed = failed + report("insert: the session survives the error", count_users(s) == 4);
+
+    var quiet = sql::write::insert(sql::demo::users());
+    sql::write::value(quiet, "email", text("ada@example.com"));
+    sql::write::value(quiet, "name", text("Impostor"));
+    sql::write::on_conflict_do_nothing(quiet, "email");
+    failed = failed + report("insert: ON CONFLICT DO NOTHING returns no row", pg::query::row_count(rows(s, sql::write::render_insert(quiet))) == 0);
+
+    var upsert = sql::write::insert(sql::demo::users());
+    sql::write::value(upsert, "email", text("ada@example.com"));
+    sql::write::value(upsert, "name", text("Ada L."));
+    sql::write::on_conflict_do_update(upsert, "email", "name", text("Ada L."));
+    sql::write::returning(upsert, "id");
+    failed = failed + report("insert: ON CONFLICT DO UPDATE keeps the id", sql::row::int(rows(s, sql::write::render_insert(upsert)), 0, "id", 0) == ada);
+
+    var fired = sql::write::delete(sql::demo::jobs());
+    sql::write::delete_filter(fired, sql::clause::lt(j("salary"), int(2000)));
+    sql::write::delete_returning(fired, "id");
+    failed = failed + report("delete: WHERE ... RETURNING", pg::query::row_count(rows(s, sql::write::render_delete(fired))) == 1);
+    failed
+}
+
+fn transaction_checks(mut s: sql::session::Session) -> Int {
+    var failed = 0;
+    let before = count_users(s);
+    let _ = sql::session::begin(s);
+    let _ = add_user(s, "gone@example.com", "Gone", 1);
+    let inside = count_users(s);
+    let _ = sql::session::rollback(s);
+    failed = failed + report("transaction: ROLLBACK undoes the insert", inside == before + 1 && count_users(s) == before);
+
+    let _ = sql::session::begin(s);
+    let _ = add_user(s, "outer@example.com", "Outer", 1);
+    let _ = sql::session::begin(s);
+    failed = failed + report("transaction: a nested begin is a savepoint", sql::session::depth(s) == 2);
+    let _ = add_user(s, "inner@example.com", "Inner", 1);
+    let _ = sql::session::rollback(s);
+    let _ = sql::session::commit(s);
+    failed = failed + report("transaction: rolling back the savepoint keeps the outer insert", count_users(s) == before + 1 && sql::session::depth(s) == 0);
+
+    // A failed statement poisons the transaction until its savepoint is
+    // rolled back — which is what begin_nested is for.
+    let _ = sql::session::begin(s);
+    let _ = sql::session::begin(s);
+    var clash = sql::write::insert(sql::demo::users());
+    sql::write::value(clash, "email", text("outer@example.com"));
+    let state = sqlstate_of(s, sql::write::render_insert(clash));
+    let _ = sql::session::rollback(s);
+    let _ = add_user(s, "after@example.com", "After", 1);
+    let _ = sql::session::commit(s);
+    failed = failed + report("transaction: a savepoint recovers a transaction after an error", std::string::as_str(state) == "23505" && count_users(s) == before + 2);
+    failed
+}
+
+fn broken_revisions() -> sql::migrate::Revisions {
+    var r = sql::demo::revisions();
+    sql::migrate::revision(r, "4d5e6f708192", "3c4d5e6f7081");
+    sql::migrate::upgrade_op(r, "ALTER TABLE notes ADD COLUMN pinned BOOLEAN");
+    sql::migrate::upgrade_op(r, "ALTER TABLE no_such_table ADD COLUMN x INTEGER");
+    r
+}
+
+fn has_column(in s: sql::session::Session, in table_name: Str, in column_name: Str) -> Bool {
+    var probe = std::string::from_str("SELECT 1 FROM information_schema.columns WHERE table_name = '");
+    std::string::append(probe, table_name);
+    std::string::append(probe, "' AND column_name = '");
+    std::string::append(probe, column_name);
+    std::string::append(probe, "'");
+    let result = sql::session::run(s, std::string::as_str(probe));
+    if !pg::query::is_ok_result(result) {
+        return false;
+    }
+    pg::query::row_count(pg::query::unwrap_ok_result(result)) == 1
+}
+
+fn migration_checks(mut s: sql::session::Session) -> Int {
+    var failed = 0;
+    let revisions = sql::demo::revisions();
+    failed = failed + report("migrate: a fresh database is at base", std::string::len(sql::session::current_revision(s)) == 0);
+    let up = sql::session::upgrade(s, revisions, std::string::as_str(sql::migrate::head(revisions)));
+    failed = failed + report("migrate: upgrade head", std::string::len(up) == 0 && std::string::as_str(sql::session::current_revision(s)) == "3c4d5e6f7081" && has_column(s, "notes", "body"));
+    let again = sql::session::upgrade(s, revisions, "3c4d5e6f7081");
+    failed = failed + report("migrate: upgrading to where it already is changes nothing", std::string::len(again) == 0);
+    let down = sql::session::downgrade(s, revisions, "1a2b3c4d5e6f");
+    failed = failed + report("migrate: downgrade two steps", std::string::len(down) == 0 && std::string::as_str(sql::session::current_revision(s)) == "1a2b3c4d5e6f" && !has_column(s, "notes", "body"));
+    let broken = sql::session::upgrade(s, broken_revisions(), "4d5e6f708192");
+    note(std::string::from_str(std::string::as_str(broken)));
+    failed = failed + report("migrate: a failing revision rolls the whole upgrade back", std::string::len(broken) > 0 && std::string::as_str(sql::session::current_revision(s)) == "1a2b3c4d5e6f" && !has_column(s, "notes", "body") && !has_column(s, "notes", "pinned"));
+    let lost = sql::session::upgrade(s, revisions, "ffffffffffff");
+    failed = failed + report("migrate: an unknown target is refused", std::string::len(lost) > 0);
+    let base = sql::session::downgrade(s, revisions, "");
+    failed = failed + report("migrate: downgrade base", std::string::len(base) == 0 && std::string::len(sql::session::current_revision(s)) == 0 && !has_column(s, "notes", "id"));
+    failed
+}
+
+fn backend_pid(in s: sql::session::Session) -> Int {
+    let result = sql::session::run(s, "SELECT pg_backend_pid()");
+    if !pg::query::is_ok_result(result) {
+        return -1;
+    }
+    sql::row::scalar_int(pg::query::unwrap_ok_result(result), -1)
+}
+
+fn pool_checks(in admin: sql::session::Session) -> Int {
+    var failed = 0;
+    var pool = sql::pool::new(address(), port(), "tuo", "tuo_oracle", "tuo-oracle-pw", 2, timeout());
+    var a = sql::pool::acquire(pool);
+    var b = sql::pool::acquire(pool);
+    let c = sql::pool::acquire(pool);
+    failed = failed + report("pool: two connections lent, the third refused", sql::session::is_open(a) && sql::session::is_open(b) && !sql::session::is_open(c) && sql::pool::lent(pool) == 2);
+
+    let first_pid = backend_pid(a);
+    let before = count_users(admin);
+    let _ = sql::session::begin(a);
+    let _ = add_user(a, "abandoned@example.com", "Abandoned", 1);
+    sql::pool::release(pool, a);
+    failed = failed + report("pool: release rolls back an abandoned transaction", count_users(admin) == before && sql::pool::lent(pool) == 1);
+
+    var again = sql::pool::acquire(pool);
+    failed = failed + report("pool: the same server process is reused, nothing new opened", backend_pid(again) == first_pid && sql::pool::opened(pool) == 2);
+    sql::pool::release(pool, again);
+
+    var kill = std::string::from_str("SELECT pg_terminate_backend(");
+    std::str::push_int(kill, first_pid);
+    std::string::push_byte(kill, 41);
+    let _ = sql::session::run_or_problem(admin, std::string::as_str(kill));
+    var replaced = sql::pool::acquire(pool);
+    let new_pid = backend_pid(replaced);
+    failed = failed + report("pool: a connection the server killed is replaced on pre-ping", sql::session::is_open(replaced) && new_pid > 0 && new_pid != first_pid && sql::pool::opened(pool) == 3);
+    sql::pool::release(pool, replaced);
+    sql::pool::release(pool, b);
+    sql::pool::dispose(pool);
+    failed = failed + report("pool: dispose closes everything", sql::pool::held(pool) == 0);
+    failed
+}
+
+fn main() -> Int {
+    var failed = scram_checks();
+    failed = failed + login_checks();
+    var s = open_session();
+    if !sql::session::is_open(s) {
+        note(sql::session::problem(s));
+        return failed + report("the oracle needs examples/sql-test/server.sh start <dir>", false);
+    }
+    failed = failed + schema_checks(s);
+    failed = failed + statement_checks(s);
+    failed = failed + transaction_checks(s);
+    failed = failed + migration_checks(s);
+    failed = failed + pool_checks(s);
+    sql::session::close(s);
+    failed
+}
