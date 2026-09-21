@@ -1,0 +1,327 @@
+// sql::select — SELECT, assembled the way SQLAlchemy lays it out.
+//
+// A `Select` keeps each part of the statement as its own `Clause`, because
+// the parts are supplied in any order (`.where()` before `.join()`) and
+// are written in a fixed one. The layout — the space before each newline,
+// `GROUP BY` and `ORDER BY` staying on the line they follow, the lone
+// space before `LIMIT` — is SQLAlchemy's, kept byte for byte so that a
+// query log or a `pg_stat_statements` entry from this port reads the same
+// as one from the Python backend.
+//
+// FROM is taken from the first column's table unless `from` names one, as
+// SQLAlchemy infers it; a joined table is never listed twice.
+
+module sql::select;
+
+/// A SELECT under construction.
+pub struct Select {
+    columns: sql::clause::Clause,
+    column_count: Int,
+    source: String,
+    joins: sql::clause::Clause,
+    filter: sql::clause::Clause,
+    groups: sql::clause::Clause,
+    group_count: Int,
+    condition: sql::clause::Clause,
+    orders: sql::clause::Clause,
+    order_count: Int,
+    top: sql::clause::Clause,
+    has_limit: Bool,
+    skip: sql::clause::Clause,
+    has_offset: Bool,
+    is_distinct: Bool,
+    locking: Bool,
+    first_cast: String,
+}
+
+/// An empty SELECT.
+///
+/// # Example
+/// ```tuo
+/// var q = sql::select::new();
+/// ```
+pub fn new() -> Select {
+    Select { columns: sql::clause::blank(), column_count: 0, source: std::string::empty(), joins: sql::clause::blank(), filter: sql::clause::blank(), groups: sql::clause::blank(), group_count: 0, condition: sql::clause::blank(), orders: sql::clause::blank(), order_count: 0, top: sql::clause::blank(), has_limit: false, skip: sql::clause::blank(), has_offset: false, is_distinct: false, locking: false, first_cast: std::string::empty() }
+}
+
+/// Add an expression to the column list. An unlabelled function or
+/// condition takes SQLAlchemy's anonymous label (`count_1`).
+///
+/// # Example
+/// ```tuo
+/// sql::select::column(q, sql::clause::col(users, "id"));
+/// ```
+pub fn column(mut q: Select, in expression: sql::clause::Clause) {
+    if q.column_count > 0 {
+        sql::clause::push_text(q.columns, ", ");
+    } else {
+        q.first_cast = sql::clause::cast_of(expression);
+    }
+    if std::string::len(q.source) == 0 {
+        q.source = sql::clause::table_of(expression);
+    }
+    sql::clause::append(q.columns, sql::clause::as_column(expression));
+    q.column_count = q.column_count + 1;
+}
+
+/// Add every column of a table — `select(users)`.
+///
+/// # Example
+/// ```tuo
+/// sql::select::all_columns(q, users);
+/// ```
+pub fn all_columns(mut q: Select, in t: sql::table::Table) {
+    var i = 0;
+    while i < sql::table::column_count(t) {
+        column(q, sql::clause::col(t, std::string::as_str(sql::table::column_at(t, i))));
+        i = i + 1;
+    }
+}
+
+/// Name the FROM table — `.select_from(t)`.
+///
+/// # Example
+/// ```tuo
+/// sql::select::from(q, users);
+/// ```
+pub fn from(mut q: Select, in t: sql::table::Table) {
+    q.source = sql::table::name(t);
+}
+
+fn joined(mut q: Select, in t: sql::table::Table, in on: sql::clause::Clause, in word: Str) {
+    sql::clause::push_text(q.joins, word);
+    sql::clause::push_text(q.joins, std::string::as_str(sql::table::name(t)));
+    sql::clause::push_text(q.joins, " ON ");
+    sql::clause::append(q.joins, on);
+}
+
+/// `JOIN t ON condition`.
+///
+/// # Example
+/// ```tuo
+/// sql::select::join(q, jobs, sql::clause::eq(owner, id));
+/// ```
+pub fn join(mut q: Select, in t: sql::table::Table, in on: sql::clause::Clause) {
+    joined(q, t, on, " JOIN ");
+}
+
+/// `LEFT OUTER JOIN t ON condition`.
+///
+/// # Example
+/// ```tuo
+/// sql::select::outer_join(q, jobs, sql::clause::eq(owner, id));
+/// ```
+pub fn outer_join(mut q: Select, in t: sql::table::Table, in on: sql::clause::Clause) {
+    joined(q, t, on, " LEFT OUTER JOIN ");
+}
+
+/// Add a WHERE condition; successive calls are ANDed, as `.where()` is.
+///
+/// # Example
+/// ```tuo
+/// sql::select::filter(q, sql::clause::ge(age, sql::clause::int(18)));
+/// ```
+pub fn filter(mut q: Select, in condition: sql::clause::Clause) {
+    q.filter = sql::clause::and_(q.filter, condition);
+}
+
+/// Add a GROUP BY expression.
+///
+/// # Example
+/// ```tuo
+/// sql::select::group_by(q, sql::clause::col(jobs, "owner_id"));
+/// ```
+pub fn group_by(mut q: Select, in expression: sql::clause::Clause) {
+    if q.group_count > 0 {
+        sql::clause::push_text(q.groups, ", ");
+    }
+    sql::clause::append(q.groups, expression);
+    q.group_count = q.group_count + 1;
+}
+
+/// Add a HAVING condition; successive calls are ANDed.
+///
+/// # Example
+/// ```tuo
+/// sql::select::having(q, sql::clause::gt(counted, sql::clause::int(2)));
+/// ```
+pub fn having(mut q: Select, in condition: sql::clause::Clause) {
+    q.condition = sql::clause::and_(q.condition, condition);
+}
+
+/// Add an ORDER BY expression; wrap it in `sql::clause::desc` to reverse.
+///
+/// # Example
+/// ```tuo
+/// sql::select::order_by(q, sql::clause::desc(sql::clause::col(users, "id")));
+/// ```
+pub fn order_by(mut q: Select, in expression: sql::clause::Clause) {
+    if q.order_count > 0 {
+        sql::clause::push_text(q.orders, ", ");
+    }
+    sql::clause::append(q.orders, expression);
+    q.order_count = q.order_count + 1;
+}
+
+/// `LIMIT n`, bound as a parameter.
+///
+/// # Example
+/// ```tuo
+/// sql::select::limit(q, 10);
+/// ```
+pub fn limit(mut q: Select, take n: Int) {
+    q.top = sql::clause::as_value(sql::clause::int(n), "INTEGER", "param");
+    q.has_limit = true;
+}
+
+/// `OFFSET n`, bound as a parameter.
+///
+/// # Example
+/// ```tuo
+/// sql::select::offset(q, 20);
+/// ```
+pub fn offset(mut q: Select, take n: Int) {
+    q.skip = sql::clause::as_value(sql::clause::int(n), "INTEGER", "param");
+    q.has_offset = true;
+}
+
+/// `SELECT DISTINCT`.
+///
+/// # Example
+/// ```tuo
+/// sql::select::distinct(q);
+/// ```
+pub fn distinct(mut q: Select) {
+    q.is_distinct = true;
+}
+
+/// `FOR UPDATE` — `.with_for_update()`.
+///
+/// # Example
+/// ```tuo
+/// sql::select::for_update(q);
+/// ```
+pub fn for_update(mut q: Select) {
+    q.locking = true;
+}
+
+/// The whole SELECT as a clause, parameters still unnumbered — what a
+/// subquery is made of. An empty column list is `SELECT *`.
+///
+/// # Example
+/// ```tuo
+/// let body = sql::select::as_clause(q);
+/// ```
+pub fn as_clause(in q: Select) -> sql::clause::Clause {
+    var c = sql::clause::blank();
+    sql::clause::push_text(c, "SELECT ");
+    if q.is_distinct {
+        sql::clause::push_text(c, "DISTINCT ");
+    }
+    if q.column_count == 0 {
+        sql::clause::push_text(c, "*");
+    } else {
+        sql::clause::append(c, q.columns);
+    }
+    if std::string::len(q.source) > 0 {
+        sql::clause::push_text(c, " \nFROM ");
+        sql::clause::push_text(c, std::string::as_str(q.source));
+        sql::clause::append(c, q.joins);
+    }
+    if std::string::len(sql::clause::text_of(q.filter)) > 0 {
+        sql::clause::push_text(c, " \nWHERE ");
+        sql::clause::append(c, q.filter);
+    }
+    if q.group_count > 0 {
+        sql::clause::push_text(c, " GROUP BY ");
+        sql::clause::append(c, q.groups);
+    }
+    if std::string::len(sql::clause::text_of(q.condition)) > 0 {
+        sql::clause::push_text(c, " \nHAVING ");
+        sql::clause::append(c, q.condition);
+    }
+    if q.order_count > 0 {
+        sql::clause::push_text(c, " ORDER BY ");
+        sql::clause::append(c, q.orders);
+    }
+    if q.has_limit {
+        sql::clause::push_text(c, " \n LIMIT ");
+        sql::clause::append(c, q.top);
+        if q.has_offset {
+            sql::clause::push_text(c, " OFFSET ");
+            sql::clause::append(c, q.skip);
+        }
+    } else if q.has_offset {
+        sql::clause::push_text(c, "\n LIMIT ALL OFFSET ");
+        sql::clause::append(c, q.skip);
+    }
+    if q.locking {
+        sql::clause::push_text(c, " FOR UPDATE");
+    }
+    c
+}
+
+/// The SELECT ready for the wire.
+///
+/// # Example
+/// ```tuo
+/// let ready = sql::select::render(q);
+/// ```
+pub fn render(in q: Select) -> sql::clause::Compiled {
+    sql::clause::render(as_clause(q))
+}
+
+/// `EXISTS (SELECT * FROM t WHERE condition)` — `exists().where(...)`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::select::exists(jobs, sql::clause::eq(owner, id));
+/// ```
+pub fn exists(in t: sql::table::Table, in condition: sql::clause::Clause) -> sql::clause::Clause {
+    var inner = new();
+    from(inner, t);
+    filter(inner, condition);
+    sql::clause::exists(as_clause(inner))
+}
+
+fn people() -> sql::table::Table {
+    var t = sql::table::named("people");
+    sql::table::integer(t, "id");
+    sql::table::primary_key(t);
+    sql::table::string(t, "name");
+    t
+}
+
+fn sample() -> Select {
+    var q = new();
+    column(q, sql::clause::col(people(), "id"));
+    column(q, sql::clause::count_star());
+    filter(q, sql::clause::gt(sql::clause::col(people(), "id"), sql::clause::int(1)));
+    filter(q, sql::clause::ilike(sql::clause::col(people(), "name"), "%k%"));
+    group_by(q, sql::clause::col(people(), "id"));
+    order_by(q, sql::clause::desc(sql::clause::col(people(), "id")));
+    limit(q, 10);
+    offset(q, 20);
+    q
+}
+
+fn sample_is(in expected: Str) -> Bool {
+    std::string::as_str(sql::clause::statement(render(sample()))) == expected
+}
+
+fn sample_sends(in expected: Str) -> Bool {
+    std::string::as_str(sql::clause::packed(render(sample()))) == expected
+}
+
+fn bare_offset_is(in expected: Str) -> Bool {
+    var q = new();
+    column(q, sql::clause::col(people(), "id"));
+    offset(q, 5);
+    std::string::as_str(sql::clause::statement(render(q))) == expected
+}
+
+spec render {
+    then sample_is("SELECT people.id, count(*) AS count_1 \nFROM people \nWHERE people.id > $1::INTEGER AND people.name ILIKE $2::VARCHAR GROUP BY people.id ORDER BY people.id DESC \n LIMIT $3::INTEGER OFFSET $4::INTEGER");
+    then sample_sends("1\u{1f}%k%\u{1f}10\u{1f}20\u{1f}");
+    then bare_offset_is("SELECT people.id \nFROM people\n LIMIT ALL OFFSET $1::INTEGER");
+}

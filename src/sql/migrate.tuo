@@ -1,0 +1,471 @@
+// sql::migrate — Alembic's revision chain, planned as data.
+//
+// An Alembic migration directory is a linked list: every revision names
+// its `down_revision`, and the database remembers where it is in one row
+// of `alembic_version`. This module holds the list, finds the path
+// between two revisions, and lays the work out as a `Plan`: the
+// statements to run, in order, with the bookkeeping statement Alembic
+// itself would issue after each step.
+//
+// The plan renders as the script `alembic upgrade --sql` prints, byte for
+// byte, which is what the specs pin it against — and the same plan is
+// what `sql::session::migrate` executes inside one transaction. Because
+// the version table and its statements are Alembic's own, a database
+// migrated by this port can be picked up by Alembic and the reverse.
+//
+// Branches and merges (a revision with two parents) are refused: `path`
+// reports no route rather than guessing an order.
+
+module sql::migrate;
+
+/// The revisions of a migration directory.
+pub struct Revisions {
+    ids: Array[String],
+    downs: Array[String],
+    up_owner: Array[Int],
+    up_text: Array[String],
+    down_owner: Array[Int],
+    down_text: Array[String],
+}
+
+/// Work laid out in order. `kinds[i]` is 0 for a statement and 1 for a
+/// comment line; only statements are executed.
+pub struct Plan {
+    ok: Bool,
+    kinds: Array[Int],
+    texts: Array[String],
+    creates_version_table: Bool,
+}
+
+/// No revisions yet.
+///
+/// # Example
+/// ```tuo
+/// var r = sql::migrate::none();
+/// ```
+pub fn none() -> Revisions {
+    Revisions { ids: std::array::empty(), downs: std::array::empty(), up_owner: std::array::empty(), up_text: std::array::empty(), down_owner: std::array::empty(), down_text: std::array::empty() }
+}
+
+/// Declare a revision; `down_revision` is empty for the first.
+///
+/// # Example
+/// ```tuo
+/// sql::migrate::revision(r, "1a2b3c4d5e6f", "");
+/// ```
+pub fn revision(mut r: Revisions, in id: Str, in down_revision: Str) {
+    std::array::push(r.ids, std::string::from_str(id));
+    std::array::push(r.downs, std::string::from_str(down_revision));
+}
+
+/// Add a statement to the `upgrade()` of the revision just declared.
+///
+/// # Example
+/// ```tuo
+/// sql::migrate::upgrade_op(r, "ALTER TABLE notes ADD COLUMN body VARCHAR");
+/// ```
+pub fn upgrade_op(mut r: Revisions, in statement: Str) {
+    std::array::push(r.up_owner, std::array::len(r.ids) - 1);
+    std::array::push(r.up_text, std::string::from_str(statement));
+}
+
+/// Add a statement to the `downgrade()` of the revision just declared.
+///
+/// # Example
+/// ```tuo
+/// sql::migrate::downgrade_op(r, "ALTER TABLE notes DROP COLUMN body");
+/// ```
+pub fn downgrade_op(mut r: Revisions, in statement: Str) {
+    std::array::push(r.down_owner, std::array::len(r.ids) - 1);
+    std::array::push(r.down_text, std::string::from_str(statement));
+}
+
+/// How many revisions there are.
+///
+/// # Example
+/// ```tuo
+/// let n = sql::migrate::count(r);
+/// ```
+pub fn count(in r: Revisions) -> Int {
+    std::array::len(r.ids)
+}
+
+/// The index of a revision id, or -1.
+///
+/// # Example
+/// ```tuo
+/// let i = sql::migrate::index_of(r, "1a2b3c4d5e6f");
+/// ```
+pub fn index_of(in r: Revisions, in id: Str) -> Int {
+    var i = 0;
+    while i < count(r) {
+        if std::string::as_str(std::array::get(r.ids, i)) == id {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+/// The head: the one revision no other revision descends from. Empty when
+/// there are no revisions, or when there is more than one head.
+///
+/// # Example
+/// ```tuo
+/// let h = sql::migrate::head(r);
+/// ```
+pub fn head(in r: Revisions) -> String {
+    var found = std::string::empty();
+    var heads = 0;
+    var i = 0;
+    while i < count(r) {
+        var is_parent = false;
+        var k = 0;
+        while k < count(r) {
+            if std::string::as_str(std::array::get(r.downs, k)) == std::string::as_str(std::array::get(r.ids, i)) {
+                is_parent = true;
+            }
+            k = k + 1;
+        }
+        if !is_parent {
+            heads = heads + 1;
+            found = std::string::from_str(std::string::as_str(std::array::get(r.ids, i)));
+        }
+        i = i + 1;
+    }
+    if heads != 1 {
+        found = std::string::empty();
+    }
+    found
+}
+
+/// The revisions to apply to get from `from` (empty for a fresh database)
+/// up to `to`, oldest first, as indices. Empty when `to` does not descend
+/// from `from`; `reachable` tells that apart from "already there".
+///
+/// # Example
+/// ```tuo
+/// let steps = sql::migrate::path(r, "", "3c4d5e6f7081");
+/// ```
+pub fn path(in r: Revisions, in from: Str, in to: Str) -> Array[Int] {
+    // Walk down from `to` until `from`, then reverse.
+    var backwards = std::array::empty();
+    var at = index_of(r, to);
+    var guard = 0;
+    var arrived = from == to;
+    while !arrived && at >= 0 && guard <= count(r) {
+        std::array::push(backwards, at);
+        let below = std::array::get(r.downs, at);
+        if std::string::as_str(below) == from {
+            arrived = true;
+        } else {
+            at = index_of(r, std::string::as_str(below));
+        }
+        guard = guard + 1;
+    }
+    var out = std::array::empty();
+    if arrived {
+        var i = std::array::len(backwards) - 1;
+        while i >= 0 {
+            std::array::push(out, std::array::get(backwards, i));
+            i = i - 1;
+        }
+    }
+    out
+}
+
+/// Does `to` descend from `from` (or equal it)?
+///
+/// # Example
+/// ```tuo
+/// let yes = sql::migrate::reachable(r, "", "3c4d5e6f7081");
+/// ```
+pub fn reachable(in r: Revisions, in from: Str, in to: Str) -> Bool {
+    if from == to {
+        return true;
+    }
+    if std::str::len(to) == 0 {
+        return false;
+    }
+    if index_of(r, to) < 0 {
+        return false;
+    }
+    if std::str::len(from) > 0 && index_of(r, from) < 0 {
+        return false;
+    }
+    std::array::len(path(r, from, to)) > 0
+}
+
+/// `CREATE TABLE alembic_version`, as Alembic writes it.
+///
+/// # Example
+/// ```tuo
+/// let ddl = sql::migrate::version_table();
+/// ```
+pub fn version_table() -> Str {
+    "CREATE TABLE alembic_version (\n    version_num VARCHAR(32) NOT NULL, \n    CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num)\n)"
+}
+
+/// The statement that reads the current revision.
+///
+/// # Example
+/// ```tuo
+/// let q = sql::migrate::current_query();
+/// ```
+pub fn current_query() -> Str {
+    "SELECT alembic_version.version_num \nFROM alembic_version"
+}
+
+fn quoted(in id: Str) -> String {
+    var out = std::string::from_str("'");
+    std::string::append(out, std::string::as_str(std::str::replace(id, "'", "''")));
+    std::string::push_byte(out, 39);
+    out
+}
+
+/// The bookkeeping statement for moving the version row from `from` to
+/// `to`: INSERT from nothing, DELETE to nothing, UPDATE between.
+///
+/// # Example
+/// ```tuo
+/// let s = sql::migrate::stamp("", "1a2b3c4d5e6f");
+/// ```
+pub fn stamp(in from: Str, in to: Str) -> String {
+    var out = std::string::empty();
+    if std::str::len(from) == 0 {
+        std::string::append(out, "INSERT INTO alembic_version (version_num) VALUES (");
+        std::string::append(out, std::string::as_str(quoted(to)));
+        std::string::append(out, ") RETURNING alembic_version.version_num");
+    } else if std::str::len(to) == 0 {
+        std::string::append(out, "DELETE FROM alembic_version WHERE alembic_version.version_num = ");
+        std::string::append(out, std::string::as_str(quoted(from)));
+    } else {
+        std::string::append(out, "UPDATE alembic_version SET version_num=");
+        std::string::append(out, std::string::as_str(quoted(to)));
+        std::string::append(out, " WHERE alembic_version.version_num = ");
+        std::string::append(out, std::string::as_str(quoted(from)));
+    }
+    out
+}
+
+fn refused() -> Plan {
+    Plan { ok: false, kinds: std::array::empty(), texts: std::array::empty(), creates_version_table: false }
+}
+
+fn push_comment(mut p: Plan, in word: Str, in from: Str, in to: Str) {
+    var line = std::string::from_str("-- Running ");
+    std::string::append(line, word);
+    std::string::push_byte(line, 32);
+    std::string::append(line, from);
+    std::string::append(line, " -> ");
+    std::string::append(line, to);
+    std::array::push(p.kinds, 1);
+    std::array::push(p.texts, line);
+}
+
+fn push_statement(mut p: Plan, in statement: Str) {
+    std::array::push(p.kinds, 0);
+    std::array::push(p.texts, std::string::from_str(statement));
+}
+
+/// Plan an upgrade from `from` (empty for a fresh database) to `to`. A
+/// fresh database also gets the version table. The plan is not `ok` when
+/// `to` does not descend from `from`.
+///
+/// # Example
+/// ```tuo
+/// let p = sql::migrate::upgrade(r, "", sql::migrate::head(r));
+/// ```
+pub fn upgrade(in r: Revisions, in from: Str, in to: Str) -> Plan {
+    if !reachable(r, from, to) {
+        return refused();
+    }
+    var p = Plan { ok: true, kinds: std::array::empty(), texts: std::array::empty(), creates_version_table: std::str::len(from) == 0 };
+    let steps = path(r, from, to);
+    var i = 0;
+    while i < std::array::len(steps) {
+        let at = std::array::get(steps, i);
+        let below = std::array::get(r.downs, at);
+        let id = std::array::get(r.ids, at);
+        push_comment(p, "upgrade", std::string::as_str(below), std::string::as_str(id));
+        var k = 0;
+        while k < std::array::len(r.up_text) {
+            if std::array::get(r.up_owner, k) == at {
+                push_statement(p, std::string::as_str(std::array::get(r.up_text, k)));
+            }
+            k = k + 1;
+        }
+        push_statement(p, std::string::as_str(stamp(std::string::as_str(below), std::string::as_str(id))));
+        i = i + 1;
+    }
+    p
+}
+
+/// Plan a downgrade from `from` down to `to` (empty for base).
+///
+/// # Example
+/// ```tuo
+/// let p = sql::migrate::downgrade(r, "3c4d5e6f7081", "");
+/// ```
+pub fn downgrade(in r: Revisions, in from: Str, in to: Str) -> Plan {
+    if !reachable(r, to, from) {
+        return refused();
+    }
+    var p = Plan { ok: true, kinds: std::array::empty(), texts: std::array::empty(), creates_version_table: false };
+    let steps = path(r, to, from);
+    var i = std::array::len(steps) - 1;
+    while i >= 0 {
+        let at = std::array::get(steps, i);
+        let below = std::array::get(r.downs, at);
+        let id = std::array::get(r.ids, at);
+        push_comment(p, "downgrade", std::string::as_str(id), std::string::as_str(below));
+        var k = 0;
+        while k < std::array::len(r.down_text) {
+            if std::array::get(r.down_owner, k) == at {
+                push_statement(p, std::string::as_str(std::array::get(r.down_text, k)));
+            }
+            k = k + 1;
+        }
+        push_statement(p, std::string::as_str(stamp(std::string::as_str(id), std::string::as_str(below))));
+        i = i - 1;
+    }
+    p
+}
+
+/// Could the plan be made?
+///
+/// # Example
+/// ```tuo
+/// let fine = sql::migrate::is_ok(p);
+/// ```
+pub fn is_ok(in p: Plan) -> Bool {
+    p.ok
+}
+
+/// Does the plan start from a fresh database, so that the version table
+/// must exist before its first statement?
+///
+/// # Example
+/// ```tuo
+/// let fresh = sql::migrate::needs_version_table(p);
+/// ```
+pub fn needs_version_table(in p: Plan) -> Bool {
+    p.creates_version_table
+}
+
+/// The statements to execute, in order, comments left out.
+///
+/// # Example
+/// ```tuo
+/// let todo = sql::migrate::statements(p);
+/// ```
+pub fn statements(in p: Plan) -> Array[String] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < std::array::len(p.texts) {
+        if std::array::get(p.kinds, i) == 0 {
+            std::array::push(out, std::string::from_str(std::string::as_str(std::array::get(p.texts, i))));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// The plan as the script `alembic upgrade --sql` prints.
+///
+/// # Example
+/// ```tuo
+/// let text = sql::migrate::script(p);
+/// ```
+pub fn script(in p: Plan) -> String {
+    var out = std::string::from_str("BEGIN;\n\n");
+    if p.creates_version_table {
+        std::string::append(out, version_table());
+        std::string::append(out, ";\n\n");
+    }
+    var i = 0;
+    while i < std::array::len(p.texts) {
+        std::string::append(out, std::string::as_str(std::array::get(p.texts, i)));
+        if std::array::get(p.kinds, i) == 0 {
+            std::string::push_byte(out, 59);
+        }
+        std::string::append(out, "\n\n");
+        i = i + 1;
+    }
+    std::string::append(out, "COMMIT;\n\n");
+    out
+}
+
+fn chain() -> Revisions {
+    var r = none();
+    revision(r, "aaa", "");
+    upgrade_op(r, "CREATE TABLE t (id INTEGER)");
+    downgrade_op(r, "DROP TABLE t");
+    revision(r, "bbb", "aaa");
+    upgrade_op(r, "ALTER TABLE t ADD COLUMN a INTEGER");
+    upgrade_op(r, "ALTER TABLE t ADD COLUMN b INTEGER");
+    downgrade_op(r, "ALTER TABLE t DROP COLUMN b");
+    downgrade_op(r, "ALTER TABLE t DROP COLUMN a");
+    revision(r, "ccc", "bbb");
+    r
+}
+
+fn forked() -> Revisions {
+    var r = chain();
+    revision(r, "ddd", "bbb");
+    r
+}
+
+fn step_count(in from: Str, in to: Str) -> Int {
+    std::array::len(path(chain(), from, to))
+}
+
+fn statement_count(in p: Plan) -> Int {
+    std::array::len(statements(p))
+}
+
+fn statement_is(in p: Plan, take i: Int, in expected: Str) -> Bool {
+    std::string::as_str(std::array::get(statements(p), i)) == expected
+}
+
+spec head {
+    then std::string::as_str(head(chain())) == "ccc";
+    then std::string::as_str(head(none())) == "";
+    then std::string::as_str(head(forked())) == "";
+}
+
+spec path {
+    then step_count("", "ccc") == 3;
+    then step_count("aaa", "ccc") == 2;
+    then step_count("ccc", "ccc") == 0;
+    then step_count("ccc", "aaa") == 0;
+    then reachable(chain(), "", "ccc");
+    then reachable(chain(), "bbb", "bbb");
+    then !reachable(chain(), "ccc", "aaa");
+    then !reachable(chain(), "", "zzz");
+    then !reachable(chain(), "zzz", "ccc");
+}
+
+spec stamp {
+    then std::string::as_str(stamp("", "aaa")) == "INSERT INTO alembic_version (version_num) VALUES ('aaa') RETURNING alembic_version.version_num";
+    then std::string::as_str(stamp("aaa", "bbb")) == "UPDATE alembic_version SET version_num='bbb' WHERE alembic_version.version_num = 'aaa'";
+    then std::string::as_str(stamp("aaa", "")) == "DELETE FROM alembic_version WHERE alembic_version.version_num = 'aaa'";
+}
+
+spec upgrade {
+    then is_ok(upgrade(chain(), "", "ccc"));
+    then needs_version_table(upgrade(chain(), "", "ccc"));
+    then !needs_version_table(upgrade(chain(), "aaa", "ccc"));
+    then statement_count(upgrade(chain(), "", "ccc")) == 6;
+    then statement_is(upgrade(chain(), "aaa", "bbb"), 1, "ALTER TABLE t ADD COLUMN b INTEGER");
+    then statement_count(upgrade(chain(), "ccc", "ccc")) == 0;
+    then !is_ok(upgrade(chain(), "ccc", "aaa"));
+}
+
+spec downgrade {
+    then is_ok(downgrade(chain(), "ccc", ""));
+    then statement_count(downgrade(chain(), "ccc", "")) == 6;
+    then statement_is(downgrade(chain(), "ccc", "aaa"), 1, "ALTER TABLE t DROP COLUMN b");
+    then statement_is(downgrade(chain(), "aaa", ""), 1, "DELETE FROM alembic_version WHERE alembic_version.version_num = 'aaa'");
+    then !is_ok(downgrade(chain(), "aaa", "ccc"));
+}

@@ -1,0 +1,1390 @@
+// sql::clause — SQL expressions as text with deferred parameters.
+//
+// SQLAlchemy builds an expression tree and compiles it. A tree is a
+// recursive type, which v0 refuses, so an expression here is compiled as
+// it is built: a `Clause` is the text so far, with one marker byte where
+// each bound parameter goes, and the parameters beside it in text order.
+// Composing two clauses concatenates both halves, so the order can never
+// drift, and numbering waits for `render`, when the whole statement is
+// known. That matters because SQLAlchemy does not number in text order:
+// the members of an `IN` list are expanded after compilation and take the
+// last numbers (`… IN ($7, $8, $9) … LIMIT $5 OFFSET $6`).
+//
+// What a clause also carries is what the compiler would have read off the
+// tree: a precedence, so `and_` knows to parenthesize an `or_`; the cast
+// of its type, so a literal compared against a column is sent as
+// `$1::VARCHAR`; the negated spelling, because `not_(a = b)` is `a != b`
+// rather than `NOT (a = b)`; and the base of the anonymous label
+// (`count_1`, `coalesce_3`) it takes when selected unlabelled. Those
+// numbers come from one counter per base that bound parameters share,
+// which is why the second `coalesce` in a column list is `coalesce_3`.
+//
+// Every string a caller supplies as a *value* travels as a parameter and
+// never enters the text. Names — tables, columns, labels, functions — do
+// enter it, unquoted as SQLAlchemy leaves lower-case names, and must come
+// from the program, not from a request.
+
+module sql::clause;
+
+/// An expression: text with parameter markers, and the parameters.
+pub struct Clause {
+    text: String,
+    values: Array[String],
+    nulls: Array[Int],
+    casts: Array[String],
+    bases: Array[String],
+    late: Array[Int],
+    prec: Int,
+    cast: String,
+    base: String,
+    table: String,
+    anon: String,
+    label: String,
+    literal: Int,
+    other: String,
+    other_prec: Int,
+}
+
+/// A statement ready for the wire: text with `$n::CAST` placeholders and
+/// the parameters in positional order. `nulls[i] == 1` marks SQL NULL.
+pub struct Compiled {
+    text: String,
+    values: Array[String],
+    nulls: Array[Int],
+}
+
+/// The marker byte standing for an ordinary bound parameter.
+pub fn mark_param() -> Int {
+    1
+}
+
+/// Opens an anonymous-label allocation: `0x02 base 0x03`.
+pub fn mark_label_open() -> Int {
+    2
+}
+
+/// Closes an anonymous-label allocation.
+pub fn mark_label_close() -> Int {
+    3
+}
+
+/// Prints the label most recently allocated.
+pub fn mark_label_print() -> Int {
+    4
+}
+
+/// The marker byte for a member of an expanded `IN` list.
+pub fn mark_late() -> Int {
+    5
+}
+
+fn prec_or() -> Int {
+    2
+}
+
+fn prec_and() -> Int {
+    3
+}
+
+fn prec_not() -> Int {
+    4
+}
+
+fn prec_compare() -> Int {
+    5
+}
+
+fn prec_add() -> Int {
+    7
+}
+
+fn prec_mul() -> Int {
+    8
+}
+
+fn prec_unary() -> Int {
+    9
+}
+
+fn prec_atom() -> Int {
+    100
+}
+
+fn literal_int() -> Int {
+    1
+}
+
+fn literal_text() -> Int {
+    2
+}
+
+fn literal_number() -> Int {
+    3
+}
+
+fn literal_bool() -> Int {
+    4
+}
+
+fn literal_null() -> Int {
+    5
+}
+
+/// An empty clause, for accumulating into.
+///
+/// # Example
+/// ```tuo
+/// var c = sql::clause::blank();
+/// ```
+pub fn blank() -> Clause {
+    Clause { text: std::string::empty(), values: std::array::empty(), nulls: std::array::empty(), casts: std::array::empty(), bases: std::array::empty(), late: std::array::empty(), prec: prec_atom(), cast: std::string::empty(), base: std::string::empty(), table: std::string::empty(), anon: std::string::empty(), label: std::string::empty(), literal: 0, other: std::string::empty(), other_prec: prec_atom() }
+}
+
+fn copy(in s: String) -> String {
+    std::string::from_str(std::string::as_str(s))
+}
+
+/// Append raw SQL text to a clause.
+///
+/// # Example
+/// ```tuo
+/// sql::clause::push_text(c, " AND ");
+/// ```
+pub fn push_text(mut c: Clause, in piece: Str) {
+    std::string::append(c.text, piece);
+}
+
+/// Append the parameters of `from` to `into`, without its text.
+///
+/// # Example
+/// ```tuo
+/// sql::clause::take_params(into, from);
+/// ```
+pub fn take_params(mut into: Clause, in from: Clause) {
+    var i = 0;
+    while i < std::array::len(from.values) {
+        std::array::push(into.values, copy(std::array::get(from.values, i)));
+        std::array::push(into.nulls, std::array::get(from.nulls, i));
+        std::array::push(into.casts, copy(std::array::get(from.casts, i)));
+        std::array::push(into.bases, copy(std::array::get(from.bases, i)));
+        std::array::push(into.late, std::array::get(from.late, i));
+        i = i + 1;
+    }
+}
+
+/// Append a clause — text and parameters — to another.
+///
+/// # Example
+/// ```tuo
+/// sql::clause::append(into, piece);
+/// ```
+pub fn append(mut into: Clause, in piece: Clause) {
+    std::string::append(into.text, std::string::as_str(piece.text));
+    take_params(into, piece);
+}
+
+fn append_grouped(mut into: Clause, in piece: Clause) {
+    std::string::push_byte(into.text, 40);
+    append(into, piece);
+    std::string::push_byte(into.text, 41);
+}
+
+/// The clause's text, markers included.
+///
+/// # Example
+/// ```tuo
+/// let t = sql::clause::text_of(c);
+/// ```
+pub fn text_of(in c: Clause) -> String {
+    copy(c.text)
+}
+
+/// How many parameters the clause carries.
+///
+/// # Example
+/// ```tuo
+/// let n = sql::clause::param_count(c);
+/// ```
+pub fn param_count(in c: Clause) -> Int {
+    std::array::len(c.values)
+}
+
+/// The first table the clause refers to; a SELECT takes its FROM from it.
+///
+/// # Example
+/// ```tuo
+/// let t = sql::clause::table_of(c);
+/// ```
+pub fn table_of(in c: Clause) -> String {
+    copy(c.table)
+}
+
+/// The cast of the clause's type, or empty when it has none.
+///
+/// # Example
+/// ```tuo
+/// let t = sql::clause::cast_of(c);
+/// ```
+pub fn cast_of(in c: Clause) -> String {
+    copy(c.cast)
+}
+
+/// Is the clause a bare literal (`int`, `text`, `number`, `boolean`, `null`)?
+///
+/// # Example
+/// ```tuo
+/// let yes = sql::clause::is_literal(sql::clause::int(3));
+/// ```
+pub fn is_literal(in c: Clause) -> Bool {
+    c.literal != 0
+}
+
+/// Does the clause need parentheses when it stands where one operand is
+/// expected (the right of `SET x=`, a scalar position)?
+///
+/// # Example
+/// ```tuo
+/// let yes = sql::clause::is_compound(c);
+/// ```
+pub fn is_compound(in c: Clause) -> Bool {
+    c.prec < prec_atom()
+}
+
+/// A column of a table: `users.email`.
+///
+/// # Example
+/// ```tuo
+/// let email = sql::clause::col(users, "email");
+/// ```
+pub fn col(in t: sql::table::Table, in name: Str) -> Clause {
+    var c = blank();
+    let owner = sql::table::name(t);
+    std::string::append(c.text, std::string::as_str(owner));
+    std::string::push_byte(c.text, 46);
+    std::string::append(c.text, name);
+    c.cast = sql::table::cast_of(t, name);
+    c.base = std::string::from_str(name);
+    c.table = owner;
+    if std::string::as_str(c.cast) == "BOOLEAN" {
+        // A boolean column is a condition: `NOT users.active`.
+        c.other = std::string::from_str("NOT ");
+        std::string::append(c.other, std::string::as_str(c.text));
+        c.other_prec = prec_not();
+    }
+    c
+}
+
+fn literal_of(in value: Str, take is_null: Int, in cast: Str, take kind: Int) -> Clause {
+    var c = blank();
+    std::string::push_byte(c.text, mark_param());
+    std::array::push(c.values, std::string::from_str(value));
+    std::array::push(c.nulls, is_null);
+    std::array::push(c.casts, std::string::from_str(cast));
+    std::array::push(c.bases, std::string::from_str("param"));
+    std::array::push(c.late, 0);
+    c.cast = std::string::from_str(cast);
+    c.literal = kind;
+    c
+}
+
+/// An integer value, bound as a parameter.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::int(18);
+/// ```
+pub fn int(take value: Int) -> Clause {
+    literal_of(std::string::as_str(std::str::to_string(value)), 0, "INTEGER", literal_int())
+}
+
+/// A text value, bound as a parameter. Timestamps, dates, and UUIDs are
+/// text too: compared against a column they take the column's cast.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::text("a@b.c");
+/// ```
+pub fn text(in value: Str) -> Clause {
+    literal_of(value, 0, "VARCHAR", literal_text())
+}
+
+/// A float or decimal value, by its spelling (`"1.5"`), bound as a
+/// parameter. The spelling is sent as written; nothing is rounded.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::number("1.5");
+/// ```
+pub fn number(in spelling: Str) -> Clause {
+    literal_of(spelling, 0, "FLOAT", literal_number())
+}
+
+/// A boolean value. In a comparison it is written inline (`= true`), as
+/// SQLAlchemy does; as an INSERT or UPDATE value it is a parameter.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::boolean(true);
+/// ```
+pub fn boolean(take value: Bool) -> Clause {
+    if value {
+        literal_of("true", 0, "BOOLEAN", literal_bool())
+    } else {
+        literal_of("false", 0, "BOOLEAN", literal_bool())
+    }
+}
+
+/// SQL NULL. `eq(c, null())` is `c IS NULL`; as a value it is a NULL
+/// parameter.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::null();
+/// ```
+pub fn null() -> Clause {
+    literal_of("", 1, "", literal_null())
+}
+
+fn is_numeric_cast(in cast: Str) -> Bool {
+    cast == "FLOAT" || std::str::starts_with(cast, "NUMERIC")
+}
+
+// The cast a literal takes beside an expression of type `against`.
+// SQLAlchemy types a Python int as INTEGER whatever it is compared with
+// (BIGINT aside), and everything else as the other side's type.
+fn adopted_cast(in lit: Clause, in against: Str) -> String {
+    if lit.literal == literal_int() {
+        if against == "BIGINT" {
+            return std::string::from_str("BIGINT");
+        }
+        return std::string::from_str("INTEGER");
+    }
+    if lit.literal == literal_number() {
+        if is_numeric_cast(against) {
+            return std::string::from_str(against);
+        }
+        return std::string::from_str("FLOAT");
+    }
+    if std::str::len(against) > 0 {
+        return std::string::from_str(against);
+    }
+    copy(lit.cast)
+}
+
+// Append a literal operand, typed and named by the expression beside it.
+fn append_literal(mut into: Clause, in lit: Clause, in against: Str, in base: Str) {
+    std::string::push_byte(into.text, mark_param());
+    std::array::push(into.values, copy(std::array::get(lit.values, 0)));
+    std::array::push(into.nulls, std::array::get(lit.nulls, 0));
+    std::array::push(into.casts, adopted_cast(lit, against));
+    if std::str::len(base) > 0 {
+        std::array::push(into.bases, std::string::from_str(base));
+    } else {
+        std::array::push(into.bases, std::string::from_str("param"));
+    }
+    std::array::push(into.late, 0);
+}
+
+/// A clause as the value of `column` in INSERT … VALUES or UPDATE … SET:
+/// a literal becomes a parameter cast to the column's type, and an
+/// expression is kept, parenthesized when it is compound.
+///
+/// # Example
+/// ```tuo
+/// let v = sql::clause::as_value(sql::clause::int(12), "NUMERIC(10, 2)", "amount");
+/// ```
+pub fn as_value(in value: Clause, in cast: Str, in column: Str) -> Clause {
+    var c = blank();
+    if is_literal(value) {
+        std::string::push_byte(c.text, mark_param());
+        std::array::push(c.values, copy(std::array::get(value.values, 0)));
+        std::array::push(c.nulls, std::array::get(value.nulls, 0));
+        std::array::push(c.casts, std::string::from_str(cast));
+        std::array::push(c.bases, std::string::from_str(column));
+        std::array::push(c.late, 0);
+    } else if is_compound(value) {
+        append_grouped(c, value);
+    } else {
+        append(c, value);
+    }
+    c
+}
+
+// One operand of a binary operator of precedence `prec`.
+fn append_operand(mut into: Clause, in operand: Clause, take prec: Int, take is_right: Bool) {
+    let tight = operand.prec < prec || (is_right && operand.prec == prec);
+    if tight {
+        append_grouped(into, operand);
+    } else {
+        append(into, operand);
+    }
+}
+
+fn inherit(mut c: Clause, in left: Clause) {
+    c.table = copy(left.table);
+    c.base = copy(left.base);
+}
+
+// `left op right`, with `negated` as the operator `not_` turns it into.
+fn compare(in left: Clause, in right: Clause, in op: Str, in negated: Str) -> Clause {
+    var c = blank();
+    inherit(c, left);
+    append_operand(c, left, prec_compare(), false);
+    var tail = blank();
+    if is_literal(right) {
+        append_literal(tail, right, std::string::as_str(left.cast), std::string::as_str(left.base));
+    } else {
+        append_operand(tail, right, prec_compare(), true);
+    }
+    c.other = copy(c.text);
+    std::string::append(c.text, op);
+    std::string::append(c.other, negated);
+    std::string::append(c.text, std::string::as_str(tail.text));
+    std::string::append(c.other, std::string::as_str(tail.text));
+    take_params(c, tail);
+    c.prec = prec_compare();
+    c.other_prec = prec_compare();
+    c.cast = std::string::from_str("BOOLEAN");
+    c.anon = std::string::from_str("anon");
+    c
+}
+
+// `left IS <word>` for NULL, true, and false, which are never parameters.
+fn is_word(in left: Clause, in word: Str, take positive: Bool) -> Clause {
+    var c = blank();
+    inherit(c, left);
+    append_operand(c, left, prec_compare(), false);
+    c.other = copy(c.text);
+    if positive {
+        std::string::append(c.text, " IS ");
+        std::string::append(c.other, " IS NOT ");
+    } else {
+        std::string::append(c.text, " IS NOT ");
+        std::string::append(c.other, " IS ");
+    }
+    std::string::append(c.text, word);
+    std::string::append(c.other, word);
+    c.prec = prec_compare();
+    c.other_prec = prec_compare();
+    c.cast = std::string::from_str("BOOLEAN");
+    c.anon = std::string::from_str("anon");
+    c
+}
+
+fn inline_bool(in left: Clause, in right: Clause, in op: Str, in negated: Str) -> Clause {
+    var c = blank();
+    inherit(c, left);
+    append_operand(c, left, prec_compare(), false);
+    c.other = copy(c.text);
+    std::string::append(c.text, op);
+    std::string::append(c.other, negated);
+    std::string::append(c.text, std::string::as_str(std::array::get(right.values, 0)));
+    std::string::append(c.other, std::string::as_str(std::array::get(right.values, 0)));
+    c.prec = prec_compare();
+    c.other_prec = prec_compare();
+    c.cast = std::string::from_str("BOOLEAN");
+    c.anon = std::string::from_str("anon");
+    c
+}
+
+/// `left = right`. Against `null()` it is `IS NULL`, and against a
+/// `boolean` the value is written inline, both as SQLAlchemy does.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::eq(sql::clause::col(users, "id"), sql::clause::int(7));
+/// ```
+pub fn eq(in left: Clause, in right: Clause) -> Clause {
+    if right.literal == literal_null() {
+        return is_word(left, "NULL", true);
+    }
+    if right.literal == literal_bool() {
+        return inline_bool(left, right, " = ", " != ");
+    }
+    compare(left, right, " = ", " != ")
+}
+
+/// `left != right`; against `null()`, `IS NOT NULL`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::ne(sql::clause::col(users, "age"), sql::clause::int(30));
+/// ```
+pub fn ne(in left: Clause, in right: Clause) -> Clause {
+    if right.literal == literal_null() {
+        return is_word(left, "NULL", false);
+    }
+    if right.literal == literal_bool() {
+        return inline_bool(left, right, " != ", " = ");
+    }
+    compare(left, right, " != ", " = ")
+}
+
+/// `left < right`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::lt(sql::clause::col(users, "age"), sql::clause::int(30));
+/// ```
+pub fn lt(in left: Clause, in right: Clause) -> Clause {
+    compare(left, right, " < ", " >= ")
+}
+
+/// `left <= right`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::le(sql::clause::col(users, "age"), sql::clause::int(30));
+/// ```
+pub fn le(in left: Clause, in right: Clause) -> Clause {
+    compare(left, right, " <= ", " > ")
+}
+
+/// `left > right`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::gt(sql::clause::col(users, "score"), sql::clause::number("1.5"));
+/// ```
+pub fn gt(in left: Clause, in right: Clause) -> Clause {
+    compare(left, right, " > ", " <= ")
+}
+
+/// `left >= right`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::ge(sql::clause::col(users, "age"), sql::clause::int(18));
+/// ```
+pub fn ge(in left: Clause, in right: Clause) -> Clause {
+    compare(left, right, " >= ", " < ")
+}
+
+/// `left LIKE pattern`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::like(sql::clause::col(users, "name"), "A%");
+/// ```
+pub fn like(in left: Clause, in pattern: Str) -> Clause {
+    compare(left, text(pattern), " LIKE ", " NOT LIKE ")
+}
+
+/// `left ILIKE pattern`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::ilike(sql::clause::col(users, "name"), "%x%");
+/// ```
+pub fn ilike(in left: Clause, in pattern: Str) -> Clause {
+    compare(left, text(pattern), " ILIKE ", " NOT ILIKE ")
+}
+
+/// `left IS NULL`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::is_null(sql::clause::col(users, "name"));
+/// ```
+pub fn is_null(in left: Clause) -> Clause {
+    is_word(left, "NULL", true)
+}
+
+/// `left IS NOT NULL`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::is_not_null(sql::clause::col(users, "name"));
+/// ```
+pub fn is_not_null(in left: Clause) -> Clause {
+    is_word(left, "NULL", false)
+}
+
+/// `left IS true`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::is_true(sql::clause::col(users, "active"));
+/// ```
+pub fn is_true(in left: Clause) -> Clause {
+    is_word(left, "true", true)
+}
+
+/// `left IS false`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::is_false(sql::clause::col(users, "active"));
+/// ```
+pub fn is_false(in left: Clause) -> Clause {
+    is_word(left, "false", true)
+}
+
+/// `left BETWEEN low AND high`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::between(sql::clause::col(users, "age"), sql::clause::int(18), sql::clause::int(65));
+/// ```
+pub fn between(in left: Clause, in low: Clause, in high: Clause) -> Clause {
+    var c = blank();
+    inherit(c, left);
+    append_operand(c, left, prec_compare(), false);
+    c.other = copy(c.text);
+    std::string::append(c.text, " BETWEEN ");
+    std::string::append(c.other, " NOT BETWEEN ");
+    var tail = blank();
+    if is_literal(low) {
+        append_literal(tail, low, std::string::as_str(left.cast), std::string::as_str(left.base));
+    } else {
+        append_operand(tail, low, prec_compare(), true);
+    }
+    std::string::append(tail.text, " AND ");
+    if is_literal(high) {
+        append_literal(tail, high, std::string::as_str(left.cast), std::string::as_str(left.base));
+    } else {
+        append_operand(tail, high, prec_compare(), true);
+    }
+    std::string::append(c.text, std::string::as_str(tail.text));
+    std::string::append(c.other, std::string::as_str(tail.text));
+    take_params(c, tail);
+    c.prec = prec_compare();
+    c.other_prec = prec_compare();
+    c.cast = std::string::from_str("BOOLEAN");
+    c.anon = std::string::from_str("anon");
+    c
+}
+
+// `left IN (…)` over `count` members whose values and literal kind are
+// given. SQLAlchemy parenthesizes the negated form, and spells the empty
+// list as a contradiction rather than as invalid SQL.
+fn in_list(in left: Clause, in members: Array[String], in member_cast: Str, take negated: Bool) -> Clause {
+    var plain = blank();
+    inherit(plain, left);
+    append_operand(plain, left, prec_compare(), false);
+    var grouped = std::string::from_str("(");
+    std::string::append(grouped, std::string::as_str(plain.text));
+    let n = std::array::len(members);
+    if n == 0 {
+        std::string::append(plain.text, " IN (NULL) AND (1 != 1)");
+        std::string::append(grouped, " NOT IN (NULL) OR (1 = 1))");
+    } else {
+        std::string::append(plain.text, " IN (");
+        std::string::append(grouped, " NOT IN (");
+        var i = 0;
+        while i < n {
+            if i > 0 {
+                std::string::append(plain.text, ", ");
+                std::string::append(grouped, ", ");
+            }
+            std::string::push_byte(plain.text, mark_late());
+            std::string::push_byte(grouped, mark_late());
+            std::array::push(plain.values, copy(std::array::get(members, i)));
+            std::array::push(plain.nulls, 0);
+            std::array::push(plain.casts, std::string::from_str(member_cast));
+            if i == 0 {
+                std::array::push(plain.bases, copy(left.base));
+            } else {
+                std::array::push(plain.bases, std::string::empty());
+            }
+            std::array::push(plain.late, 1);
+            i = i + 1;
+        }
+        std::string::push_byte(plain.text, 41);
+        std::string::append(grouped, "))");
+    }
+    plain.prec = prec_compare();
+    plain.other_prec = prec_atom();
+    plain.cast = std::string::from_str("BOOLEAN");
+    plain.anon = std::string::from_str("anon");
+    plain.other = grouped;
+    if negated {
+        return not_(plain);
+    }
+    plain
+}
+
+fn int_member_cast(in left: Clause) -> String {
+    if std::string::as_str(left.cast) == "BIGINT" {
+        return std::string::from_str("BIGINT");
+    }
+    std::string::from_str("INTEGER")
+}
+
+fn text_member_cast(in left: Clause) -> String {
+    if std::string::len(left.cast) > 0 {
+        return copy(left.cast);
+    }
+    std::string::from_str("VARCHAR")
+}
+
+fn ints_as_text(in members: Array[Int]) -> Array[String] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < std::array::len(members) {
+        std::array::push(out, std::str::to_string(std::array::get(members, i)));
+        i = i + 1;
+    }
+    out
+}
+
+/// `left IN (members…)` over integers.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::in_ints(sql::clause::col(users, "id"), ids);
+/// ```
+pub fn in_ints(in left: Clause, in members: Array[Int]) -> Clause {
+    in_list(left, ints_as_text(members), std::string::as_str(int_member_cast(left)), false)
+}
+
+/// `(left NOT IN (members…))` over integers.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::not_in_ints(sql::clause::col(users, "id"), ids);
+/// ```
+pub fn not_in_ints(in left: Clause, in members: Array[Int]) -> Clause {
+    in_list(left, ints_as_text(members), std::string::as_str(int_member_cast(left)), true)
+}
+
+/// `left IN (members…)` over text values.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::in_texts(sql::clause::col(users, "email"), emails);
+/// ```
+pub fn in_texts(in left: Clause, in members: Array[String]) -> Clause {
+    in_list(left, members, std::string::as_str(text_member_cast(left)), false)
+}
+
+/// `(left NOT IN (members…))` over text values.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::not_in_texts(sql::clause::col(users, "email"), emails);
+/// ```
+pub fn not_in_texts(in left: Clause, in members: Array[String]) -> Clause {
+    in_list(left, members, std::string::as_str(text_member_cast(left)), true)
+}
+
+/// `left IN (subquery)`; `body` is a SELECT from `sql::select::as_clause`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::in_select(sql::clause::col(users, "id"), sql::select::as_clause(owners));
+/// ```
+pub fn in_select(in left: Clause, in body: Clause) -> Clause {
+    var c = blank();
+    inherit(c, left);
+    append_operand(c, left, prec_compare(), false);
+    var grouped = std::string::from_str("(");
+    std::string::append(grouped, std::string::as_str(c.text));
+    std::string::append(c.text, " IN (");
+    std::string::append(grouped, " NOT IN (");
+    std::string::append(c.text, std::string::as_str(body.text));
+    std::string::append(grouped, std::string::as_str(body.text));
+    std::string::push_byte(c.text, 41);
+    std::string::append(grouped, "))");
+    take_params(c, body);
+    c.other = grouped;
+    c.prec = prec_compare();
+    c.other_prec = prec_atom();
+    c.cast = std::string::from_str("BOOLEAN");
+    c.anon = std::string::from_str("anon");
+    c
+}
+
+/// `EXISTS (subquery)`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::exists(sql::select::as_clause(owned));
+/// ```
+pub fn exists(in body: Clause) -> Clause {
+    var c = blank();
+    std::string::append(c.text, "EXISTS (");
+    append(c, body);
+    std::string::push_byte(c.text, 41);
+    c.prec = prec_unary();
+    c.cast = std::string::from_str("BOOLEAN");
+    c.anon = std::string::from_str("anon");
+    c
+}
+
+/// `(subquery)` as a scalar value.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::scalar(sql::select::as_clause(counted));
+/// ```
+pub fn scalar(in body: Clause) -> Clause {
+    var c = blank();
+    append_grouped(c, body);
+    c.cast = copy(body.cast);
+    c.anon = std::string::from_str("anon");
+    c
+}
+
+/// Negate a condition the way SQLAlchemy does: a comparison flips its
+/// operator, `IN` becomes a parenthesized `NOT IN`, a boolean column gains
+/// `NOT`, and anything else is wrapped as `NOT (…)`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::not_(sql::clause::eq(age, sql::clause::int(3))); // age != $1
+/// ```
+pub fn not_(in inner: Clause) -> Clause {
+    var c = blank();
+    take_params(c, inner);
+    c.table = copy(inner.table);
+    c.base = copy(inner.base);
+    c.cast = std::string::from_str("BOOLEAN");
+    c.anon = std::string::from_str("anon");
+    if std::string::len(inner.other) > 0 {
+        c.text = copy(inner.other);
+        c.other = copy(inner.text);
+        c.prec = inner.other_prec;
+        c.other_prec = inner.prec;
+        return c;
+    }
+    std::string::append(c.text, "NOT ");
+    if is_compound(inner) {
+        std::string::push_byte(c.text, 40);
+        std::string::append(c.text, std::string::as_str(inner.text));
+        std::string::push_byte(c.text, 41);
+    } else {
+        std::string::append(c.text, std::string::as_str(inner.text));
+    }
+    c.other = copy(inner.text);
+    c.prec = prec_not();
+    c.other_prec = inner.prec;
+    c
+}
+
+fn junction(in left: Clause, in right: Clause, in word: Str, take prec: Int) -> Clause {
+    if std::string::len(left.text) == 0 {
+        var only = blank();
+        append(only, right);
+        only.prec = right.prec;
+        only.other = copy(right.other);
+        only.other_prec = right.other_prec;
+        only.table = copy(right.table);
+        only.cast = copy(right.cast);
+        only.anon = copy(right.anon);
+        return only;
+    }
+    var c = blank();
+    c.table = copy(left.table);
+    if left.prec < prec {
+        append_grouped(c, left);
+    } else {
+        append(c, left);
+    }
+    std::string::append(c.text, word);
+    if right.prec < prec {
+        append_grouped(c, right);
+    } else {
+        append(c, right);
+    }
+    c.prec = prec;
+    c.cast = std::string::from_str("BOOLEAN");
+    c.anon = std::string::from_str("anon");
+    c
+}
+
+/// `left AND right`. An `or_` operand is parenthesized; a nested `and_` is
+/// flattened; and a `blank()` left side yields `right` alone, so a filter
+/// can be accumulated from nothing.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::and_(adult, active);
+/// ```
+pub fn and_(in left: Clause, in right: Clause) -> Clause {
+    junction(left, right, " AND ", prec_and())
+}
+
+/// `left OR right`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::or_(young, old);
+/// ```
+pub fn or_(in left: Clause, in right: Clause) -> Clause {
+    junction(left, right, " OR ", prec_or())
+}
+
+fn arithmetic(in left: Clause, in right: Clause, in op: Str, take prec: Int) -> Clause {
+    var c = blank();
+    inherit(c, left);
+    append_operand(c, left, prec, false);
+    std::string::append(c.text, op);
+    if is_literal(right) {
+        append_literal(c, right, std::string::as_str(left.cast), std::string::as_str(left.base));
+    } else {
+        append_operand(c, right, prec, true);
+    }
+    c.prec = prec;
+    c.cast = copy(left.cast);
+    c.anon = std::string::from_str("anon");
+    c
+}
+
+/// `left + right`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::plus(sql::clause::col(users, "age"), sql::clause::int(1));
+/// ```
+pub fn plus(in left: Clause, in right: Clause) -> Clause {
+    arithmetic(left, right, " + ", prec_add())
+}
+
+/// `left - right`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::minus(balance, age);
+/// ```
+pub fn minus(in left: Clause, in right: Clause) -> Clause {
+    arithmetic(left, right, " - ", prec_add())
+}
+
+/// `left * right`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::times(age, sql::clause::int(2));
+/// ```
+pub fn times(in left: Clause, in right: Clause) -> Clause {
+    arithmetic(left, right, " * ", prec_mul())
+}
+
+/// `name()` — `func.now()`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::call0("now");
+/// ```
+pub fn call0(in name: Str) -> Clause {
+    var c = blank();
+    std::string::append(c.text, name);
+    std::string::append(c.text, "()");
+    c.base = std::string::from_str(name);
+    c.anon = std::string::from_str(name);
+    if name == "now" {
+        c.cast = std::string::from_str("TIMESTAMP WITH TIME ZONE");
+    }
+    c
+}
+
+/// `count(*)` — `func.count()`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::count_star();
+/// ```
+pub fn count_star() -> Clause {
+    var c = blank();
+    std::string::append(c.text, "count(*)");
+    c.base = std::string::from_str("count");
+    c.anon = std::string::from_str("count");
+    c.cast = std::string::from_str("INTEGER");
+    c
+}
+
+fn append_argument(mut c: Clause, in argument: Clause, in against: Str, in name: Str) {
+    if is_literal(argument) {
+        append_literal(c, argument, against, name);
+    } else {
+        append(c, argument);
+    }
+}
+
+/// `name(a)` — `func.count(col)`, `func.sum(col)`, `func.lower(col)`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::call1("sum", sql::clause::col(users, "age"));
+/// ```
+pub fn call1(in name: Str, in a: Clause) -> Clause {
+    var c = blank();
+    std::string::append(c.text, name);
+    std::string::push_byte(c.text, 40);
+    append_argument(c, a, "", name);
+    std::string::push_byte(c.text, 41);
+    c.table = copy(a.table);
+    c.base = std::string::from_str(name);
+    c.anon = std::string::from_str(name);
+    if name == "count" {
+        c.cast = std::string::from_str("INTEGER");
+    } else {
+        c.cast = copy(a.cast);
+    }
+    c
+}
+
+/// `name(a, b)` — `func.coalesce(expr, fallback)`. A literal `b` takes
+/// the type of `a`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::call2("coalesce", total, sql::clause::int(0));
+/// ```
+pub fn call2(in name: Str, in a: Clause, in b: Clause) -> Clause {
+    var c = blank();
+    std::string::append(c.text, name);
+    std::string::push_byte(c.text, 40);
+    append_argument(c, a, "", name);
+    std::string::append(c.text, ", ");
+    append_argument(c, b, std::string::as_str(a.cast), name);
+    std::string::push_byte(c.text, 41);
+    c.table = copy(a.table);
+    c.base = std::string::from_str(name);
+    c.anon = std::string::from_str(name);
+    c.cast = copy(a.cast);
+    c
+}
+
+/// Give a clause a label for the column list: `expr AS name`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::label(sql::clause::count_star(), "n");
+/// ```
+pub fn label(in inner: Clause, in name: Str) -> Clause {
+    var c = blank();
+    append(c, inner);
+    c.prec = inner.prec;
+    c.cast = copy(inner.cast);
+    c.base = copy(inner.base);
+    c.table = copy(inner.table);
+    c.label = std::string::from_str(name);
+    c
+}
+
+/// The clause as one entry of a SELECT column list: with its label, or
+/// with the anonymous label SQLAlchemy would allocate, or bare for a
+/// plain column.
+///
+/// # Example
+/// ```tuo
+/// let entry = sql::clause::as_column(sql::clause::count_star()); // count(*) AS count_1
+/// ```
+pub fn as_column(in inner: Clause) -> Clause {
+    var c = blank();
+    c.table = copy(inner.table);
+    c.cast = copy(inner.cast);
+    if std::string::len(inner.label) > 0 {
+        append(c, inner);
+        std::string::append(c.text, " AS ");
+        std::string::append(c.text, std::string::as_str(inner.label));
+    } else if std::string::len(inner.anon) > 0 {
+        // The label's number is allocated before the numbers of the
+        // parameters inside the expression, so the directive goes first.
+        std::string::push_byte(c.text, mark_label_open());
+        std::string::append(c.text, std::string::as_str(inner.anon));
+        std::string::push_byte(c.text, mark_label_close());
+        append(c, inner);
+        std::string::append(c.text, " AS ");
+        std::string::push_byte(c.text, mark_label_print());
+    } else {
+        append(c, inner);
+    }
+    c
+}
+
+fn suffixed(in inner: Clause, in suffix: Str) -> Clause {
+    var c = blank();
+    append(c, inner);
+    std::string::append(c.text, suffix);
+    c.table = copy(inner.table);
+    c
+}
+
+/// `expr ASC`, for ORDER BY.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::asc(sql::clause::col(users, "name"));
+/// ```
+pub fn asc(in inner: Clause) -> Clause {
+    suffixed(inner, " ASC")
+}
+
+/// `expr DESC`, for ORDER BY.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::desc(sql::clause::col(users, "id"));
+/// ```
+pub fn desc(in inner: Clause) -> Clause {
+    suffixed(inner, " DESC")
+}
+
+/// `expr NULLS LAST`, after `asc` or `desc`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::nulls_last(sql::clause::desc(score));
+/// ```
+pub fn nulls_last(in inner: Clause) -> Clause {
+    suffixed(inner, " NULLS LAST")
+}
+
+/// `expr NULLS FIRST`, after `asc` or `desc`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::clause::nulls_first(sql::clause::asc(score));
+/// ```
+pub fn nulls_first(in inner: Clause) -> Clause {
+    suffixed(inner, " NULLS FIRST")
+}
+
+// One counter per anonymous-name base, as parallel arrays.
+fn next_number(mut names: Array[String], mut counts: Array[Int], in base: Str) -> Int {
+    var i = 0;
+    while i < std::array::len(names) {
+        if std::string::as_str(std::array::get(names, i)) == base {
+            let n = std::array::get(counts, i) + 1;
+            std::array::set(counts, i, n);
+            return n;
+        }
+        i = i + 1;
+    }
+    std::array::push(names, std::string::from_str(base));
+    std::array::push(counts, 1);
+    1
+}
+
+/// Number the parameters and resolve the anonymous labels: the statement
+/// as it goes to PostgreSQL.
+///
+/// # Example
+/// ```tuo
+/// let ready = sql::clause::render(c);
+/// ```
+pub fn render(in c: Clause) -> Compiled {
+    let total = std::array::len(c.values);
+    var early = 0;
+    var i = 0;
+    while i < total {
+        if std::array::get(c.late, i) == 0 {
+            early = early + 1;
+        }
+        i = i + 1;
+    }
+
+    var out = std::string::empty();
+    var names = std::array::empty();
+    var counts = std::array::empty();
+    var pending = std::string::empty();
+    var seen = 0;
+    var seen_early = 0;
+    var seen_late = 0;
+    let n = std::string::len(c.text);
+    var at = 0;
+    while at < n {
+        let b = std::string::byte_at(c.text, at);
+        if b == mark_param() || b == mark_late() {
+            var number = 0;
+            if std::array::get(c.late, seen) == 0 {
+                seen_early = seen_early + 1;
+                number = seen_early;
+            } else {
+                seen_late = seen_late + 1;
+                number = early + seen_late;
+            }
+            let base = std::array::get(c.bases, seen);
+            if std::string::len(base) > 0 {
+                let _ = next_number(names, counts, std::string::as_str(base));
+            }
+            std::string::push_byte(out, 36);
+            std::str::push_int(out, number);
+            let cast = std::array::get(c.casts, seen);
+            if std::string::len(cast) > 0 {
+                std::string::append(out, "::");
+                std::string::append(out, std::string::as_str(cast));
+            }
+            seen = seen + 1;
+            at = at + 1;
+        } else if b == mark_label_open() {
+            var base = std::string::empty();
+            at = at + 1;
+            while at < n && std::string::byte_at(c.text, at) != mark_label_close() {
+                std::string::push_byte(base, std::string::byte_at(c.text, at));
+                at = at + 1;
+            }
+            at = at + 1;
+            let number = next_number(names, counts, std::string::as_str(base));
+            pending = base;
+            std::string::push_byte(pending, 95);
+            std::str::push_int(pending, number);
+        } else if b == mark_label_print() {
+            std::string::append(out, std::string::as_str(pending));
+            at = at + 1;
+        } else {
+            std::string::push_byte(out, b);
+            at = at + 1;
+        }
+    }
+
+    var values = std::array::empty();
+    var nulls = std::array::empty();
+    var pass = 0;
+    while pass < 2 {
+        i = 0;
+        while i < total {
+            if std::array::get(c.late, i) == pass {
+                std::array::push(values, copy(std::array::get(c.values, i)));
+                std::array::push(nulls, std::array::get(c.nulls, i));
+            }
+            i = i + 1;
+        }
+        pass = pass + 1;
+    }
+    Compiled { text: out, values: values, nulls: nulls }
+}
+
+/// A statement with no parameters, from literal SQL — for DDL.
+///
+/// # Example
+/// ```tuo
+/// let ready = sql::clause::raw("SELECT 1");
+/// ```
+pub fn raw(in statement: Str) -> Compiled {
+    Compiled { text: std::string::from_str(statement), values: std::array::empty(), nulls: std::array::empty() }
+}
+
+/// The compiled statement's text.
+///
+/// # Example
+/// ```tuo
+/// let t = sql::clause::statement(ready);
+/// ```
+pub fn statement(in ready: Compiled) -> String {
+    copy(ready.text)
+}
+
+/// The compiled parameters packed as the fixture spells them: each value
+/// followed by 0x1F, NULL as the single byte 0x00.
+///
+/// # Example
+/// ```tuo
+/// let p = sql::clause::packed(ready);
+/// ```
+pub fn packed(in ready: Compiled) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::array::len(ready.values) {
+        if std::array::get(ready.nulls, i) == 1 {
+            std::string::push_byte(out, 0);
+        } else {
+            std::string::append(out, std::string::as_str(std::array::get(ready.values, i)));
+        }
+        std::string::push_byte(out, 31);
+        i = i + 1;
+    }
+    out
+}
+
+fn people() -> sql::table::Table {
+    var t = sql::table::named("people");
+    sql::table::integer(t, "id");
+    sql::table::primary_key(t);
+    sql::table::string(t, "name");
+    sql::table::boolean(t, "active");
+    sql::table::bigint(t, "wealth");
+    sql::table::float(t, "score");
+    t
+}
+
+fn shows(in c: Clause, in expected: Str) -> Bool {
+    std::string::as_str(statement(render(c))) == expected
+}
+
+fn sends(in c: Clause, in expected: Str) -> Bool {
+    std::string::as_str(packed(render(c))) == expected
+}
+
+fn id() -> Clause {
+    col(people(), "id")
+}
+
+fn name() -> Clause {
+    col(people(), "name")
+}
+
+fn one_two() -> Array[Int] {
+    var xs = std::array::empty();
+    std::array::push(xs, 1);
+    std::array::push(xs, 2);
+    xs
+}
+
+spec eq {
+    then shows(eq(id(), int(7)), "people.id = $1::INTEGER");
+    then sends(eq(id(), int(7)), "7\u{1f}");
+    then shows(eq(name(), text("x")), "people.name = $1::VARCHAR");
+    then shows(eq(name(), null()), "people.name IS NULL");
+    then shows(ne(name(), null()), "people.name IS NOT NULL");
+    then shows(eq(col(people(), "active"), boolean(true)), "people.active = true");
+    then shows(ge(col(people(), "wealth"), int(5)), "people.wealth >= $1::BIGINT");
+    then shows(gt(col(people(), "score"), int(1)), "people.score > $1::INTEGER");
+    then shows(gt(col(people(), "score"), number("1.5")), "people.score > $1::FLOAT");
+    then shows(gt(id(), col(people(), "wealth")), "people.id > people.wealth");
+}
+
+spec not_ {
+    then shows(not_(eq(id(), int(7))), "people.id != $1::INTEGER");
+    then shows(not_(lt(id(), int(7))), "people.id >= $1::INTEGER");
+    then shows(not_(not_(lt(id(), int(7)))), "people.id < $1::INTEGER");
+    then shows(not_(col(people(), "active")), "NOT people.active");
+    then shows(not_(not_(col(people(), "active"))), "people.active");
+    then shows(not_(like(name(), "A%")), "people.name NOT LIKE $1::VARCHAR");
+    then shows(not_(is_null(name())), "people.name IS NOT NULL");
+    then shows(not_(between(id(), int(1), int(2))), "people.id NOT BETWEEN $1::INTEGER AND $2::INTEGER");
+    then shows(not_(and_(eq(id(), int(1)), eq(id(), int(2)))), "NOT (people.id = $1::INTEGER AND people.id = $2::INTEGER)");
+}
+
+spec and_ {
+    then shows(and_(blank(), eq(id(), int(1))), "people.id = $1::INTEGER");
+    then shows(and_(eq(id(), int(1)), or_(eq(id(), int(2)), eq(id(), int(3)))), "people.id = $1::INTEGER AND (people.id = $2::INTEGER OR people.id = $3::INTEGER)");
+    then shows(or_(and_(eq(id(), int(1)), eq(id(), int(2))), is_null(name())), "people.id = $1::INTEGER AND people.id = $2::INTEGER OR people.name IS NULL");
+    then shows(and_(and_(eq(id(), int(1)), eq(id(), int(2))), eq(id(), int(3))), "people.id = $1::INTEGER AND people.id = $2::INTEGER AND people.id = $3::INTEGER");
+    then shows(and_(not_(col(people(), "active")), gt(id(), int(1))), "NOT people.active AND people.id > $1::INTEGER");
+}
+
+spec in_ints {
+    then shows(in_ints(id(), one_two()), "people.id IN ($1::INTEGER, $2::INTEGER)");
+    then shows(not_in_ints(id(), one_two()), "(people.id NOT IN ($1::INTEGER, $2::INTEGER))");
+    then shows(not_(not_in_ints(id(), one_two())), "people.id IN ($1::INTEGER, $2::INTEGER)");
+    then shows(in_ints(id(), std::array::empty()), "people.id IN (NULL) AND (1 != 1)");
+    then shows(not_in_ints(id(), std::array::empty()), "(people.id NOT IN (NULL) OR (1 = 1))");
+    then shows(and_(in_ints(id(), one_two()), gt(id(), int(9))), "people.id IN ($2::INTEGER, $3::INTEGER) AND people.id > $1::INTEGER");
+    then sends(and_(in_ints(id(), one_two()), gt(id(), int(9))), "9\u{1f}1\u{1f}2\u{1f}");
+}
+
+spec as_column {
+    then shows(as_column(count_star()), "count(*) AS count_1");
+    then shows(as_column(label(count_star(), "n")), "count(*) AS n");
+    then shows(as_column(id()), "people.id");
+    then shows(as_column(call2("coalesce", call1("sum", id()), int(0))), "coalesce(sum(people.id), $1::INTEGER) AS coalesce_1");
+    then shows(as_column(is_not_null(name())), "people.name IS NOT NULL AS anon_1");
+}
+
+spec plus {
+    then shows(gt(plus(id(), int(1)), int(5)), "people.id + $1::INTEGER > $2::INTEGER");
+    then shows(times(plus(id(), int(1)), int(5)), "(people.id + $1::INTEGER) * $2::INTEGER");
+    then shows(minus(id(), minus(id(), int(5))), "people.id - (people.id - $1::INTEGER)");
+}
+
+spec as_value {
+    then shows(as_value(int(12), "NUMERIC(10, 2)", "amount"), "$1::NUMERIC(10, 2)");
+    then shows(as_value(boolean(false), "BOOLEAN", "active"), "$1::BOOLEAN");
+    then sends(as_value(null(), "INTEGER", "age"), "\u{0}\u{1f}");
+    then shows(as_value(call0("now"), "TIMESTAMP WITH TIME ZONE", "at"), "now()");
+    then shows(as_value(plus(id(), int(1)), "INTEGER", "id"), "(people.id + $1::INTEGER)");
+}

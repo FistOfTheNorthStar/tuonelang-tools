@@ -1,0 +1,755 @@
+// sql::demo — every captured statement, rebuilt with the tuonelang builder.
+//
+// `examples/sql_oracle.py` holds 117 statements written with SQLAlchemy
+// and Alembic — the constructs the backend's services use — and records
+// what each compiles to. `build` writes the same statements with
+// `sql::clause`, `sql::select`, `sql::write`, `sql::table`, and
+// `sql::migrate`, case by case under the same name, and the spec at the
+// bottom holds the two to byte equality: statement text and positional
+// parameters both.
+//
+// It doubles as the phrase book: find the SQLAlchemy spelling in the
+// oracle script, and the tuonelang spelling is the branch of the same
+// name here.
+
+module sql::demo;
+
+/// The `users` table of the oracle.
+///
+/// # Example
+/// ```tuo
+/// let users = sql::demo::users();
+/// ```
+pub fn users() -> sql::table::Table {
+    var t = sql::table::named("users");
+    sql::table::integer(t, "id");
+    sql::table::primary_key(t);
+    sql::table::varchar(t, "email", 255);
+    sql::table::not_null(t);
+    sql::table::unique(t);
+    sql::table::string(t, "name");
+    sql::table::integer(t, "age");
+    sql::table::boolean(t, "active");
+    sql::table::not_null(t);
+    sql::table::server_default(t, "true");
+    sql::table::float(t, "score");
+    sql::table::bigint(t, "balance");
+    sql::table::text(t, "bio");
+    sql::table::timestamptz(t, "created_at");
+    sql::table::server_default(t, "now()");
+    t
+}
+
+/// The `jobs` table of the oracle.
+///
+/// # Example
+/// ```tuo
+/// let jobs = sql::demo::jobs();
+/// ```
+pub fn jobs() -> sql::table::Table {
+    var t = sql::table::named("jobs");
+    sql::table::integer(t, "id");
+    sql::table::primary_key(t);
+    sql::table::integer(t, "owner_id");
+    sql::table::references(t, "users", "id");
+    sql::table::not_null(t);
+    sql::table::varchar(t, "title", 100);
+    sql::table::not_null(t);
+    sql::table::string(t, "city");
+    sql::table::integer(t, "salary");
+    sql::table::boolean(t, "published");
+    sql::table::timestamptz(t, "posted_at");
+    t
+}
+
+/// The `events` table of the oracle: the less common column types.
+///
+/// # Example
+/// ```tuo
+/// let events = sql::demo::events();
+/// ```
+pub fn events() -> sql::table::Table {
+    var t = sql::table::named("events");
+    sql::table::uuid(t, "id");
+    sql::table::primary_key(t);
+    sql::table::date(t, "day");
+    sql::table::not_null(t);
+    sql::table::timestamp(t, "at");
+    sql::table::numeric(t, "amount", 10, 2);
+    sql::table::json(t, "payload");
+    t
+}
+
+/// The `profiles` table of the oracle: constraint ordering.
+///
+/// # Example
+/// ```tuo
+/// let profiles = sql::demo::profiles();
+/// ```
+pub fn profiles() -> sql::table::Table {
+    var t = sql::table::named("profiles");
+    sql::table::bigint(t, "id");
+    sql::table::primary_key(t);
+    sql::table::varchar(t, "handle", 40);
+    sql::table::unique(t);
+    sql::table::integer(t, "user_id");
+    sql::table::references(t, "users", "id");
+    sql::table::not_null(t);
+    sql::table::unique(t);
+    sql::table::integer(t, "job_id");
+    sql::table::references(t, "jobs", "id");
+    sql::table::integer(t, "visits");
+    sql::table::not_null(t);
+    sql::table::server_default(t, "0");
+    t
+}
+
+/// The oracle's three Alembic revisions.
+///
+/// # Example
+/// ```tuo
+/// let r = sql::demo::revisions();
+/// ```
+pub fn revisions() -> sql::migrate::Revisions {
+    var r = sql::migrate::none();
+    sql::migrate::revision(r, "1a2b3c4d5e6f", "");
+    sql::migrate::upgrade_op(r, "CREATE TABLE notes (id SERIAL NOT NULL, PRIMARY KEY (id))");
+    sql::migrate::downgrade_op(r, "DROP TABLE notes");
+    sql::migrate::revision(r, "2b3c4d5e6f70", "1a2b3c4d5e6f");
+    sql::migrate::upgrade_op(r, "ALTER TABLE notes ADD COLUMN body VARCHAR");
+    sql::migrate::downgrade_op(r, "ALTER TABLE notes DROP COLUMN body");
+    sql::migrate::revision(r, "3c4d5e6f7081", "2b3c4d5e6f70");
+    sql::migrate::upgrade_op(r, "CREATE INDEX ix_notes_body ON notes (body)");
+    sql::migrate::downgrade_op(r, "DROP INDEX ix_notes_body");
+    r
+}
+
+fn u(in name: Str) -> sql::clause::Clause {
+    sql::clause::col(users(), name)
+}
+
+fn j(in name: Str) -> sql::clause::Clause {
+    sql::clause::col(jobs(), name)
+}
+
+fn e(in name: Str) -> sql::clause::Clause {
+    sql::clause::col(events(), name)
+}
+
+fn int(take v: Int) -> sql::clause::Clause {
+    sql::clause::int(v)
+}
+
+fn moment() -> sql::clause::Clause {
+    sql::clause::text("2026-09-21T12:30:00+00:00")
+}
+
+// `select(users.c.id).where(condition)` — the shape most cases share.
+fn ids_where(in condition: sql::clause::Clause) -> sql::clause::Compiled {
+    var q = sql::select::new();
+    sql::select::column(q, u("id"));
+    sql::select::filter(q, condition);
+    sql::select::render(q)
+}
+
+fn ids() -> sql::select::Select {
+    var q = sql::select::new();
+    sql::select::column(q, u("id"));
+    q
+}
+
+fn ints3(take a: Int, take b: Int, take c: Int) -> Array[Int] {
+    var xs = std::array::empty();
+    std::array::push(xs, a);
+    if b != 0 {
+        std::array::push(xs, b);
+    }
+    if c != 0 {
+        std::array::push(xs, c);
+    }
+    xs
+}
+
+fn texts2(in a: Str, in b: Str) -> Array[String] {
+    var xs = std::array::empty();
+    std::array::push(xs, std::string::from_str(a));
+    std::array::push(xs, std::string::from_str(b));
+    xs
+}
+
+fn owns() -> sql::clause::Clause {
+    sql::clause::eq(j("owner_id"), u("id"))
+}
+
+fn age_window() -> sql::clause::Clause {
+    sql::clause::and_(sql::clause::gt(u("age"), int(1)), sql::clause::lt(u("age"), int(5)))
+}
+
+fn comparisons(in name: Str) -> sql::clause::Compiled {
+    if name == "compare_ne" {
+        return ids_where(sql::clause::ne(u("age"), int(30)));
+    }
+    if name == "compare_lt" {
+        return ids_where(sql::clause::lt(u("age"), int(30)));
+    }
+    if name == "compare_le" {
+        return ids_where(sql::clause::le(u("age"), int(30)));
+    }
+    if name == "compare_gt" {
+        return ids_where(sql::clause::gt(u("score"), sql::clause::number("1.5")));
+    }
+    if name == "compare_ge" {
+        return ids_where(sql::clause::ge(u("balance"), int(5000000000)));
+    }
+    if name == "compare_bool" {
+        return ids_where(sql::clause::eq(u("active"), sql::clause::boolean(true)));
+    }
+    if name == "compare_text" {
+        return ids_where(sql::clause::eq(u("bio"), sql::clause::text("x")));
+    }
+    if name == "compare_columns" {
+        return ids_where(sql::clause::gt(u("age"), u("balance")));
+    }
+    if name == "is_null" {
+        return ids_where(sql::clause::is_null(u("name")));
+    }
+    if name == "is_not_null" {
+        return ids_where(sql::clause::is_not_null(u("name")));
+    }
+    if name == "is_true" {
+        return ids_where(sql::clause::is_true(u("active")));
+    }
+    if name == "is_false" {
+        return ids_where(sql::clause::is_false(u("active")));
+    }
+    if name == "eq_none" {
+        return ids_where(sql::clause::eq(u("name"), sql::clause::null()));
+    }
+    if name == "ne_none" {
+        return ids_where(sql::clause::ne(u("name"), sql::clause::null()));
+    }
+    if name == "like" {
+        return ids_where(sql::clause::like(u("name"), "A%"));
+    }
+    if name == "ilike" {
+        return ids_where(sql::clause::ilike(u("name"), "%x%"));
+    }
+    if name == "in_ints" {
+        return ids_where(sql::clause::in_ints(u("id"), ints3(1, 2, 3)));
+    }
+    if name == "in_texts" {
+        return ids_where(sql::clause::in_texts(u("email"), texts2("a", "b")));
+    }
+    if name == "in_empty" {
+        return ids_where(sql::clause::in_ints(u("id"), std::array::empty()));
+    }
+    if name == "not_in" {
+        return ids_where(sql::clause::not_in_ints(u("id"), ints3(4, 5, 0)));
+    }
+    if name == "between" {
+        return ids_where(sql::clause::between(u("age"), int(18), int(65)));
+    }
+    if name == "int_against_float" {
+        return ids_where(sql::clause::gt(u("score"), int(1)));
+    }
+    if name == "arithmetic" {
+        return ids_where(sql::clause::gt(sql::clause::plus(u("age"), int(1)), int(5)));
+    }
+    if name == "lower_compare" {
+        return ids_where(sql::clause::eq(sql::clause::call1("lower", u("email")), sql::clause::text("a@b.c")));
+    }
+    sql::clause::raw("")
+}
+
+fn junctions(in name: Str) -> sql::clause::Compiled {
+    if name == "and_two" {
+        return ids_where(sql::clause::and_(sql::clause::ge(u("age"), int(18)), sql::clause::eq(u("active"), sql::clause::boolean(true))));
+    }
+    if name == "where_twice" {
+        var q = ids();
+        sql::select::filter(q, sql::clause::ge(u("age"), int(18)));
+        sql::select::filter(q, sql::clause::eq(u("name"), sql::clause::text("n")));
+        return sql::select::render(q);
+    }
+    if name == "or_two" {
+        return ids_where(sql::clause::or_(sql::clause::lt(u("age"), int(18)), sql::clause::gt(u("age"), int(65))));
+    }
+    if name == "or_inside_and" {
+        return ids_where(sql::clause::and_(sql::clause::is_true(u("active")), sql::clause::or_(sql::clause::ilike(u("name"), "%a%"), sql::clause::ilike(u("bio"), "%a%"))));
+    }
+    if name == "and_inside_or" {
+        return ids_where(sql::clause::or_(age_window(), sql::clause::is_null(u("name"))));
+    }
+    if name == "and_inside_and" {
+        return ids_where(sql::clause::and_(age_window(), sql::clause::eq(u("id"), int(2))));
+    }
+    if name == "and_of_one" {
+        return ids_where(sql::clause::and_(sql::clause::blank(), sql::clause::gt(u("age"), int(1))));
+    }
+    if name == "not_column" {
+        return ids_where(sql::clause::not_(u("active")));
+    }
+    if name == "not_eq" {
+        return ids_where(sql::clause::not_(sql::clause::eq(u("age"), int(3))));
+    }
+    if name == "not_lt" {
+        return ids_where(sql::clause::not_(sql::clause::lt(u("age"), int(3))));
+    }
+    if name == "not_like" {
+        return ids_where(sql::clause::not_(sql::clause::like(u("name"), "A%")));
+    }
+    if name == "not_ilike" {
+        return ids_where(sql::clause::not_(sql::clause::ilike(u("name"), "A%")));
+    }
+    if name == "not_is_null" {
+        return ids_where(sql::clause::not_(sql::clause::is_null(u("name"))));
+    }
+    if name == "not_between" {
+        return ids_where(sql::clause::not_(sql::clause::between(u("age"), int(1), int(2))));
+    }
+    if name == "not_in_list" {
+        return ids_where(sql::clause::not_(sql::clause::in_ints(u("id"), ints3(1, 2, 0))));
+    }
+    if name == "not_and" {
+        return ids_where(sql::clause::not_(age_window()));
+    }
+    if name == "not_or" {
+        return ids_where(sql::clause::not_(sql::clause::or_(sql::clause::gt(u("age"), int(1)), sql::clause::lt(u("age"), int(5)))));
+    }
+    if name == "not_inside_and" {
+        return ids_where(sql::clause::and_(sql::clause::not_(u("active")), sql::clause::gt(u("age"), int(1))));
+    }
+    if name == "in_empty_inside_or" {
+        return ids_where(sql::clause::or_(sql::clause::in_ints(u("id"), std::array::empty()), sql::clause::gt(u("age"), int(1))));
+    }
+    if name == "not_in_empty" {
+        return ids_where(sql::clause::not_in_ints(u("id"), std::array::empty()));
+    }
+    if name == "not_not_column" {
+        return ids_where(sql::clause::not_(sql::clause::not_(u("active"))));
+    }
+    if name == "not_not_in" {
+        return ids_where(sql::clause::not_(sql::clause::not_in_ints(u("id"), ints3(1, 0, 0))));
+    }
+    if name == "not_in_inside_and" {
+        return ids_where(sql::clause::and_(sql::clause::not_in_ints(u("id"), ints3(1, 0, 0)), sql::clause::gt(u("age"), int(1))));
+    }
+    sql::clause::raw("")
+}
+
+fn coalesced(in total: sql::clause::Clause, in fallback: sql::clause::Clause) -> sql::clause::Clause {
+    sql::clause::call2("coalesce", total, fallback)
+}
+
+fn functions(in name: Str) -> sql::clause::Compiled {
+    var q = sql::select::new();
+    if name == "count_star" {
+        sql::select::column(q, sql::clause::count_star());
+        sql::select::from(q, users());
+    } else if name == "count_column" {
+        sql::select::column(q, sql::clause::call1("count", u("id")));
+        sql::select::filter(q, sql::clause::is_true(u("active")));
+    } else if name == "count_labelled" {
+        sql::select::column(q, sql::clause::label(sql::clause::call1("count", u("id")), "n"));
+        sql::select::filter(q, sql::clause::gt(u("age"), int(1)));
+    } else if name == "sum_coalesce" {
+        sql::select::column(q, coalesced(sql::clause::call1("sum", u("age")), int(0)));
+        sql::select::filter(q, sql::clause::is_true(u("active")));
+    } else if name == "two_coalesce" {
+        sql::select::column(q, coalesced(sql::clause::call1("sum", u("age")), int(0)));
+        sql::select::column(q, coalesced(sql::clause::call1("max", u("score")), sql::clause::number("1.5")));
+    } else if name == "coalesce_labelled" {
+        sql::select::column(q, sql::clause::label(coalesced(sql::clause::call1("sum", j("salary")), int(0)), "total"));
+        sql::select::filter(q, sql::clause::eq(j("owner_id"), int(4)));
+    } else if name == "min_max_avg" {
+        sql::select::column(q, sql::clause::call1("min", u("age")));
+        sql::select::column(q, sql::clause::call1("max", u("age")));
+        sql::select::column(q, sql::clause::call1("avg", u("score")));
+    } else if name == "column_labelled" {
+        sql::select::column(q, sql::clause::label(u("name"), "who"));
+        sql::select::column(q, u("id"));
+    } else if name == "condition_labelled" {
+        sql::select::column(q, sql::clause::label(sql::clause::is_not_null(u("name")), "named"));
+    } else if name == "arithmetic_minus" {
+        sql::select::column(q, u("id"));
+        sql::select::column(q, sql::clause::label(sql::clause::minus(u("balance"), u("age")), "rest"));
+        sql::select::filter(q, sql::clause::lt(sql::clause::times(u("age"), int(2)), int(9)));
+    } else {
+        return sql::clause::raw("");
+    }
+    sql::select::render(q)
+}
+
+fn shapes(in name: Str) -> sql::clause::Compiled {
+    var q = ids();
+    if name == "order_asc" {
+        sql::select::order_by(q, u("name"));
+    } else if name == "order_asc_explicit" {
+        sql::select::order_by(q, sql::clause::asc(u("name")));
+    } else if name == "order_desc" {
+        sql::select::order_by(q, sql::clause::desc(u("created_at")));
+    } else if name == "order_two" {
+        sql::select::order_by(q, sql::clause::asc(u("name")));
+        sql::select::order_by(q, sql::clause::desc(u("id")));
+    } else if name == "order_nulls_last" {
+        sql::select::order_by(q, sql::clause::nulls_last(sql::clause::desc(u("score"))));
+    } else if name == "limit" {
+        sql::select::limit(q, 10);
+    } else if name == "limit_offset" {
+        sql::select::filter(q, sql::clause::gt(u("age"), int(1)));
+        sql::select::order_by(q, sql::clause::desc(u("id")));
+        sql::select::limit(q, 10);
+        sql::select::offset(q, 20);
+    } else if name == "offset_only" {
+        sql::select::offset(q, 20);
+    } else if name == "for_update" {
+        sql::select::filter(q, sql::clause::eq(u("id"), int(1)));
+        sql::select::for_update(q);
+    } else if name == "join_and" {
+        sql::select::join(q, jobs(), sql::clause::and_(owns(), sql::clause::is_true(j("published"))));
+    } else if name == "exists" {
+        sql::select::filter(q, sql::select::exists(jobs(), owns()));
+    } else if name == "not_exists" {
+        sql::select::filter(q, sql::clause::not_(sql::select::exists(jobs(), owns())));
+    } else if name == "in_subquery" {
+        var owners = sql::select::new();
+        sql::select::column(owners, j("owner_id"));
+        sql::select::filter(owners, sql::clause::gt(j("salary"), int(100)));
+        sql::select::filter(q, sql::clause::in_select(u("id"), sql::select::as_clause(owners)));
+    } else {
+        return sql::clause::raw("");
+    }
+    sql::select::render(q)
+}
+
+fn selects(in name: Str) -> sql::clause::Compiled {
+    var q = sql::select::new();
+    if name == "select_all" {
+        sql::select::all_columns(q, users());
+    } else if name == "select_by_email" {
+        sql::select::all_columns(q, users());
+        sql::select::filter(q, sql::clause::eq(u("email"), sql::clause::text("a@b.c")));
+    } else if name == "select_two_columns" {
+        sql::select::column(q, u("id"));
+        sql::select::column(q, u("name"));
+        sql::select::filter(q, sql::clause::eq(u("id"), int(7)));
+    } else if name == "compare_time" {
+        sql::select::column(q, j("id"));
+        sql::select::filter(q, sql::clause::gt(j("posted_at"), moment()));
+    } else if name == "distinct" {
+        sql::select::column(q, u("name"));
+        sql::select::distinct(q);
+    } else if name == "group_by" {
+        sql::select::column(q, j("owner_id"));
+        sql::select::column(q, sql::clause::call1("count", j("id")));
+        sql::select::group_by(q, j("owner_id"));
+    } else if name == "group_having" {
+        sql::select::column(q, j("owner_id"));
+        sql::select::column(q, sql::clause::label(sql::clause::call1("count", j("id")), "n"));
+        sql::select::group_by(q, j("owner_id"));
+        sql::select::having(q, sql::clause::gt(sql::clause::call1("count", j("id")), int(2)));
+        sql::select::order_by(q, sql::clause::desc(sql::clause::call1("count", j("id"))));
+    } else if name == "join" {
+        sql::select::column(q, u("name"));
+        sql::select::column(q, j("title"));
+        sql::select::join(q, jobs(), owns());
+        sql::select::filter(q, sql::clause::is_true(j("published")));
+    } else if name == "join_from" {
+        sql::select::column(q, u("name"));
+        sql::select::column(q, j("title"));
+        sql::select::from(q, users());
+        sql::select::join(q, jobs(), owns());
+    } else if name == "outer_join" {
+        sql::select::column(q, u("name"));
+        sql::select::column(q, sql::clause::label(sql::clause::call1("count", j("id")), "jobs"));
+        sql::select::outer_join(q, jobs(), owns());
+        sql::select::group_by(q, u("name"));
+    } else if name == "exists_select" {
+        sql::select::column(q, sql::select::exists(users(), sql::clause::eq(u("email"), sql::clause::text("x"))));
+    } else if name == "scalar_subquery" {
+        var counted = sql::select::new();
+        sql::select::column(counted, sql::clause::call1("count", j("id")));
+        sql::select::filter(counted, owns());
+        sql::select::column(q, u("name"));
+        sql::select::column(q, sql::clause::label(sql::clause::scalar(sql::select::as_clause(counted)), "jobs"));
+    } else if name == "everything" {
+        sql::select::column(q, u("id"));
+        sql::select::column(q, u("email"));
+        sql::select::filter(q, sql::clause::is_true(u("active")));
+        sql::select::filter(q, sql::clause::or_(sql::clause::ilike(u("name"), "%k%"), sql::clause::ilike(u("email"), "%k%")));
+        sql::select::filter(q, sql::clause::between(u("age"), int(18), int(65)));
+        sql::select::filter(q, sql::clause::in_ints(u("id"), ints3(1, 2, 3)));
+        sql::select::order_by(q, sql::clause::desc(u("created_at")));
+        sql::select::order_by(q, u("id"));
+        sql::select::limit(q, 25);
+        sql::select::offset(q, 50);
+    } else if name == "other_kinds" {
+        sql::select::column(q, e("id"));
+        sql::select::filter(q, sql::clause::eq(e("id"), sql::clause::text("6f1b0c1e-0d5a-4c0e-9a57-1f2e3d4c5b6a")));
+        sql::select::filter(q, sql::clause::ge(e("day"), sql::clause::text("2026-09-21")));
+        sql::select::filter(q, sql::clause::lt(e("at"), sql::clause::text("2026-09-21T12:30:00")));
+        sql::select::filter(q, sql::clause::gt(e("amount"), sql::clause::number("10.50")));
+    } else if name == "int_against_numeric" {
+        sql::select::column(q, e("id"));
+        sql::select::filter(q, sql::clause::gt(e("amount"), int(10)));
+    } else {
+        return sql::clause::raw("");
+    }
+    sql::select::render(q)
+}
+
+fn inserts(in name: Str) -> sql::clause::Compiled {
+    var q = sql::write::insert(users());
+    if name == "insert_with_key" {
+        sql::write::value(q, "id", int(5));
+        sql::write::value(q, "email", sql::clause::text("k"));
+    } else if name == "insert_values" {
+        sql::write::value(q, "email", sql::clause::text("a@b.c"));
+        sql::write::value(q, "name", sql::clause::text("A"));
+    } else if name == "insert_returning" {
+        sql::write::value(q, "email", sql::clause::text("a@b.c"));
+        sql::write::value(q, "name", sql::clause::text("A"));
+        sql::write::value(q, "age", int(33));
+        sql::write::returning(q, "id");
+    } else if name == "insert_null" {
+        sql::write::value(q, "email", sql::clause::text("a@b.c"));
+        sql::write::value(q, "name", sql::clause::null());
+    } else if name == "insert_every_kind" {
+        sql::write::value(q, "email", sql::clause::text("e"));
+        sql::write::value(q, "name", sql::clause::text("n"));
+        sql::write::value(q, "age", int(1));
+        sql::write::value(q, "active", sql::clause::boolean(false));
+        sql::write::value(q, "score", sql::clause::number("2.5"));
+        sql::write::value(q, "balance", int(5000000000));
+        sql::write::value(q, "bio", sql::clause::text("b"));
+        sql::write::value(q, "created_at", moment());
+        sql::write::returning(q, "id");
+        sql::write::returning(q, "created_at");
+    } else if name == "insert_conflict_nothing" {
+        sql::write::value(q, "email", sql::clause::text("a"));
+        sql::write::value(q, "name", sql::clause::text("b"));
+        sql::write::on_conflict_do_nothing(q, "email");
+    } else if name == "insert_conflict_update" {
+        sql::write::value(q, "email", sql::clause::text("a"));
+        sql::write::value(q, "name", sql::clause::text("b"));
+        sql::write::on_conflict_do_update(q, "email", "name", sql::clause::text("b"));
+        sql::write::returning(q, "id");
+    } else {
+        return sql::clause::raw("");
+    }
+    sql::write::render_insert(q)
+}
+
+fn other_inserts(in name: Str) -> sql::clause::Compiled {
+    if name == "insert_now" {
+        var q = sql::write::insert(jobs());
+        sql::write::value(q, "owner_id", int(1));
+        sql::write::value(q, "title", sql::clause::text("t"));
+        sql::write::value(q, "posted_at", sql::clause::call0("now"));
+        return sql::write::render_insert(q);
+    }
+    if name == "insert_other_kinds" {
+        var q = sql::write::insert(events());
+        sql::write::value(q, "id", sql::clause::text("6f1b0c1e-0d5a-4c0e-9a57-1f2e3d4c5b6a"));
+        sql::write::value(q, "day", sql::clause::text("2026-09-21"));
+        sql::write::value(q, "amount", int(12));
+        sql::write::value(q, "payload", sql::clause::null());
+        return sql::write::render_insert(q);
+    }
+    sql::clause::raw("")
+}
+
+fn user_updates(in name: Str) -> sql::clause::Compiled {
+    var q = sql::write::update(users());
+    if name == "update_values" {
+        sql::write::set(q, "name", sql::clause::text("z"));
+        sql::write::update_filter(q, sql::clause::eq(u("id"), int(3)));
+    } else if name == "update_null" {
+        sql::write::set(q, "name", sql::clause::text("z"));
+        sql::write::set(q, "age", sql::clause::null());
+        sql::write::update_filter(q, sql::clause::eq(u("id"), int(3)));
+    } else if name == "update_returning" {
+        sql::write::set(q, "active", sql::clause::boolean(false));
+        sql::write::update_filter(q, sql::clause::eq(u("id"), int(3)));
+        sql::write::update_returning(q, "id");
+        sql::write::update_returning(q, "active");
+    } else if name == "update_increment" {
+        sql::write::set(q, "age", sql::clause::plus(u("age"), int(1)));
+        sql::write::update_filter(q, sql::clause::eq(u("id"), int(3)));
+    } else if name == "update_all" {
+        sql::write::set(q, "active", sql::clause::boolean(true));
+    } else {
+        return sql::clause::raw("");
+    }
+    sql::write::render_update(q)
+}
+
+fn job_writes(in name: Str) -> sql::clause::Compiled {
+    if name == "update_now" {
+        var q = sql::write::update(jobs());
+        sql::write::set(q, "published", sql::clause::boolean(true));
+        sql::write::set(q, "posted_at", sql::clause::call0("now"));
+        sql::write::update_filter(q, sql::clause::eq(j("owner_id"), int(3)));
+        sql::write::update_filter(q, sql::clause::is_false(j("published")));
+        return sql::write::render_update(q);
+    }
+    if name == "update_coalesce" {
+        var q = sql::write::update(jobs());
+        sql::write::set(q, "posted_at", coalesced(j("posted_at"), moment()));
+        sql::write::update_filter(q, sql::clause::eq(j("id"), int(1)));
+        return sql::write::render_update(q);
+    }
+    if name == "delete_where" {
+        var q = sql::write::delete(users());
+        sql::write::delete_filter(q, sql::clause::eq(u("id"), int(3)));
+        return sql::write::render_delete(q);
+    }
+    var q = sql::write::delete(jobs());
+    if name == "delete_and" {
+        sql::write::delete_filter(q, sql::clause::eq(j("owner_id"), int(3)));
+        sql::write::delete_filter(q, sql::clause::is_false(j("published")));
+    } else if name == "delete_returning" {
+        sql::write::delete_filter(q, sql::clause::lt(j("salary"), int(10)));
+        sql::write::delete_returning(q, "id");
+    } else if name != "delete_all" {
+        return sql::clause::raw("");
+    }
+    sql::write::render_delete(q)
+}
+
+fn schema(in name: Str) -> String {
+    if name == "create_users" {
+        return sql::table::create(users());
+    }
+    if name == "create_jobs" {
+        return sql::table::create(jobs());
+    }
+    if name == "create_events" {
+        return sql::table::create(events());
+    }
+    if name == "create_profiles" {
+        return sql::table::create(profiles());
+    }
+    if name == "create_index" {
+        return sql::table::create_index(jobs(), "ix_jobs_city", "city", false);
+    }
+    if name == "create_unique_index" {
+        return sql::table::create_index(jobs(), "ix_jobs_owner_title", "owner_id,title", true);
+    }
+    if name == "drop_index" {
+        return sql::table::drop_index("ix_jobs_city");
+    }
+    if name == "drop_jobs" {
+        return sql::table::drop(jobs());
+    }
+    if name == "upgrade_head" {
+        return sql::migrate::script(sql::migrate::upgrade(revisions(), "", std::string::as_str(sql::migrate::head(revisions()))));
+    }
+    if name == "upgrade_partial" {
+        return sql::migrate::script(sql::migrate::upgrade(revisions(), "1a2b3c4d5e6f", "3c4d5e6f7081"));
+    }
+    if name == "downgrade_one" {
+        return sql::migrate::script(sql::migrate::downgrade(revisions(), "3c4d5e6f7081", "2b3c4d5e6f70"));
+    }
+    if name == "downgrade_base" {
+        return sql::migrate::script(sql::migrate::downgrade(revisions(), "3c4d5e6f7081", ""));
+    }
+    std::string::empty()
+}
+
+fn built(in ready: sql::clause::Compiled) -> Bool {
+    std::string::len(sql::clause::statement(ready)) > 0
+}
+
+/// Build the oracle case of this name with the tuonelang builder. An
+/// unknown name yields an empty statement.
+///
+/// # Example
+/// ```tuo
+/// let ready = sql::demo::build("limit_offset");
+/// ```
+pub fn build(in name: Str) -> sql::clause::Compiled {
+    let a = comparisons(name);
+    if built(a) {
+        return a;
+    }
+    let b = junctions(name);
+    if built(b) {
+        return b;
+    }
+    let c = functions(name);
+    if built(c) {
+        return c;
+    }
+    let d = shapes(name);
+    if built(d) {
+        return d;
+    }
+    let f = selects(name);
+    if built(f) {
+        return f;
+    }
+    let g = inserts(name);
+    if built(g) {
+        return g;
+    }
+    let h = other_inserts(name);
+    if built(h) {
+        return h;
+    }
+    let k = user_updates(name);
+    if built(k) {
+        return k;
+    }
+    let m = job_writes(name);
+    if built(m) {
+        return m;
+    }
+    sql::clause::raw(std::string::as_str(schema(name)))
+}
+
+/// Does the builder reproduce fixture case `i` — text and parameters?
+///
+/// # Example
+/// ```tuo
+/// let same = sql::demo::agrees(0);
+/// ```
+pub fn agrees(take i: Int) -> Bool {
+    let ready = build(sql::fixture::name(i));
+    let text_same = std::string::as_str(sql::clause::statement(ready)) == sql::fixture::statement(i);
+    let params_same = std::string::as_str(sql::clause::packed(ready)) == sql::fixture::parameters(i);
+    text_same && params_same
+}
+
+/// The first case in `[from, to)` the builder gets wrong, or -1.
+///
+/// # Example
+/// ```tuo
+/// let bad = sql::demo::first_disagreement(0, sql::fixture::count());
+/// ```
+pub fn first_disagreement(take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to {
+        if !agrees(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+spec "every captured statement is reproduced" {
+    then sql::fixture::count() == 117;
+    then first_disagreement(0, 10) == -1;
+    then first_disagreement(10, 20) == -1;
+    then first_disagreement(20, 30) == -1;
+    then first_disagreement(30, 40) == -1;
+    then first_disagreement(40, 50) == -1;
+    then first_disagreement(50, 60) == -1;
+    then first_disagreement(60, 70) == -1;
+    then first_disagreement(70, 80) == -1;
+    then first_disagreement(80, 90) == -1;
+    then first_disagreement(90, 100) == -1;
+    then first_disagreement(100, 110) == -1;
+    then first_disagreement(110, 117) == -1;
+}
