@@ -1,0 +1,542 @@
+// sql::table — a table as data, and the DDL SQLAlchemy emits for it.
+//
+// SQLAlchemy's `Table` is a runtime object that the query constructs read
+// their names and types from. Here it is a struct of parallel arrays: the
+// column names, the type each is declared with, the cast its bound
+// parameters carry (the asyncpg dialect writes `$1::VARCHAR`, so the
+// server never has to guess a parameter's type), and the constraints.
+//
+// `create`, `drop`, `create_index`, and `drop_index` reproduce
+// `CreateTable` and friends byte for byte — tabs, trailing spaces, and
+// constraint order included — because Alembic autogenerate diffs and
+// migration scripts are compared as text.
+
+module sql::table;
+
+/// A table definition.
+pub struct Table {
+    name: String,
+    columns: Array[String],
+    types: Array[String],
+    casts: Array[String],
+    flags: Array[Int],
+    defaults: Array[String],
+    targets: Array[String],
+}
+
+fn flag_primary() -> Int {
+    1
+}
+
+fn flag_not_null() -> Int {
+    2
+}
+
+fn flag_unique() -> Int {
+    4
+}
+
+/// A table with no columns yet.
+///
+/// # Example
+/// ```tuo
+/// var users = sql::table::named("users");
+/// ```
+pub fn named(in name: Str) -> Table {
+    Table { name: std::string::from_str(name), columns: std::array::empty(), types: std::array::empty(), casts: std::array::empty(), flags: std::array::empty(), defaults: std::array::empty(), targets: std::array::empty() }
+}
+
+/// Add a column with an explicit declared type and parameter cast. The
+/// typed builders below are what callers normally use.
+///
+/// # Example
+/// ```tuo
+/// sql::table::add(t, "tags", "TEXT[]", "TEXT[]");
+/// ```
+pub fn add(mut t: Table, in name: Str, in declared: Str, in cast: Str) {
+    std::array::push(t.columns, std::string::from_str(name));
+    std::array::push(t.types, std::string::from_str(declared));
+    std::array::push(t.casts, std::string::from_str(cast));
+    std::array::push(t.flags, 0);
+    std::array::push(t.defaults, std::string::empty());
+    std::array::push(t.targets, std::string::empty());
+}
+
+/// An `Integer` column.
+///
+/// # Example
+/// ```tuo
+/// sql::table::integer(t, "age");
+/// ```
+pub fn integer(mut t: Table, in name: Str) {
+    add(t, name, "INTEGER", "INTEGER");
+}
+
+/// A `BigInteger` column.
+///
+/// # Example
+/// ```tuo
+/// sql::table::bigint(t, "balance");
+/// ```
+pub fn bigint(mut t: Table, in name: Str) {
+    add(t, name, "BIGINT", "BIGINT");
+}
+
+/// A `String` column with no length.
+///
+/// # Example
+/// ```tuo
+/// sql::table::string(t, "name");
+/// ```
+pub fn string(mut t: Table, in name: Str) {
+    add(t, name, "VARCHAR", "VARCHAR");
+}
+
+/// A `String(size)` column. The cast carries no length, as in SQLAlchemy.
+///
+/// # Example
+/// ```tuo
+/// sql::table::varchar(t, "email", 255);
+/// ```
+pub fn varchar(mut t: Table, in name: Str, take size: Int) {
+    var declared = std::string::from_str("VARCHAR(");
+    std::str::push_int(declared, size);
+    std::string::push_byte(declared, 41);
+    add(t, name, std::string::as_str(declared), "VARCHAR");
+}
+
+/// A `Text` column. Its parameters are cast to VARCHAR, as SQLAlchemy does.
+///
+/// # Example
+/// ```tuo
+/// sql::table::text(t, "bio");
+/// ```
+pub fn text(mut t: Table, in name: Str) {
+    add(t, name, "TEXT", "VARCHAR");
+}
+
+/// A `Boolean` column.
+///
+/// # Example
+/// ```tuo
+/// sql::table::boolean(t, "active");
+/// ```
+pub fn boolean(mut t: Table, in name: Str) {
+    add(t, name, "BOOLEAN", "BOOLEAN");
+}
+
+/// A `Float` column.
+///
+/// # Example
+/// ```tuo
+/// sql::table::float(t, "score");
+/// ```
+pub fn float(mut t: Table, in name: Str) {
+    add(t, name, "FLOAT", "FLOAT");
+}
+
+/// A `Numeric(precision, scale)` column.
+///
+/// # Example
+/// ```tuo
+/// sql::table::numeric(t, "amount", 10, 2);
+/// ```
+pub fn numeric(mut t: Table, in name: Str, take precision: Int, take scale: Int) {
+    var declared = std::string::from_str("NUMERIC(");
+    std::str::push_int(declared, precision);
+    std::string::append(declared, ", ");
+    std::str::push_int(declared, scale);
+    std::string::push_byte(declared, 41);
+    let cast = std::string::from_str(std::string::as_str(declared));
+    add(t, name, std::string::as_str(declared), std::string::as_str(cast));
+}
+
+/// A `DateTime(timezone=True)` column.
+///
+/// # Example
+/// ```tuo
+/// sql::table::timestamptz(t, "created_at");
+/// ```
+pub fn timestamptz(mut t: Table, in name: Str) {
+    add(t, name, "TIMESTAMP WITH TIME ZONE", "TIMESTAMP WITH TIME ZONE");
+}
+
+/// A `DateTime` column with no time zone.
+///
+/// # Example
+/// ```tuo
+/// sql::table::timestamp(t, "at");
+/// ```
+pub fn timestamp(mut t: Table, in name: Str) {
+    add(t, name, "TIMESTAMP WITHOUT TIME ZONE", "TIMESTAMP WITHOUT TIME ZONE");
+}
+
+/// A `Date` column.
+///
+/// # Example
+/// ```tuo
+/// sql::table::date(t, "day");
+/// ```
+pub fn date(mut t: Table, in name: Str) {
+    add(t, name, "DATE", "DATE");
+}
+
+/// A `Uuid` column.
+///
+/// # Example
+/// ```tuo
+/// sql::table::uuid(t, "id");
+/// ```
+pub fn uuid(mut t: Table, in name: Str) {
+    add(t, name, "UUID", "UUID");
+}
+
+/// A `JSON` column.
+///
+/// # Example
+/// ```tuo
+/// sql::table::json(t, "payload");
+/// ```
+pub fn json(mut t: Table, in name: Str) {
+    add(t, name, "JSON", "JSON");
+}
+
+fn raise(mut t: Table, take flag: Int) {
+    let last = std::array::len(t.flags) - 1;
+    if last >= 0 {
+        let now = std::array::get(t.flags, last);
+        if (now / flag) % 2 == 0 {
+            std::array::set(t.flags, last, now + flag);
+        }
+    }
+}
+
+/// Make the column just added the primary key (`primary_key=True`).
+///
+/// # Example
+/// ```tuo
+/// sql::table::integer(t, "id");
+/// sql::table::primary_key(t);
+/// ```
+pub fn primary_key(mut t: Table) {
+    raise(t, flag_primary());
+}
+
+/// Make the column just added `nullable=False`.
+///
+/// # Example
+/// ```tuo
+/// sql::table::not_null(t);
+/// ```
+pub fn not_null(mut t: Table) {
+    raise(t, flag_not_null());
+}
+
+/// Make the column just added `unique=True`.
+///
+/// # Example
+/// ```tuo
+/// sql::table::unique(t);
+/// ```
+pub fn unique(mut t: Table) {
+    raise(t, flag_unique());
+}
+
+/// Give the column just added a `server_default`, as SQL text.
+///
+/// # Example
+/// ```tuo
+/// sql::table::server_default(t, "now()");
+/// ```
+pub fn server_default(mut t: Table, in expression: Str) {
+    let last = std::array::len(t.defaults) - 1;
+    if last >= 0 {
+        std::array::set(t.defaults, last, std::string::from_str(expression));
+    }
+}
+
+/// Make the column just added a `ForeignKey("table.column")`.
+///
+/// # Example
+/// ```tuo
+/// sql::table::references(t, "users", "id");
+/// ```
+pub fn references(mut t: Table, in table_name: Str, in column_name: Str) {
+    let last = std::array::len(t.targets) - 1;
+    if last >= 0 {
+        var target = std::string::from_str(table_name);
+        std::string::append(target, " (");
+        std::string::append(target, column_name);
+        std::string::push_byte(target, 41);
+        std::array::set(t.targets, last, target);
+    }
+}
+
+/// The table's name.
+///
+/// # Example
+/// ```tuo
+/// let n = sql::table::name(t);
+/// ```
+pub fn name(in t: Table) -> String {
+    std::string::from_str(std::string::as_str(t.name))
+}
+
+/// How many columns the table has.
+///
+/// # Example
+/// ```tuo
+/// let n = sql::table::column_count(t);
+/// ```
+pub fn column_count(in t: Table) -> Int {
+    std::array::len(t.columns)
+}
+
+/// The name of column `i`.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::table::column_at(t, 0);
+/// ```
+pub fn column_at(in t: Table, take i: Int) -> String {
+    std::string::from_str(std::string::as_str(std::array::get(t.columns, i)))
+}
+
+/// The index of a column, or -1.
+///
+/// # Example
+/// ```tuo
+/// let i = sql::table::index_of(t, "email");
+/// ```
+pub fn index_of(in t: Table, in column: Str) -> Int {
+    var i = 0;
+    while i < std::array::len(t.columns) {
+        if std::string::as_str(std::array::get(t.columns, i)) == column {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+/// The cast a parameter bound against `column` carries; empty when the
+/// table has no such column.
+///
+/// # Example
+/// ```tuo
+/// let c = sql::table::cast_of(t, "email"); // "VARCHAR"
+/// ```
+pub fn cast_of(in t: Table, in column: Str) -> String {
+    let i = index_of(t, column);
+    if i < 0 {
+        return std::string::empty();
+    }
+    std::string::from_str(std::string::as_str(std::array::get(t.casts, i)))
+}
+
+fn has_flag(in t: Table, take i: Int, take flag: Int) -> Bool {
+    (std::array::get(t.flags, i) / flag) % 2 == 1
+}
+
+/// Is column `i` part of the primary key?
+///
+/// # Example
+/// ```tuo
+/// let pk = sql::table::is_primary(t, 0);
+/// ```
+pub fn is_primary(in t: Table, take i: Int) -> Bool {
+    has_flag(t, i, flag_primary())
+}
+
+fn primary_count(in t: Table) -> Int {
+    var n = 0;
+    var i = 0;
+    while i < column_count(t) {
+        if is_primary(t, i) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    n
+}
+
+// SQLAlchemy turns a lone integer primary key with no default into SERIAL.
+fn declared_type(in t: Table, take i: Int) -> String {
+    let declared = std::string::as_str(std::array::get(t.types, i));
+    let plain = std::string::len(std::array::get(t.defaults, i)) == 0 && std::string::len(std::array::get(t.targets, i)) == 0;
+    if is_primary(t, i) && primary_count(t) == 1 && plain {
+        if declared == "INTEGER" {
+            return std::string::from_str("SERIAL");
+        }
+        if declared == "BIGINT" {
+            return std::string::from_str("BIGSERIAL");
+        }
+    }
+    std::string::from_str(declared)
+}
+
+/// `CreateTable(t)` as SQLAlchemy compiles it for PostgreSQL.
+///
+/// # Example
+/// ```tuo
+/// let ddl = sql::table::create(users);
+/// ```
+pub fn create(in t: Table) -> String {
+    var out = std::string::from_str("\nCREATE TABLE ");
+    std::string::append(out, std::string::as_str(t.name));
+    std::string::append(out, " (");
+    var i = 0;
+    while i < column_count(t) {
+        std::string::append(out, "\n\t");
+        std::string::append(out, std::string::as_str(std::array::get(t.columns, i)));
+        std::string::push_byte(out, 32);
+        std::string::append(out, std::string::as_str(declared_type(t, i)));
+        if std::string::len(std::array::get(t.defaults, i)) > 0 {
+            std::string::append(out, " DEFAULT ");
+            std::string::append(out, std::string::as_str(std::array::get(t.defaults, i)));
+        }
+        if is_primary(t, i) || has_flag(t, i, flag_not_null()) {
+            std::string::append(out, " NOT NULL");
+        }
+        std::string::append(out, ", ");
+        i = i + 1;
+    }
+    std::string::append(out, "\n\tPRIMARY KEY (");
+    var seen = 0;
+    i = 0;
+    while i < column_count(t) {
+        if is_primary(t, i) {
+            if seen > 0 {
+                std::string::append(out, ", ");
+            }
+            std::string::append(out, std::string::as_str(std::array::get(t.columns, i)));
+            seen = seen + 1;
+        }
+        i = i + 1;
+    }
+    std::string::push_byte(out, 41);
+    i = 0;
+    while i < column_count(t) {
+        if has_flag(t, i, flag_unique()) {
+            std::string::append(out, ", \n\tUNIQUE (");
+            std::string::append(out, std::string::as_str(std::array::get(t.columns, i)));
+            std::string::push_byte(out, 41);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < column_count(t) {
+        if std::string::len(std::array::get(t.targets, i)) > 0 {
+            std::string::append(out, ", \n\tFOREIGN KEY(");
+            std::string::append(out, std::string::as_str(std::array::get(t.columns, i)));
+            std::string::append(out, ") REFERENCES ");
+            std::string::append(out, std::string::as_str(std::array::get(t.targets, i)));
+        }
+        i = i + 1;
+    }
+    std::string::append(out, "\n)\n\n");
+    out
+}
+
+/// `DropTable(t)`.
+///
+/// # Example
+/// ```tuo
+/// let ddl = sql::table::drop(users);
+/// ```
+pub fn drop(in t: Table) -> String {
+    var out = std::string::from_str("\nDROP TABLE ");
+    std::string::append(out, std::string::as_str(t.name));
+    out
+}
+
+/// `CreateIndex(Index(name, *columns, unique=unique))`; `columns` is a
+/// comma-separated list.
+///
+/// # Example
+/// ```tuo
+/// let ddl = sql::table::create_index(jobs, "ix_jobs_city", "city", false);
+/// ```
+pub fn create_index(in t: Table, in index_name: Str, in columns: Str, take is_unique: Bool) -> String {
+    var out = std::string::from_str("CREATE ");
+    if is_unique {
+        std::string::append(out, "UNIQUE ");
+    }
+    std::string::append(out, "INDEX ");
+    std::string::append(out, index_name);
+    std::string::append(out, " ON ");
+    std::string::append(out, std::string::as_str(t.name));
+    std::string::append(out, " (");
+    let parts = std::str::split(columns, ",");
+    var i = 0;
+    while i < std::array::len(parts) {
+        if i > 0 {
+            std::string::append(out, ", ");
+        }
+        std::string::append(out, std::str::trim(std::string::as_str(std::array::get(parts, i))));
+        i = i + 1;
+    }
+    std::string::push_byte(out, 41);
+    out
+}
+
+/// `DropIndex(Index(name, ...))`.
+///
+/// # Example
+/// ```tuo
+/// let ddl = sql::table::drop_index("ix_jobs_city");
+/// ```
+pub fn drop_index(in index_name: Str) -> String {
+    var out = std::string::from_str("\nDROP INDEX ");
+    std::string::append(out, index_name);
+    out
+}
+
+fn sample() -> Table {
+    var t = named("notes");
+    integer(t, "id");
+    primary_key(t);
+    varchar(t, "title", 80);
+    not_null(t);
+    unique(t);
+    integer(t, "owner_id");
+    references(t, "users", "id");
+    boolean(t, "pinned");
+    server_default(t, "false");
+    not_null(t);
+    text(t, "body");
+    t
+}
+
+fn create_is(in expected: Str) -> Bool {
+    std::string::as_str(create(sample())) == expected
+}
+
+fn cast_is(in column: Str, in expected: Str) -> Bool {
+    std::string::as_str(cast_of(sample(), column)) == expected
+}
+
+spec create {
+    then create_is("\nCREATE TABLE notes (\n\tid SERIAL NOT NULL, \n\ttitle VARCHAR(80) NOT NULL, \n\towner_id INTEGER, \n\tpinned BOOLEAN DEFAULT false NOT NULL, \n\tbody TEXT, \n\tPRIMARY KEY (id), \n\tUNIQUE (title), \n\tFOREIGN KEY(owner_id) REFERENCES users (id)\n)\n\n");
+}
+
+spec cast_of {
+    then cast_is("title", "VARCHAR");
+    then cast_is("body", "VARCHAR");
+    then cast_is("pinned", "BOOLEAN");
+    then cast_is("absent", "");
+}
+
+spec index_of {
+    then index_of(sample(), "id") == 0;
+    then index_of(sample(), "body") == 4;
+    then index_of(sample(), "nope") == -1;
+    then is_primary(sample(), 0);
+    then !is_primary(sample(), 1);
+}
+
+spec create_index {
+    then std::string::as_str(create_index(sample(), "ix_a", "title, owner_id", true)) == "CREATE UNIQUE INDEX ix_a ON notes (title, owner_id)";
+    then std::string::as_str(drop_index("ix_a")) == "\nDROP INDEX ix_a";
+    then std::string::as_str(drop(sample())) == "\nDROP TABLE notes";
+}

@@ -1,0 +1,381 @@
+// sql::write — INSERT, UPDATE, and DELETE.
+//
+// The three statements that change rows, laid out as SQLAlchemy lays them
+// out: `SET name=$1` with no spaces, but `DO UPDATE SET name = $3` with
+// them; a compound value parenthesized; and an INSERT that names no
+// primary key value supplied `RETURNING` of the key it did not name, because
+// that is how SQLAlchemy learns the new row's id and the backend's
+// services read it back.
+//
+// A value is any `Clause`. A literal becomes a parameter cast to the
+// *column's* type — `amount=12` is sent as `$1::NUMERIC(10, 2)` — so the
+// server parses it as the column would store it.
+
+module sql::write;
+
+/// An INSERT under construction.
+pub struct Insert {
+    table: sql::table::Table,
+    names: Array[String],
+    values: sql::clause::Clause,
+    conflict: String,
+    conflict_action: Int,
+    updates: sql::clause::Clause,
+    update_count: Int,
+    returned: Array[String],
+}
+
+/// An UPDATE under construction.
+pub struct Update {
+    table: sql::table::Table,
+    sets: sql::clause::Clause,
+    set_count: Int,
+    filter: sql::clause::Clause,
+    returned: Array[String],
+}
+
+/// A DELETE under construction.
+pub struct Delete {
+    table: sql::table::Table,
+    filter: sql::clause::Clause,
+    returned: Array[String],
+}
+
+fn same_table(in t: sql::table::Table) -> sql::table::Table {
+    var out = sql::table::named(std::string::as_str(sql::table::name(t)));
+    var i = 0;
+    while i < sql::table::column_count(t) {
+        let column = sql::table::column_at(t, i);
+        let cast = sql::table::cast_of(t, std::string::as_str(column));
+        sql::table::add(out, std::string::as_str(column), std::string::as_str(cast), std::string::as_str(cast));
+        if sql::table::is_primary(t, i) {
+            sql::table::primary_key(out);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// `insert(t)`.
+///
+/// # Example
+/// ```tuo
+/// var q = sql::write::insert(users);
+/// ```
+pub fn insert(in t: sql::table::Table) -> Insert {
+    Insert { table: same_table(t), names: std::array::empty(), values: sql::clause::blank(), conflict: std::string::empty(), conflict_action: 0, updates: sql::clause::blank(), update_count: 0, returned: std::array::empty() }
+}
+
+/// Give a column its value — one keyword of `.values(...)`.
+///
+/// # Example
+/// ```tuo
+/// sql::write::value(q, "email", sql::clause::text("a@b.c"));
+/// ```
+pub fn value(mut q: Insert, in column: Str, in supplied: sql::clause::Clause) {
+    if std::array::len(q.names) > 0 {
+        sql::clause::push_text(q.values, ", ");
+    }
+    std::array::push(q.names, std::string::from_str(column));
+    let cast = sql::table::cast_of(q.table, column);
+    sql::clause::append(q.values, sql::clause::as_value(supplied, std::string::as_str(cast), column));
+}
+
+/// `.on_conflict_do_nothing(index_elements=[…])`; `columns` is a
+/// comma-separated list.
+///
+/// # Example
+/// ```tuo
+/// sql::write::on_conflict_do_nothing(q, "email");
+/// ```
+pub fn on_conflict_do_nothing(mut q: Insert, in columns: Str) {
+    q.conflict = std::string::from_str(columns);
+    q.conflict_action = 1;
+}
+
+/// `.on_conflict_do_update(index_elements=[…], set_={column: supplied})`.
+/// Call it once per column to set.
+///
+/// # Example
+/// ```tuo
+/// sql::write::on_conflict_do_update(q, "email", "name", sql::clause::text("b"));
+/// ```
+pub fn on_conflict_do_update(mut q: Insert, in columns: Str, in column: Str, in supplied: sql::clause::Clause) {
+    q.conflict = std::string::from_str(columns);
+    q.conflict_action = 2;
+    if q.update_count > 0 {
+        sql::clause::push_text(q.updates, ", ");
+    }
+    sql::clause::push_text(q.updates, column);
+    sql::clause::push_text(q.updates, " = ");
+    let cast = sql::table::cast_of(q.table, column);
+    sql::clause::append(q.updates, sql::clause::as_value(supplied, std::string::as_str(cast), column));
+    q.update_count = q.update_count + 1;
+}
+
+/// Add a column to RETURNING.
+///
+/// # Example
+/// ```tuo
+/// sql::write::returning(q, "id");
+/// ```
+pub fn returning(mut q: Insert, in column: Str) {
+    std::array::push(q.returned, std::string::from_str(column));
+}
+
+fn names_value(in q: Insert, in column: Str) -> Bool {
+    var i = 0;
+    while i < std::array::len(q.names) {
+        if std::string::as_str(std::array::get(q.names, i)) == column {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn push_returning(mut c: sql::clause::Clause, in t: sql::table::Table, in returned: Array[String]) {
+    var i = 0;
+    while i < std::array::len(returned) {
+        if i == 0 {
+            sql::clause::push_text(c, " RETURNING ");
+        } else {
+            sql::clause::push_text(c, ", ");
+        }
+        sql::clause::push_text(c, std::string::as_str(sql::table::name(t)));
+        sql::clause::push_text(c, ".");
+        sql::clause::push_text(c, std::string::as_str(std::array::get(returned, i)));
+        i = i + 1;
+    }
+}
+
+// With no explicit RETURNING, SQLAlchemy asks for the primary key columns
+// the statement did not supply.
+fn implicit_returning(in q: Insert) -> Array[String] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < sql::table::column_count(q.table) {
+        let column = sql::table::column_at(q.table, i);
+        if sql::table::is_primary(q.table, i) && !names_value(q, std::string::as_str(column)) {
+            std::array::push(out, std::string::from_str(std::string::as_str(column)));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn spaced_list(in columns: Str) -> String {
+    var out = std::string::empty();
+    let parts = std::str::split(columns, ",");
+    var i = 0;
+    while i < std::array::len(parts) {
+        if i > 0 {
+            std::string::append(out, ", ");
+        }
+        std::string::append(out, std::str::trim(std::string::as_str(std::array::get(parts, i))));
+        i = i + 1;
+    }
+    out
+}
+
+/// The INSERT ready for the wire.
+///
+/// # Example
+/// ```tuo
+/// let ready = sql::write::render_insert(q);
+/// ```
+pub fn render_insert(in q: Insert) -> sql::clause::Compiled {
+    var c = sql::clause::blank();
+    sql::clause::push_text(c, "INSERT INTO ");
+    sql::clause::push_text(c, std::string::as_str(sql::table::name(q.table)));
+    sql::clause::push_text(c, " (");
+    var i = 0;
+    while i < std::array::len(q.names) {
+        if i > 0 {
+            sql::clause::push_text(c, ", ");
+        }
+        sql::clause::push_text(c, std::string::as_str(std::array::get(q.names, i)));
+        i = i + 1;
+    }
+    sql::clause::push_text(c, ") VALUES (");
+    sql::clause::append(c, q.values);
+    sql::clause::push_text(c, ")");
+    if q.conflict_action > 0 {
+        sql::clause::push_text(c, " ON CONFLICT (");
+        sql::clause::push_text(c, std::string::as_str(spaced_list(std::string::as_str(q.conflict))));
+        if q.conflict_action == 1 {
+            sql::clause::push_text(c, ") DO NOTHING");
+        } else {
+            sql::clause::push_text(c, ") DO UPDATE SET ");
+            sql::clause::append(c, q.updates);
+        }
+    }
+    if std::array::len(q.returned) > 0 {
+        push_returning(c, q.table, q.returned);
+    } else {
+        push_returning(c, q.table, implicit_returning(q));
+    }
+    sql::clause::render(c)
+}
+
+/// `update(t)`.
+///
+/// # Example
+/// ```tuo
+/// var q = sql::write::update(users);
+/// ```
+pub fn update(in t: sql::table::Table) -> Update {
+    Update { table: same_table(t), sets: sql::clause::blank(), set_count: 0, filter: sql::clause::blank(), returned: std::array::empty() }
+}
+
+/// Set a column — one keyword of `.values(...)`.
+///
+/// # Example
+/// ```tuo
+/// sql::write::set(q, "name", sql::clause::text("z"));
+/// ```
+pub fn set(mut q: Update, in column: Str, in supplied: sql::clause::Clause) {
+    if q.set_count > 0 {
+        sql::clause::push_text(q.sets, ", ");
+    }
+    sql::clause::push_text(q.sets, column);
+    sql::clause::push_text(q.sets, "=");
+    let cast = sql::table::cast_of(q.table, column);
+    sql::clause::append(q.sets, sql::clause::as_value(supplied, std::string::as_str(cast), column));
+    q.set_count = q.set_count + 1;
+}
+
+/// Add a WHERE condition to the UPDATE; successive calls are ANDed.
+///
+/// # Example
+/// ```tuo
+/// sql::write::update_filter(q, sql::clause::eq(id, sql::clause::int(3)));
+/// ```
+pub fn update_filter(mut q: Update, in condition: sql::clause::Clause) {
+    q.filter = sql::clause::and_(q.filter, condition);
+}
+
+/// Add a column to the UPDATE's RETURNING.
+///
+/// # Example
+/// ```tuo
+/// sql::write::update_returning(q, "id");
+/// ```
+pub fn update_returning(mut q: Update, in column: Str) {
+    std::array::push(q.returned, std::string::from_str(column));
+}
+
+/// The UPDATE ready for the wire.
+///
+/// # Example
+/// ```tuo
+/// let ready = sql::write::render_update(q);
+/// ```
+pub fn render_update(in q: Update) -> sql::clause::Compiled {
+    var c = sql::clause::blank();
+    sql::clause::push_text(c, "UPDATE ");
+    sql::clause::push_text(c, std::string::as_str(sql::table::name(q.table)));
+    sql::clause::push_text(c, " SET ");
+    sql::clause::append(c, q.sets);
+    if std::string::len(sql::clause::text_of(q.filter)) > 0 {
+        sql::clause::push_text(c, " WHERE ");
+        sql::clause::append(c, q.filter);
+    }
+    push_returning(c, q.table, q.returned);
+    sql::clause::render(c)
+}
+
+/// `delete(t)`.
+///
+/// # Example
+/// ```tuo
+/// var q = sql::write::delete(users);
+/// ```
+pub fn delete(in t: sql::table::Table) -> Delete {
+    Delete { table: same_table(t), filter: sql::clause::blank(), returned: std::array::empty() }
+}
+
+/// Add a WHERE condition to the DELETE; successive calls are ANDed.
+///
+/// # Example
+/// ```tuo
+/// sql::write::delete_filter(q, sql::clause::eq(id, sql::clause::int(3)));
+/// ```
+pub fn delete_filter(mut q: Delete, in condition: sql::clause::Clause) {
+    q.filter = sql::clause::and_(q.filter, condition);
+}
+
+/// Add a column to the DELETE's RETURNING.
+///
+/// # Example
+/// ```tuo
+/// sql::write::delete_returning(q, "id");
+/// ```
+pub fn delete_returning(mut q: Delete, in column: Str) {
+    std::array::push(q.returned, std::string::from_str(column));
+}
+
+/// The DELETE ready for the wire.
+///
+/// # Example
+/// ```tuo
+/// let ready = sql::write::render_delete(q);
+/// ```
+pub fn render_delete(in q: Delete) -> sql::clause::Compiled {
+    var c = sql::clause::blank();
+    sql::clause::push_text(c, "DELETE FROM ");
+    sql::clause::push_text(c, std::string::as_str(sql::table::name(q.table)));
+    if std::string::len(sql::clause::text_of(q.filter)) > 0 {
+        sql::clause::push_text(c, " WHERE ");
+        sql::clause::append(c, q.filter);
+    }
+    push_returning(c, q.table, q.returned);
+    sql::clause::render(c)
+}
+
+fn people() -> sql::table::Table {
+    var t = sql::table::named("people");
+    sql::table::integer(t, "id");
+    sql::table::primary_key(t);
+    sql::table::string(t, "name");
+    sql::table::integer(t, "age");
+    t
+}
+
+fn insert_is(take with_key: Bool, in expected: Str) -> Bool {
+    var q = insert(people());
+    if with_key {
+        value(q, "id", sql::clause::int(5));
+    }
+    value(q, "name", sql::clause::text("n"));
+    value(q, "age", sql::clause::null());
+    std::string::as_str(sql::clause::statement(render_insert(q))) == expected
+}
+
+fn update_is(in expected: Str) -> Bool {
+    var q = update(people());
+    set(q, "name", sql::clause::text("z"));
+    set(q, "age", sql::clause::plus(sql::clause::col(people(), "age"), sql::clause::int(1)));
+    update_filter(q, sql::clause::eq(sql::clause::col(people(), "id"), sql::clause::int(3)));
+    update_returning(q, "age");
+    std::string::as_str(sql::clause::statement(render_update(q))) == expected
+}
+
+fn delete_is(in expected: Str) -> Bool {
+    var q = delete(people());
+    delete_filter(q, sql::clause::lt(sql::clause::col(people(), "age"), sql::clause::int(3)));
+    std::string::as_str(sql::clause::statement(render_delete(q))) == expected
+}
+
+spec render_insert {
+    then insert_is(false, "INSERT INTO people (name, age) VALUES ($1::VARCHAR, $2::INTEGER) RETURNING people.id");
+    then insert_is(true, "INSERT INTO people (id, name, age) VALUES ($1::INTEGER, $2::VARCHAR, $3::INTEGER)");
+}
+
+spec render_update {
+    then update_is("UPDATE people SET name=$1::VARCHAR, age=(people.age + $2::INTEGER) WHERE people.id = $3::INTEGER RETURNING people.age");
+}
+
+spec render_delete {
+    then delete_is("DELETE FROM people WHERE people.age < $1::INTEGER");
+}

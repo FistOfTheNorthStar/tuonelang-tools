@@ -1,0 +1,195 @@
+// sql::row — reading a result the way SQLAlchemy's `Result` is read.
+//
+// `pg::query::ResultSet` indexes cells by row and column number. The
+// backend never does: it asks for `scalar_one_or_none()`, or reads
+// `row.email`. This module is that by-name, by-cardinality layer. A row
+// mapper is then an ordinary function from `(ResultSet, row)` to a
+// struct, written once per model — the typed row mapping an ORM would
+// derive by reflection, stated instead where the compiler can check it.
+//
+// A column the result does not have reads as NULL rather than trapping:
+// a mapper shared between a full SELECT and a narrower one keeps working.
+
+module sql::row;
+
+/// `one_or_none`: exactly one row was found; it is row 0.
+///
+/// # Example
+/// ```tuo
+/// let yes = sql::row::one_or_none(rs) == sql::row::found();
+/// ```
+pub fn found() -> Int {
+    0
+}
+
+/// `one_or_none`: no row — SQLAlchemy's `None`.
+///
+/// # Example
+/// ```tuo
+/// let missing = sql::row::one_or_none(rs) == sql::row::none();
+/// ```
+pub fn none() -> Int {
+    -1
+}
+
+/// `one_or_none`: more than one row — SQLAlchemy's `MultipleResultsFound`.
+///
+/// # Example
+/// ```tuo
+/// let ambiguous = sql::row::one_or_none(rs) == sql::row::multiple();
+/// ```
+pub fn multiple() -> Int {
+    -2
+}
+
+/// `Result.one_or_none()` / `scalar_one_or_none()`: the row index `0`,
+/// `none()`, or `multiple()`.
+///
+/// # Example
+/// ```tuo
+/// let r = sql::row::one_or_none(rs);
+/// ```
+pub fn one_or_none(in rs: pg::query::ResultSet) -> Int {
+    let n = pg::query::row_count(rs);
+    if n == 1 {
+        found()
+    } else if n == 0 {
+        none()
+    } else {
+        multiple()
+    }
+}
+
+/// `Result.first()`: row 0, or `none()` — extra rows are not an error.
+///
+/// # Example
+/// ```tuo
+/// let r = sql::row::first(rs);
+/// ```
+pub fn first(in rs: pg::query::ResultSet) -> Int {
+    if pg::query::row_count(rs) > 0 {
+        found()
+    } else {
+        none()
+    }
+}
+
+fn cell_exists(in rs: pg::query::ResultSet, take r: Int, take c: Int) -> Bool {
+    c >= 0 && r >= 0 && r < pg::query::row_count(rs)
+}
+
+/// Is the named cell SQL NULL? A missing column or row reads as NULL.
+///
+/// # Example
+/// ```tuo
+/// let absent = sql::row::is_null(rs, 0, "name");
+/// ```
+pub fn is_null(in rs: pg::query::ResultSet, take r: Int, in column: Str) -> Bool {
+    let c = pg::query::column_index(rs, column);
+    if !cell_exists(rs, r, c) {
+        return true;
+    }
+    pg::query::is_null(rs, r, c)
+}
+
+/// The named cell as text; empty for NULL.
+///
+/// # Example
+/// ```tuo
+/// let email = sql::row::text(rs, 0, "email");
+/// ```
+pub fn text(in rs: pg::query::ResultSet, take r: Int, in column: Str) -> String {
+    let c = pg::query::column_index(rs, column);
+    if !cell_exists(rs, r, c) {
+        return std::string::empty();
+    }
+    pg::query::cell(rs, r, c)
+}
+
+/// The named cell as an integer; `fallback` for NULL or a non-integer.
+///
+/// # Example
+/// ```tuo
+/// let id = sql::row::int(rs, 0, "id", 0);
+/// ```
+pub fn int(in rs: pg::query::ResultSet, take r: Int, in column: Str, take fallback: Int) -> Int {
+    let c = pg::query::column_index(rs, column);
+    if !cell_exists(rs, r, c) {
+        return fallback;
+    }
+    pg::query::cell_int(rs, r, c, fallback)
+}
+
+/// The named cell as a boolean; NULL reads as false.
+///
+/// # Example
+/// ```tuo
+/// let active = sql::row::boolean(rs, 0, "active");
+/// ```
+pub fn boolean(in rs: pg::query::ResultSet, take r: Int, in column: Str) -> Bool {
+    let c = pg::query::column_index(rs, column);
+    if !cell_exists(rs, r, c) {
+        return false;
+    }
+    pg::query::cell_bool(rs, r, c)
+}
+
+/// The named cell as a float; `fallback` for NULL or a non-number.
+///
+/// # Example
+/// ```tuo
+/// let score = sql::row::float(rs, 0, "score", 0.0);
+/// ```
+pub fn float(in rs: pg::query::ResultSet, take r: Int, in column: Str, take fallback: Float) -> Float {
+    let c = pg::query::column_index(rs, column);
+    if !cell_exists(rs, r, c) {
+        return fallback;
+    }
+    pg::query::cell_float(rs, r, c, fallback)
+}
+
+/// `Result.scalar()` as an integer: row 0, column 0 — `fallback` when
+/// there is no row. What `select(func.count())` is read with.
+///
+/// # Example
+/// ```tuo
+/// let total = sql::row::scalar_int(rs, 0);
+/// ```
+pub fn scalar_int(in rs: pg::query::ResultSet, take fallback: Int) -> Int {
+    if pg::query::row_count(rs) == 0 || pg::query::column_count(rs) == 0 {
+        return fallback;
+    }
+    pg::query::cell_int(rs, 0, 0, fallback)
+}
+
+fn ada() -> pg::query::ResultSet {
+    pg::query::fixture_rs()
+}
+
+spec one_or_none {
+    then one_or_none(ada()) == multiple();
+    then one_or_none(pg::query::empty_result()) == none();
+    then first(ada()) == found();
+    then first(pg::query::empty_result()) == none();
+}
+
+spec text {
+    then std::string::as_str(text(ada(), 0, "name")) == "ada";
+    then std::string::as_str(text(ada(), 1, "name")) == "";
+    then std::string::as_str(text(ada(), 0, "absent")) == "";
+    then std::string::as_str(text(ada(), 7, "name")) == "";
+}
+
+spec is_null {
+    then !is_null(ada(), 0, "name");
+    then is_null(ada(), 1, "name");
+    then is_null(ada(), 0, "absent");
+}
+
+spec int {
+    then int(ada(), 1, "id", 0) == 2;
+    then int(ada(), 0, "name", -5) == -5;
+    then int(ada(), 0, "absent", 9) == 9;
+    then scalar_int(ada(), 0) == 1;
+    then scalar_int(pg::query::empty_result(), 42) == 42;
+}
