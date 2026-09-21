@@ -96,13 +96,24 @@ models, enums, dates, headers as parameters, JWT bearer auth (HS256 is
 are dispatched by a `match` on a slot, since a route table cannot hold
 function values in v0.
 
-### 5. SQLAlchemy-equivalent query layer — replaces `sqlalchemy` + `alembic`
+### 5. SQLAlchemy-equivalent query layer — replaces `sqlalchemy` + `alembic` — ✅ done
 
 `tuonelang-db` gives you the wire protocol. What is missing is the layer above:
 typed row mapping, a query builder, connection pooling, transactions, and
 migrations. Skip the ORM identity map and lazy loading — they need capturing
 closures and recursive types, both refused today. Build a typed query builder
 instead; it is a better fit for the language and a better tool anyway.
+
+Done on 2026-09-21 as `sql`: a query builder whose text is SQLAlchemy's
+own — 117 statements compiled by SQLAlchemy 2.0.54 for asyncpg, and by
+Alembic 1.20.0 offline, rebuilt byte for byte — with row access by name,
+nested transactions, a pool with pre-ping and reset-on-return, and
+Alembic-compatible migrations run in one transaction. It also gave the
+vendored `tuonelang-db` adapter the login a stock PostgreSQL demands,
+SCRAM-SHA-256, spec'd against RFC 7677. All of it is exercised by 51
+live checks against PostgreSQL 18. Still to come: TLS to the database,
+aliases and CTEs, PostGIS expressions, and the backend's models written
+as `sql::table` definitions with their row mappers.
 
 ### 6. Argon2 password hashing — replaces `passlib[argon2]` — ✅ done
 
@@ -159,8 +170,11 @@ Be honest about these rather than half-porting them.
 4. ✅ **HTTP/1.1** — the backbone of everything outbound and inbound.
 5. ✅ **TLS 1.3** — the client, and the chain validation that makes it
    reach Stripe, R2, and Sentry.
-6. ◐ **Router + validation** — the request path is done; then the **query
-   layer** — **next** — which is what the backend's own routes wait on.
+6. ◐ **Router + validation** — the request path is done — and ✅ the
+   **query layer**, so a route now has both its ends.
+7. **Next: the first real routes.** JWT bearer auth (HS256 is one HMAC
+   away), then the auth endpoints end to end: `web` in front, `argon2`
+   for the password, `sql` behind.
 
 Tiers 2 and 3 fall out largely for free once 4 and 5 exist.
 

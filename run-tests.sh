@@ -11,7 +11,10 @@
 #                           chains), fetch https:// from Stripe, Sentry, and
 #                           Cloudflare with chains validated against the root
 #                           store, and drive the Redis client against the
-#                           docker compose redis on 127.0.0.1:6380
+#                           docker compose redis on 127.0.0.1:6380, and run the
+#                           query layer against a throwaway PostgreSQL that
+#                           examples/sql-test/server.sh creates and deletes
+#                           (needs initdb, pg_ctl, psql on PATH)
 #
 # TUO may be set to a `tuo` binary; otherwise the one on PATH is used.
 #
@@ -66,6 +69,18 @@ WEB_SRC=(src/web/json.tuo src/web/coerce.tuo src/web/errors.tuo src/web/schema.t
          src/web/query.tuo src/web/route.tuo src/web/request.tuo src/web/response.tuo
          src/web/fixture.tuo src/web/demo.tuo)
 
+# The query layer stands on tuonelang-db's adapter, vendored as src/pg and
+# src/db exactly as the catalog modules are.
+PG_SRC=(src/db/bytes.tuo src/db/error.tuo src/pg/auth.tuo src/pg/conn.tuo
+        src/pg/message.tuo src/pg/proto.tuo src/pg/query.tuo src/pg/value.tuo)
+SQL_SRC=(src/sql/table.tuo src/sql/clause.tuo src/sql/select.tuo src/sql/write.tuo
+         src/sql/migrate.tuo src/sql/fixture.tuo src/sql/demo.tuo src/sql/scram.tuo
+         src/sql/url.tuo src/sql/row.tuo src/sql/session.tuo src/sql/pool.tuo
+         "${PG_SRC[@]}"
+         src/dns/wire.tuo src/dns/name.tuo src/dns/message.tuo src/dns/record.tuo
+         src/dns/resolver.tuo
+         src/std_net.tuo src/std_str.tuo src/std_crypto.tuo src/std_ct.tuo src/std_bits.tuo)
+
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
 check() { if [ "$1" -eq 0 ]; then echo "PASS $2"; else echo "FAIL $2"; failed=1; fi }
@@ -107,11 +122,17 @@ step "Web: front end (check)"
 step "Web: specs (verify), all 107 captured FastAPI responses replayed"
 "$TUO" verify "${WEB_SRC[@]}" src/http/message.tuo src/http/fixture.tuo src/http/url.tuo src/std_str.tuo src/std_bits.tuo; check $? "web verify"
 
+step "SQL: front end (check)"
+"$TUO" check "${SQL_SRC[@]}" examples/sql.tuo; check $? "sql check"
+
+step "SQL: specs (verify), all 117 captured SQLAlchemy and Alembic statements rebuilt"
+"$TUO" verify "${SQL_SRC[@]}"; check $? "sql verify"
+
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
-# to `crates/tuo-stdlib/src/std/`.
+# to `crates/tuo-stdlib/src/std/` — and src/pg, src/db are tuonelang-db's.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.
@@ -243,8 +264,32 @@ if [ "$live" -eq 1 ]; then
     echo "redis oracle exited $rc — that many checks disagreed (is docker compose up?)"
     check 1 "redis"
   fi
+
+  # The query layer against a real server: a cluster created for this run,
+  # on its own port, demanding SCRAM, MD5, and cleartext of three roles.
+  step "SQL: live — against a throwaway PostgreSQL on 127.0.0.1:54329"
+  if command -v initdb >/dev/null 2>&1 && command -v pg_ctl >/dev/null 2>&1 && command -v psql >/dev/null 2>&1; then
+    sql_dir="$(mktemp -d)/cluster"
+    if examples/sql-test/server.sh start "$sql_dir" 2>/dev/null; then
+      "$TUO" run examples/sql.tuo "${SQL_SRC[@]}"
+      rc=$?
+      examples/sql-test/server.sh stop "$sql_dir"
+      if [ "$rc" -eq 0 ]; then
+        check 0 "sql live (all checks agreed)"
+      else
+        echo "sql oracle exited $rc — that many checks disagreed"
+        check 1 "sql live"
+      fi
+    else
+      examples/sql-test/server.sh stop "$sql_dir"
+      echo "could not start a PostgreSQL cluster (is port 54329 taken?)"
+      check 1 "sql live"
+    fi
+  else
+    echo "initdb, pg_ctl, or psql not found — skipped"
+  fi
 else
-  printf '\n(skipping live DNS and Redis checks; pass --live to run them)\n'
+  printf '\n(skipping live DNS, HTTP, TLS, Redis, and SQL checks; pass --live to run them)\n'
 fi
 
 printf '\n'

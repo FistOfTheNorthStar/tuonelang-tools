@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Seven ports so far:
+Eight ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -15,6 +15,7 @@ Seven ports so far:
 | **`http`** — HTTP/1.1 framing, a client with redirects, a keep-alive server | `httpx`, `requests`, `uvicorn` (behind Caddy) | 107 specs against bytes Cloudflare and gunicorn sent, an 18-check loopback oracle, an 11-check live one |
 | **`tls`** — a TLS 1.3 client on the catalog's `std::tls`, and `https://` in the HTTP client | the `ssl` module | RFC 8448's trace reproduced from the client's side, a 12-check loopback oracle against `std::tls`, an 8-check interop oracle against three OpenSSL servers, and live `https://` to Stripe, Sentry, and Cloudflare |
 | **`x509`**, **`ec`**, **`rsa`** — certificate parsing, chain validation, a root store, ECDSA on P-256/P-384, RSA PKCS#1 v1.5 and PSS, SHA-384 | the `ssl` module's trust half (`certifi`, `cryptography`'s verifier) | 380 specs (RFC 6979 and a test PKI natively), a 27-check oracle over chains captured from Cloudflare, Sentry, and Stripe |
+| **`sql`** — a typed query builder, DDL, Alembic's revision chain, SCRAM login, nested transactions, a connection pool | `sqlalchemy` (Core), `alembic`, `asyncpg`'s login | 34 specs, 117 statements compiled by SQLAlchemy 2.0 and Alembic 1.20 rebuilt byte for byte, RFC 7677, and a 51-check live oracle against PostgreSQL 18 |
 | **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
 
 ```bash
@@ -23,11 +24,12 @@ Seven ports so far:
 ./run-tests.sh --live   # also resolve real names over UDP, fetch from public HTTP servers,
                         # complete TLS 1.3 handshakes with three openssl s_server instances,
                         # fetch https:// from Stripe, Sentry, and Cloudflare, and drive the
-                        # Redis client against shallowflaws's docker compose redis on 6380
+                        # Redis client against shallowflaws's docker compose redis on 6380,
+                        # and run the query layer against a throwaway PostgreSQL
 ```
 
-Both ports are pure tuonelang over the v0 core, with the catalog modules
-they need vendored as compiler inputs (see [Layout](#layout)). Nothing is
+Every port is pure tuonelang over the v0 core, with the catalog modules
+it needs vendored as compiler inputs (see [Layout](#layout)). Nothing is
 embedded in the runtime.
 
 ---
@@ -332,6 +334,152 @@ CAs; adding one is one base64 line. And the catalog's own caveat carries
 over: `std::bignum` is variable-time, so the client's X25519 step leaks
 timing on its ephemeral key. Signature *verification* is variable-time
 by design, and there is no signing function in `ec` or `rsa` at all.
+
+---
+
+## `sql` — SQLAlchemy's Core, and Alembic's chain
+
+The backend talks to PostgreSQL through SQLAlchemy: 218 `select`s, 53
+`delete`s, 35 `update`s, all built from Python expressions and compiled
+for asyncpg. [`tuonelang-db`](../tuonelang-db) already speaks the wire
+protocol; this port is the layer above it that the roadmap asked for — a
+query builder, row access, transactions, a pool, migrations — and the one
+thing below it that a stock server demands and the adapter stops short
+of: SCRAM-SHA-256.
+
+The ORM's identity map and lazy loading are not here, by the roadmap's
+own reasoning: they need capturing closures and recursive types. What is
+here is Core — and the statement text is SQLAlchemy's own, byte for
+byte, so a query log or a `pg_stat_statements` row reads the same from
+either backend.
+
+```tuo
+var q = sql::select::new();
+sql::select::column(q, sql::clause::col(users, "id"));
+sql::select::column(q, sql::clause::col(users, "email"));
+sql::select::filter(q, sql::clause::is_true(sql::clause::col(users, "active")));
+sql::select::filter(q, sql::clause::ilike(sql::clause::col(users, "name"), pattern));
+sql::select::order_by(q, sql::clause::desc(sql::clause::col(users, "created_at")));
+sql::select::limit(q, 25);
+let result = sql::session::execute(s, sql::select::render(q));
+// SELECT users.id, users.email \nFROM users \nWHERE users.active IS true
+//   AND users.name ILIKE $1::VARCHAR ORDER BY users.created_at DESC \n LIMIT $2::INTEGER
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `sql::table` — a table as data; `CREATE TABLE`, indexes, drops as SQLAlchemy emits them | ✅ proven |
+| `sql::clause` — expressions: comparisons, `IN`, `BETWEEN`, `LIKE`, `and_`/`or_`/`not_`, functions, arithmetic, labels, subqueries | ✅ proven |
+| `sql::select`, `sql::write` — SELECT with joins, grouping, ordering, paging, `FOR UPDATE`; INSERT with `ON CONFLICT` and `RETURNING`; UPDATE; DELETE | ✅ proven |
+| `sql::migrate` — Alembic's revision chain, planned as data, rendered as `alembic upgrade --sql` renders it | ✅ proven against Alembic 1.20 |
+| `sql::demo` — all 117 oracle statements rebuilt | ✅ 117 of 117, text and parameters |
+| `sql::scram`, `sql::url` — SCRAM-SHA-256's messages; `DATABASE_URL` | ✅ proven against RFC 7677 |
+| `sql::row` — `scalar_one_or_none`, `first`, cells by column name | ✅ proven |
+| `sql::session`, `sql::pool` — login (SCRAM, MD5, cleartext), NULL parameters, nested transactions, running migrations; a pool with pre-ping and reset-on-return | ✅ 51 live checks against PostgreSQL 18 |
+
+### The oracle is SQLAlchemy itself
+
+`examples/sql_oracle.py` writes 117 statements in SQLAlchemy — the
+constructs the backend's services use, and the edges around them — and
+compiles each with the asyncpg dialect, in `shallowflaws`'s own
+virtualenv (SQLAlchemy 2.0.54, Alembic 1.20.0). Four more are whole
+migration scripts from Alembic's offline mode. It records the text and
+the positional parameters as `src/sql/fixture.tuo`. `sql::demo::build`
+writes the same statements with the tuonelang builder, case by case
+under the same name, and one spec holds the two to byte equality. It was
+broken on purpose once to see the spec fail. The demo doubles as a
+phrase book: find the SQLAlchemy spelling in the oracle script, and the
+tuonelang spelling is the branch of the same name.
+
+```bash
+../shallowflaws/.venv/bin/python examples/sql_oracle.py   # rewrites src/sql/fixture.tuo
+```
+
+### What the specs pin that a comment cannot
+
+**Parameters are not numbered in text order.** SQLAlchemy expands an `IN`
+list after compiling the rest, so its members take the *last* numbers:
+`… AND users.id IN ($7::INTEGER, $8::INTEGER, $9::INTEGER) ORDER BY … LIMIT
+$5::INTEGER OFFSET $6::INTEGER`, with the parameters sent in numeric
+order. A clause here is text with marker bytes and its parameters beside
+it, numbered only at `render`, which is what makes that reproducible —
+and the live oracle checks the values still land on the right
+placeholders.
+
+**`not_` rewrites; it does not wrap.** `not_(a == b)` is `a != b`,
+`not_(a < b)` is `a >= b`, `not_(x.in_(…))` is `(x NOT IN (…))` *with*
+the parentheses, `not_(not_(active))` is `active`, and only a
+conjunction becomes `NOT (… AND …)`. An empty `IN` is `IN (NULL) AND (1
+!= 1)` — valid SQL that matches nothing — and its negation is `(x NOT IN
+(NULL) OR (1 = 1))`.
+
+**Every parameter is cast, and the cast is not always the column's.**
+`$1::VARCHAR` even for a `Text` column; `$1::BIGINT` for an int against
+a `BigInteger`, but `$1::INTEGER` for an int against a `Float` or a
+`Numeric`; `$1::NUMERIC(10, 2)` for the same int as an INSERT value.
+`== True` is written inline as `= true`; `== None` is `IS NULL`.
+
+**Anonymous labels share a counter with parameters.** Two unlabelled
+`coalesce(…, 0)` columns are `coalesce_1` and `coalesce_3`, because each
+bound `0` took a number in between. The backend reads such columns by
+position, but a port that labelled them `coalesce_2` would not be the
+same statement.
+
+**The layout's whitespace is part of the text.** `" \nFROM "`, `GROUP
+BY` and `ORDER BY` staying on the line before, `" \n LIMIT "`, and an
+`OFFSET` alone as `"\n LIMIT ALL OFFSET "` with no space before the
+newline. `SET name=$1` has no spaces; `DO UPDATE SET name = $3` does.
+
+**An INSERT returns the key it did not name.** `insert(users).values(email=…)`
+compiles with `RETURNING users.id`; give `id` a value and the clause is
+gone. **DDL matches too**: `SERIAL` for a lone integer key and
+`BIGSERIAL` for a big one, `DEFAULT` before `NOT NULL`, the primary key,
+then uniques, then foreign keys, tabs and trailing spaces included.
+
+**Migrations are Alembic's.** The version table's DDL, `INSERT … RETURNING`
+for the first stamp, `UPDATE` between, `DELETE` back to base, and the
+`-- Running upgrade  -> 1a2b3c4d5e6f` comment with its two spaces. A
+database migrated here can be picked up by Alembic, and the reverse.
+
+**SCRAM against RFC 7677 §3**: the client-final message with its proof,
+the server signature accepted, and one flipped character in it refused.
+A challenge whose nonce does not extend the client's is refused.
+
+### The live oracle
+
+`examples/sql-test/server.sh` creates a PostgreSQL cluster in a temporary
+directory, on port 54329, with three roles — one per password method —
+and deletes it afterwards. `examples/sql.tuo` then logs in all three
+ways; is refused with `28P01` for a wrong password; creates the oracle's
+tables from `sql::table::create`; inserts every column kind with a NULL
+among them and reads them back typed; stores `'; DROP TABLE users; --`
+as data; pages with late-numbered `IN` members; aggregates, joins,
+correlates; hits a unique violation (`23505`) and carries on; rolls back
+a transaction, rolls back a savepoint inside one and keeps the outer
+work; upgrades to head, downgrades, and watches a revision that fails
+half-way leave *nothing* behind; and drives the pool — exhaustion, reuse
+of the same server process, rollback of an abandoned transaction on
+release, and replacement of a connection the server killed.
+
+### What is deliberately not here
+
+**No ORM**: no identity map, no unit of work, no relationships or
+`selectinload`; a row mapper is a function you write once per model over
+`sql::row`. **No TLS to the database**: a URL with `sslmode=require` is
+refused rather than downgraded. **One thread**: the pool refuses at once
+when exhausted, where QueuePool would wait. **Names are trusted, values
+never are**: table, column, and label names enter the text unquoted, as
+SQLAlchemy leaves lower-case names, and must come from the program;
+every value travels out of band. **Floats are sent by their spelling**
+(`sql::clause::number("1.5")`). **Not modelled:** `CASE`, `CAST`, window
+functions, CTEs, `UNION`, aliases and self-joins, multi-row `VALUES`,
+composite foreign keys, PostGIS, branching migrations, autogenerate.
+`SASLprep` is not applied, so SCRAM credentials should be ASCII.
+
+`src/pg` and `src/db` are `tuonelang-db`'s adapter, vendored
+byte-identical at its commit `6d9971f`.
 
 ---
 
@@ -657,6 +805,23 @@ src/web/demo.tuo         the oracle's FastAPI app, reimplemented
 examples/web.tuo         the socket oracle: web::demo behind http::server
 examples/web_oracle.py   the FastAPI app and requests the fixture was captured from
 examples/web_fixture.py  oracle.json to src/web/fixture.tuo
+
+src/sql/table.tuo        tables as data; CREATE TABLE, indexes, drops
+src/sql/clause.tuo       expressions as text with deferred parameters; render
+src/sql/select.tuo       SELECT
+src/sql/write.tuo        INSERT, UPDATE, DELETE
+src/sql/migrate.tuo      Alembic's revision chain as a plan and as a script
+src/sql/fixture.tuo      117 statements compiled by SQLAlchemy and Alembic (generated)
+src/sql/demo.tuo         the same 117, built here
+src/sql/scram.tuo        SCRAM-SHA-256, the client's messages
+src/sql/url.tuo          postgresql+driver:// URLs
+src/sql/row.tuo          one_or_none, first, cells by name
+src/sql/session.tuo      login, execute with NULLs, nested transactions, migrate
+src/sql/pool.tuo         a connection pool: pre-ping, reset on return
+src/pg/, src/db/         tuonelang-db's PostgreSQL adapter, vendored
+examples/sql.tuo         the live oracle, against a throwaway PostgreSQL
+examples/sql_oracle.py   the SQLAlchemy statements the fixture is compiled from
+examples/sql-test/       server.sh: create, start, and delete the test cluster
 
 src/tls/handshake.tuo    the client's half of the handshake, as pure data; Trust
 src/tls/client.tuo       the session: handshake over a socket, bytes over records
