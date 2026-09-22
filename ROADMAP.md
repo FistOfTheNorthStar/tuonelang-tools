@@ -171,10 +171,13 @@ Be honest about these rather than half-porting them.
 5. ✅ **TLS 1.3** — the client, and the chain validation that makes it
    reach Stripe, R2, and Sentry.
 6. ◐ **Router + validation** — the request path is done — and ✅ the
-   **query layer**, so a route now has both its ends.
-7. **Next: the first real routes.** JWT bearer auth (HS256 is one HMAC
-   away), then the auth endpoints end to end: `web` in front, `argon2`
-   for the password, `sql` behind.
+   **query layer**. Tier 1 is complete; **next** is Tier 2, starting
+   with the S3 client, which R2 needs and which is pure SigV4 over the
+   HTTPS client.
+
+The application itself — shallowflaws's routers, services, and models —
+stays in Python and is **out of scope** here. It is the oracle these
+ports are pinned against, never the thing being ported.
 
 Tiers 2 and 3 fall out largely for free once 4 and 5 exist.
 
