@@ -136,7 +136,7 @@ Achievable on v0 as it stands, in rough order of value-per-effort.
 | **Redis client** — ✅ done | `redis` | RESP2 over TCP, spec'd against bytes a real server sent; the transport `tuolang-celery` lacked, which still models the broker in memory until its message envelope is written over this client. |
 | **Structured logging + Sentry** | `sentry-sdk` | Needs only JSON + HTTP. Error capture, breadcrumbs, envelope format. |
 | **JWT / JOSE** | (part of your auth) | HMAC-SHA256 already exists — HS256 is nearly free today. RS256 verification is `rsa::verify` now; signing waits on a constant-time bignum. |
-| **S3 client** | `boto3` | You only use Cloudflare R2. SigV4 signing is pure HMAC-SHA256 — already available. A tiny, targeted client beats all of boto3. |
+| **S3 client** — ✅ done | `boto3` | You only use Cloudflare R2. SigV4 signing is pure HMAC-SHA256 — already available. A tiny, targeted client beats all of boto3. Done 2026-09-22 as `s3`: the seven calls the backend makes, pinned to 22 requests captured from boto3 with a frozen clock, and a 35-check live oracle against MinIO. |
 | **Template engine** | `jinja2` + `markupsafe` | Parser + renderer; escaping is a correctness property that specs pin beautifully. |
 | **Config / env loading** | `pydantic-settings`, `python-dotenv` | Nearly trivial; `.env` parsing + typed struct binding. |
 | **CSV / XLSX reading** | `openpyxl` | XLSX is a zip of XML — needs a deflate decompressor first (worth having anyway). |
@@ -171,9 +171,9 @@ Be honest about these rather than half-porting them.
 5. ✅ **TLS 1.3** — the client, and the chain validation that makes it
    reach Stripe, R2, and Sentry.
 6. ◐ **Router + validation** — the request path is done — and ✅ the
-   **query layer**. Tier 1 is complete; **next** is Tier 2, starting
-   with the S3 client, which R2 needs and which is pure SigV4 over the
-   HTTPS client.
+   **query layer**. Tier 1 is complete.
+7. ✅ **S3 client** — the first of Tier 2. **Next:** structured logging
+   and the Sentry envelope, then JWT/JOSE, then the template engine.
 
 The application itself — shallowflaws's routers, services, and models —
 stays in Python and is **out of scope** here. It is the oracle these

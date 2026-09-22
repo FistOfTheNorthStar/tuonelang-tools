@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Eight ports so far:
+Nine ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -16,6 +16,7 @@ Eight ports so far:
 | **`tls`** — a TLS 1.3 client on the catalog's `std::tls`, and `https://` in the HTTP client | the `ssl` module | RFC 8448's trace reproduced from the client's side, a 12-check loopback oracle against `std::tls`, an 8-check interop oracle against three OpenSSL servers, and live `https://` to Stripe, Sentry, and Cloudflare |
 | **`x509`**, **`ec`**, **`rsa`** — certificate parsing, chain validation, a root store, ECDSA on P-256/P-384, RSA PKCS#1 v1.5 and PSS, SHA-384 | the `ssl` module's trust half (`certifi`, `cryptography`'s verifier) | 380 specs (RFC 6979 and a test PKI natively), a 27-check oracle over chains captured from Cloudflare, Sentry, and Stripe |
 | **`sql`** — a typed query builder, DDL, Alembic's revision chain, SCRAM login, nested transactions, a connection pool | `sqlalchemy` (Core), `alembic`, `asyncpg`'s login | 34 specs, 117 statements compiled by SQLAlchemy 2.0 and Alembic 1.20 rebuilt byte for byte, RFC 7677, and a 51-check live oracle against PostgreSQL 18 |
+| **`s3`** — SigV4 signing, the seven S3 calls the backend makes, presigned URLs, CRC-32 checksums | `boto3` (the R2 half) | 38 specs, 22 requests captured from boto3 1.43 reproduced byte for byte, and a 35-check live oracle against MinIO |
 | **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
 
 ```bash
@@ -25,7 +26,8 @@ Eight ports so far:
                         # complete TLS 1.3 handshakes with three openssl s_server instances,
                         # fetch https:// from Stripe, Sentry, and Cloudflare, and drive the
                         # Redis client against shallowflaws's docker compose redis on 6380,
-                        # and run the query layer against a throwaway PostgreSQL
+                        # and the S3 client against its MinIO on 9000, and run the
+                        # query layer against a throwaway PostgreSQL
 ```
 
 Every port is pure tuonelang over the v0 core, with the catalog modules
@@ -334,6 +336,102 @@ CAs; adding one is one base64 line. And the catalog's own caveat carries
 over: `std::bignum` is variable-time, so the client's X25519 step leaks
 timing on its ephemeral key. Signature *verification* is variable-time
 by design, and there is no signing function in `ec` or `rsa` at all.
+
+---
+
+## `s3` — the R2 half of boto3
+
+The backend keeps uploads and extraction results in Cloudflare R2 and,
+in development, in a local MinIO — both speak S3. Of boto3's thousands
+of operations it calls seven: `put_object`, `get_object`, `head_object`,
+`delete_object`, `list_objects_v2` behind a paginator, `delete_objects`,
+and `generate_presigned_url` for a download and an upload. This port is
+those seven, on the crate's own HTTP and HTTPS clients, with every byte
+boto3 would send — the SigV4 signature included — reproduced from a
+capture of boto3 itself.
+
+```tuo
+let target = s3::request::target(endpoint, access_key, secret_key, "auto", bucket);
+let c = s3::client::new(target, 10000);
+let stored = s3::client::put(c, "extraction/7/result.csv", csv, "text/csv");
+let url = s3::client::presigned_get(c, "extraction/7/result.csv", "text/csv", "attachment; filename=\"result.csv\"", 900);
+let keys = s3::client::list(c, "extraction/7/docs/", 1000, pages);
+let swept = s3::client::delete_many(c, keys);
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `s3::crc32` — CRC-32, as `x-amz-checksum-crc32` carries it | ✅ proven |
+| `s3::sigv4` — canonical request, string to sign, signing key, `Authorization`, presigned queries | ✅ proven against boto3's signatures |
+| `s3::request` — the seven calls as bytes, `aws-chunked` and whole-body uploads, `create_bucket`/`delete_bucket` for tests | ✅ 22 of 22 captured requests reproduced |
+| `s3::xml` — listings, batch-delete results, errors | ✅ proven |
+| `s3::client` — the calls on the wire, the clock from SNTP, errors as `Code` and `Message` | ✅ 35 live checks against MinIO |
+
+### The oracle is boto3 itself
+
+`examples/s3_oracle.py` builds the backend's client exactly as
+`get_r2_client` does — `s3v4`, path-style addressing, region `auto` — in
+`shallowflaws`'s virtualenv (boto3 1.43.98), freezes botocore's clock,
+uses the AWS documentation's example credentials, and makes each call
+against an R2-shaped HTTPS endpoint and the docker compose MinIO over
+HTTP. A `before-send` hook records what would have left the process:
+method, URL, headers, body. `src/s3/fixture.tuo` is the recording;
+`s3::demo` makes the same calls through `s3::request` and one spec holds
+URL, headers, and body to byte equality.
+
+```bash
+../shallowflaws/.venv/bin/python examples/s3_oracle.py   # writes examples/s3_oracle.json
+python3 examples/s3_fixture.py && tuo fmt src/s3/fixture.tuo
+```
+
+### What the specs pin that a comment cannot
+
+**The signature is over exactly these bytes.** Path encoded once
+(`logo one.png` is `logo%20one.png`), query values encoded
+(`extraction%2F7%2Fdocs%2F`), pairs sorted by name for signing but sent in
+the order boto3 adds them, headers lowercased and sorted with `host`
+among them, and the credential scope `20260922/auto/s3/aws4_request`. A
+presigned URL is the same signature with the `X-Amz-*` parameters in the
+query, `UNSIGNED-PAYLOAD` as the digest, and the signed headers reduced
+to `host` — or `content-type;host` for an upload, which is why the
+uploader must send the content type it was signed with.
+
+**Uploads differ by scheme.** Over HTTPS boto3 sends `aws-chunked`: one
+chunk, a zero chunk, the CRC-32 as a trailer, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`
+as the digest, no `Content-Length`. Over HTTP it sends the body whole,
+the CRC-32 in a header, and the body's SHA-256 signed. Both are
+reproduced; the client sends the whole-body form on either scheme
+(see below).
+
+**The empty body has a checksum too**: `AAAAAA==`, and `Content-Length: 0`
+on a PUT or DELETE but not on a GET. `?delete` is sent bare, signed as
+`delete=`.
+
+**Listings are decoded as botocore decodes them.** The request asks for
+`encoding-type=url`, so `b & c+d.pdf` comes back as `b+%26+c%2Bd.pdf`;
+`+` is a space, then `%XX`.
+
+### The live oracle
+
+`examples/s3.tuo` runs against the MinIO that `shallowflaws/docker` starts,
+in a bucket it creates and deletes: the seven calls, a listing of three
+keys paged two at a time by continuation token, a presigned download
+fetched by a plain `http::client::get` with the response headers it asked
+for honoured, a presigned upload accepted with the signed content type
+and refused with another, a wrong CRC-32 refused under
+`UNSIGNED-PAYLOAD`, a wrong signature and a wrong secret refused, and a
+batch delete of everything under a prefix.
+
+### What is deliberately not here
+
+The client sends every upload whole, never `aws-chunked`: the HTTP
+client frames a body by `Content-Length`, and S3, R2, and MinIO all take
+the whole-body form. Not modelled: multipart uploads, copy, versioning,
+bucket policies, `list_objects` v1, virtual-host addressing, retries,
+and the SES half of boto3 (`send_email`), which is a different service
+signed the same way.
 
 ---
 
@@ -659,7 +757,13 @@ HTTP/2, no `Expect: 100-continue`, no compression, no `Upgrade`. The
 `http::server`'s handler, which receives the raw request and returns the
 raw response.
 
-### A compiler finding, since fixed
+### Compiler findings
+
+One since fixed, one open (`docs/COMPILER-FINDING-3.md`: a `Str` borrowed
+from an array element and returned dangles in native code while the
+interpreter reads it correctly — never return such a borrow).
+
+#### The first, since fixed
 
 Writing the loopback oracle surfaced a code-generation refusal: a
 temporary owned value in the right operand of `&&` or `||` failed MIR
@@ -805,6 +909,17 @@ src/web/demo.tuo         the oracle's FastAPI app, reimplemented
 examples/web.tuo         the socket oracle: web::demo behind http::server
 examples/web_oracle.py   the FastAPI app and requests the fixture was captured from
 examples/web_fixture.py  oracle.json to src/web/fixture.tuo
+
+src/s3/crc32.tuo         CRC-32, base64
+src/s3/sigv4.tuo         AWS Signature Version 4: headers and presigned queries
+src/s3/request.tuo       the seven calls as bytes; aws-chunked and whole-body uploads
+src/s3/fixture.tuo       22 requests captured from boto3 (generated)
+src/s3/demo.tuo          the same 22, built here
+src/s3/xml.tuo           listings, delete results, errors
+src/s3/client.tuo        the effect boundary: send, read, the SNTP clock
+examples/s3.tuo          the live oracle (needs the docker compose MinIO on 9000)
+examples/s3_oracle.py    boto3 with a frozen clock, recording what it sends
+examples/s3_fixture.py   s3_oracle.json to src/s3/fixture.tuo
 
 src/sql/table.tuo        tables as data; CREATE TABLE, indexes, drops
 src/sql/clause.tuo       expressions as text with deferred parameters; render
