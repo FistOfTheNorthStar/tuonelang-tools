@@ -1,0 +1,124 @@
+// sentry::demo — the oracle's sequence, replayed.
+//
+// `examples/sentry_oracle.py` makes a fixed sequence of calls against
+// sentry-sdk 2.69 — messages, logged records, a logged exception, a
+// captured one, tags and a user set along the way — and keeps the seven
+// envelopes it serialized. `envelopes` makes the same calls through
+// `sentry::*` and `log::*`, and the spec holds each envelope to byte
+// equality.
+
+module sentry::demo;
+
+fn dsn() -> sentry::dsn::Dsn {
+    sentry::dsn::parse("https://abcdef0123456789abcdef0123456789@o123456.ingest.de.sentry.io/4507000000000000")
+}
+
+fn moment() -> Str {
+    "2026-09-22T08:30:00.123456Z"
+}
+
+fn asctime() -> Str {
+    "2026-09-22 08:30:00,123"
+}
+
+fn stamp_of(take k: Int) -> sentry::event::Stamp {
+    var id = std::string::from_str("0");
+    std::str::push_int(id, k);
+    std::string::append(id, "23456789abcdef0123456789abcdef");
+    sentry::event::stamp(std::string::as_str(id), "b8d6951380264e93b77bccfe8164cca5", "9a99b3dbf38b91a0", moment())
+}
+
+fn envelope_of(in s: sentry::scope::Scope, take k: Int, in payload: String) -> String {
+    sentry::envelope::serialize(dsn(), s, stamp_of(k), "2026-09-22T08:30:01.000000Z", std::string::as_str(payload))
+}
+
+fn record(in name: Str, take level: Int, in template: Str) -> log::record::Record {
+    log::record::new(name, level, template, 1790065800123)
+}
+
+/// The seven envelopes, in the oracle's order.
+///
+/// # Example
+/// ```tuo
+/// let all = sentry::demo::envelopes();
+/// ```
+pub fn envelopes() -> Array[String] {
+    var out = std::array::empty();
+    var s = sentry::scope::new("production", "shallowflaws@2026.09.22", "cloud");
+    let mail = "app.services.email";
+    let tasks = "app.tasks.extraction_tasks";
+
+    std::array::push(out, envelope_of(s, 0, sentry::event::message(s, "Worker started", "info", stamp_of(0))));
+
+    var sent = record(mail, log::record::info(), "[SES] Email sent to %s, MessageId: %s");
+    log::record::text(sent, "a@b.co");
+    log::record::text(sent, "0100019");
+    sentry::scope::note(s, sent, moment(), asctime());
+    sentry::scope::note(s, record(mail, log::record::debug(), "not a breadcrumb: below the root level"), moment(), asctime());
+    var retry = record(tasks, log::record::warning(), "retrying job %d after %s");
+    log::record::int(retry, 7);
+    log::record::text(retry, "timeout");
+    sentry::scope::note(s, retry, moment(), asctime());
+    sentry::scope::set_tag(s, "job_id", "7");
+    std::array::push(out, envelope_of(s, 1, sentry::event::message(s, "Extraction finished", "info", stamp_of(1))));
+
+    sentry::scope::add_breadcrumb(s, "auth", "login", "info", "{\"user_id\":42}", moment());
+    var frames = sentry::event::no_frames();
+    sentry::event::push_frame(frames, "sentry_oracle.py", "<module>", "__main__", 68);
+    let failed = record(tasks, log::record::error(), "Extraction failed");
+    std::array::push(out, envelope_of(s, 2, sentry::event::logged(s, failed, "KeyError", "'missing'", frames, stamp_of(2))));
+    sentry::scope::note(s, failed, moment(), asctime());
+
+    sentry::scope::set_user(s, "42");
+    std::array::push(out, envelope_of(s, 3, sentry::event::error(s, "ValueError", "bad input", sentry::event::no_frames(), stamp_of(3))));
+
+    var gave_up = record(tasks, log::record::error(), "worker gave up after %d attempts");
+    log::record::int(gave_up, 3);
+    std::array::push(out, envelope_of(s, 4, sentry::event::logged(s, gave_up, "", "", sentry::event::no_frames(), stamp_of(4))));
+    sentry::scope::note(s, gave_up, moment(), asctime());
+
+    std::array::push(out, envelope_of(s, 5, sentry::event::message(s, "Quota nearly exhausted", "warning", stamp_of(5))));
+
+    var memory = record(tasks, log::record::critical(), "out of %s");
+    log::record::text(memory, "memory");
+    std::array::push(out, envelope_of(s, 6, sentry::event::logged(s, memory, "", "", sentry::event::no_frames(), stamp_of(6))));
+    out
+}
+
+/// Does envelope `i` match the SDK's?
+///
+/// # Example
+/// ```tuo
+/// let same = sentry::demo::agrees(0);
+/// ```
+pub fn agrees(take i: Int) -> Bool {
+    let all = envelopes();
+    if i >= std::array::len(all) {
+        return false;
+    }
+    std::string::as_str(std::array::get(all, i)) == sentry::fixture::envelope(i)
+}
+
+/// The first envelope in `[from, to)` that differs, or -1.
+///
+/// # Example
+/// ```tuo
+/// let bad = sentry::demo::first_disagreement(0, 7);
+/// ```
+pub fn first_disagreement(take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to {
+        if !agrees(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+spec "every envelope is what sentry-sdk serialized" {
+    then sentry::fixture::count() == 7;
+    then std::array::len(envelopes()) == 7;
+    then first_disagreement(0, 7) == -1;
+    then std::string::as_str(sentry::dsn::auth_header(dsn(), "sentry.python/2.69.2")) == sentry::fixture::auth();
+}

@@ -1,0 +1,177 @@
+// examples/sentry — the loopback oracle for the Sentry client and the logger.
+//
+// The envelopes are pinned to sentry-sdk's bytes by specs. What specs
+// cannot show is the transport: that `sentry::client` posts an envelope
+// whose declared length is its payload's, with the auth header and
+// content type Sentry's ingest checks, with ids and a clock of its own,
+// and that the logging integration turns records into breadcrumbs and
+// errors into events on the way. This program is a Sentry-shaped
+// receiver behind `http::server` on a loopback port — it checks each
+// envelope and answers `{"id": …}` for a good one and 400 for a bad one
+// — and a client that logs and captures against it, over a DSN that
+// names the port.
+//
+//     tuo run examples/sentry.tuo <the SENTRY_SRC list in run-tests.sh>
+//
+// The clock is SNTP's, so it needs UDP to the internet. It prints one
+// line per check and exits with the number that failed.
+
+module sentry_check;
+
+fn timeout() -> Int {
+    10000
+}
+
+fn say(in text: Str) -> Int {
+    var line = std::string::from_str(text);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    0
+}
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    let _ = say(std::string::as_str(line));
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn expected_auth() -> String {
+    sentry::dsn::auth_header(sentry::dsn::parse("http://abcdef0123456789abcdef0123456789@127.0.0.1:1/4507000000000000"), sentry::dsn::client_name())
+}
+
+// The receiver: what Sentry's ingest checks before it accepts an
+// envelope, answered as Sentry answers.
+fn receive(in raw: String) -> String {
+    let req = web::request::parse(std::string::as_str(raw));
+    if !req.ok || std::string::as_str(req.method) != "POST" {
+        return web::response::detail(405, "expected a POST");
+    }
+    if std::string::as_str(req.path) != "/api/4507000000000000/envelope/" {
+        return web::response::detail(404, "unknown project");
+    }
+    if std::string::as_str(web::request::header(req, "X-Sentry-Auth")) != std::string::as_str(expected_auth()) {
+        return web::response::detail(401, "bad auth");
+    }
+    if std::string::as_str(web::request::header(req, "Content-Type")) != "application/x-sentry-envelope" {
+        return web::response::detail(400, "bad content type");
+    }
+    let body = std::string::as_str(req.body);
+    let declared = sentry::envelope::declared_length(body);
+    // header line, item line, payload, newline
+    let lines = std::str::split(body, "\n");
+    if std::array::len(lines) != 4 || declared < 0 {
+        return web::response::detail(400, "malformed envelope");
+    }
+    let payload = std::string::as_str(std::array::get(lines, 2));
+    if std::str::len(payload) != declared || std::str::len(std::string::as_str(std::array::get(lines, 3))) != 0 {
+        return web::response::detail(400, "length does not match");
+    }
+    let head = web::json::parse(std::string::as_str(std::array::get(lines, 0)));
+    let event = web::json::parse(payload);
+    if !head.ok || !event.ok {
+        return web::response::detail(400, "not JSON");
+    }
+    let id_node = web::json::member(head, web::json::root(head), "event_id");
+    let same_id = web::json::member(event, web::json::root(event), "event_id");
+    if id_node < 0 || same_id < 0 || std::string::as_str(web::json::text_of(head, id_node)) != std::string::as_str(web::json::text_of(event, same_id)) {
+        return web::response::detail(400, "event ids differ");
+    }
+    if web::json::member(event, web::json::root(event), "timestamp") < 0 || web::json::member(event, web::json::root(event), "breadcrumbs") < 0 {
+        return web::response::detail(400, "missing members");
+    }
+    var answer = std::string::from_str("{\"id\":");
+    web::json::push_string(answer, std::string::as_str(web::json::text_of(head, id_node)));
+    std::string::push_byte(answer, 125);
+    web::response::json(200, std::string::as_str(answer))
+}
+
+fn server_role(take listener: Int) -> Int {
+    http::server::serve(listener, receive, 4, timeout())
+}
+
+fn client_role(take port: Int) -> Int {
+    var failed = 0;
+    var dsn = std::string::from_str("http://abcdef0123456789abcdef0123456789@127.0.0.1:");
+    std::str::push_int(dsn, port);
+    std::string::append(dsn, "/4507000000000000");
+    var c = sentry::client::new(std::string::as_str(dsn), "production", "shallowflaws@2026.09.22", "cloud", timeout());
+    failed = failed + report("client: the DSN names the loopback receiver", sentry::client::is_ok(c));
+    let now = sentry::client::now_iso(c);
+    failed = failed + report("clock: SNTP gave a timestamp", std::string::len(now) == 27);
+
+    let cfg = log::logger::production();
+    var journal = log::logger::journal();
+    let unix_ms = tls::clock::now_unix(tls::clock::default_server(), timeout()) * 1000;
+
+    var sent = log::record::new("app.services.email", log::record::info(), "[SES] Email sent to %s", unix_ms);
+    log::record::text(sent, "a@b.co");
+    log::logger::keep(cfg, journal, sent);
+    let quiet = sentry::client::record(c, sent, "", "", sentry::event::no_frames());
+    failed = failed + report("logging: an INFO record is a breadcrumb, not an event", sentry::client::status(quiet) == 0 && std::string::len(sentry::client::event_id(quiet)) == 0);
+    failed = failed + report("logging: the production line is valid JSON with the four fields", log::logger::count(journal) == 1 && web::json::parse(std::string::as_str(log::logger::line(journal, 0))).ok && std::str::contains(std::string::as_str(log::logger::line(journal, 0)), "\"message\":\"[SES] Email sent to a@b.co\"}"));
+
+    sentry::client::set_tag(c, "job_id", "7");
+    let first = sentry::client::capture_message(c, "Extraction finished", "info");
+    failed = failed + report("capture_message: the receiver accepted the envelope", sentry::client::status(first) == 200);
+    failed = failed + report("capture_message: the event id is a version-4 UUID", std::string::len(sentry::client::event_id(first)) == 32 && std::string::byte_at(sentry::client::event_id(first), 12) == 52);
+
+    var gave_up = log::record::new("app.tasks.extraction_tasks", log::record::error(), "worker gave up after %d attempts", unix_ms);
+    log::record::int(gave_up, 3);
+    log::logger::keep(cfg, journal, gave_up);
+    let logged = sentry::client::record(c, gave_up, "", "", sentry::event::no_frames());
+    failed = failed + report("logging: an ERROR record is an event, accepted", sentry::client::status(logged) == 200);
+
+    var frames = sentry::event::no_frames();
+    sentry::event::push_frame(frames, "extraction.tuo", "run_job", "tasks::extraction", 66);
+    sentry::client::set_user(c, "42");
+    let error = sentry::client::capture_error(c, "ValueError", "bad input", frames);
+    failed = failed + report("capture_exception: accepted with a frame, a user, and three breadcrumbs", sentry::client::status(error) == 200);
+    failed = failed + report("ids: every event got its own", std::string::as_str(sentry::client::event_id(first)) != std::string::as_str(sentry::client::event_id(error)));
+
+    // A client with no usable DSN never sends and never fails loudly.
+    let off = sentry::client::new("", "production", "", "", timeout());
+    let nothing = sentry::client::capture_message(off, "unheard", "info");
+    failed = failed + report("no DSN: a capture is a no-op with status 0", !sentry::client::is_ok(off) && sentry::client::status(nothing) == 0);
+
+    // The receiver refuses what Sentry would refuse.
+    var wrong = std::string::from_str("http://not-the-key@127.0.0.1:");
+    std::str::push_int(wrong, port);
+    std::string::append(wrong, "/4507000000000000");
+    let impostor = sentry::client::new(std::string::as_str(wrong), "production", "", "", timeout());
+    failed = failed + report("auth: a wrong key is refused by the receiver", sentry::client::status(sentry::client::capture_message(impostor, "x", "info")) == 401);
+    failed
+}
+
+fn role(take task: Int) -> Int {
+    if task >= 100000 {
+        client_role(task - 100000)
+    } else {
+        server_role(task)
+    }
+}
+
+fn main() -> Int {
+    let listener = std::net::listen(0);
+    if listener < 0 {
+        return report("listen on an ephemeral port", false);
+    }
+    let port = std::net::bound_port(listener);
+    var tasks = std::array::empty();
+    std::array::push(tasks, listener);
+    std::array::push(tasks, port + 100000);
+    let results = std::sync::par_map(role, tasks, 2);
+    let _ = std::net::close(listener);
+    var failed = std::array::get(results, 1);
+    failed = failed + report("the receiver answered four envelopes: three accepted, one refused", std::array::get(results, 0) == 4);
+    failed
+}

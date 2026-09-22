@@ -1,0 +1,149 @@
+// log::logger — the threshold, and where lines go.
+//
+// `basicConfig(level=…)` sets one threshold on the root logger, and every
+// module's logger inherits it; a record below it is dropped before it
+// is formatted. `Config` is that threshold and the choice of format.
+// `emit` writes the line and a newline to a descriptor — `basicConfig`'s
+// handler writes to stderr — and `Journal` keeps lines in memory for a
+// program that wants to look at them, or for a test.
+
+module log::logger;
+
+/// The root logger's configuration.
+pub struct Config {
+    level: Int,
+    development: Bool,
+}
+
+/// `basicConfig(level=DEBUG, format=<the development format>)`.
+///
+/// # Example
+/// ```tuo
+/// let cfg = log::logger::development();
+/// ```
+pub fn development() -> Config {
+    Config { level: log::record::debug(), development: true }
+}
+
+/// `basicConfig(level=INFO, format=<the JSON format>)`.
+///
+/// # Example
+/// ```tuo
+/// let cfg = log::logger::production();
+/// ```
+pub fn production() -> Config {
+    Config { level: log::record::info(), development: false }
+}
+
+/// A configuration with a chosen threshold and format.
+///
+/// # Example
+/// ```tuo
+/// let cfg = log::logger::configured(log::record::warning(), false);
+/// ```
+pub fn configured(take level: Int, take development_format: Bool) -> Config {
+    Config { level: level, development: development_format }
+}
+
+/// `logger.isEnabledFor(level)`.
+///
+/// # Example
+/// ```tuo
+/// if log::logger::enabled(cfg, log::record::debug()) { /* … */ }
+/// ```
+pub fn enabled(in cfg: Config, take level: Int) -> Bool {
+    level >= cfg.level
+}
+
+/// The line a record becomes under this configuration.
+///
+/// # Example
+/// ```tuo
+/// let line = log::logger::render(cfg, r);
+/// ```
+pub fn render(in cfg: Config, in r: log::record::Record) -> String {
+    if cfg.development {
+        log::format::development(r)
+    } else {
+        log::format::production(r)
+    }
+}
+
+/// EFFECT: write a record's line and a newline to `fd` (2 for stderr),
+/// if the level passes. Returns whether it was written.
+///
+/// # Example
+/// ```tuo
+/// let _ = log::logger::emit(cfg, 2, r);
+/// ```
+pub fn emit(in cfg: Config, take fd: Int, in r: log::record::Record) -> Bool {
+    if !enabled(cfg, log::record::level(r)) {
+        return false;
+    }
+    var line = render(cfg, r);
+    std::string::push_byte(line, 10);
+    std::rt::write_string(fd, line) >= 0
+}
+
+/// Lines kept in memory.
+pub struct Journal {
+    lines: Array[String],
+}
+
+/// An empty journal.
+///
+/// # Example
+/// ```tuo
+/// var j = log::logger::journal();
+/// ```
+pub fn journal() -> Journal {
+    Journal { lines: std::array::empty() }
+}
+
+/// Keep a record's line, if the level passes.
+///
+/// # Example
+/// ```tuo
+/// log::logger::keep(cfg, j, r);
+/// ```
+pub fn keep(in cfg: Config, mut j: Journal, in r: log::record::Record) {
+    if enabled(cfg, log::record::level(r)) {
+        std::array::push(j.lines, render(cfg, r));
+    }
+}
+
+/// How many lines the journal holds.
+///
+/// # Example
+/// ```tuo
+/// let n = log::logger::count(j);
+/// ```
+pub fn count(in j: Journal) -> Int {
+    std::array::len(j.lines)
+}
+
+/// Line `i` of the journal.
+///
+/// # Example
+/// ```tuo
+/// let line = log::logger::line(j, 0);
+/// ```
+pub fn line(in j: Journal, take i: Int) -> String {
+    std::string::from_str(std::string::as_str(std::array::get(j.lines, i)))
+}
+
+fn two_records() -> Journal {
+    var j = journal();
+    let cfg = production();
+    keep(cfg, j, log::record::new("app", log::record::debug(), "dropped", 0));
+    keep(cfg, j, log::record::new("app", log::record::info(), "kept", 0));
+    j
+}
+
+spec enabled {
+    then enabled(production(), log::record::info());
+    then !enabled(production(), log::record::debug());
+    then enabled(development(), log::record::debug());
+    then count(two_records()) == 1;
+    then std::string::as_str(line(two_records(), 0)) == "{\"time\":\"1970-01-01 00:00:00,000\",\"name\":\"app\",\"level\":\"INFO\",\"message\":\"kept\"}";
+}

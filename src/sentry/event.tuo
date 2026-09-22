@@ -1,0 +1,215 @@
+// sentry::event — the event JSON, in the SDK's shape.
+//
+// Three kinds of event leave the backend: a `capture_message`, a
+// `capture_exception`, and what the logging integration makes of a
+// record at ERROR or above — an event with `logger` and `logentry`
+// (template, formatted text, parameters), and an `exception` when the
+// record carried one (`logger.exception`). Each is a function here from
+// the scope and its inputs to the payload bytes, with members in the
+// order sentry-sdk 2.69 writes them, which `sentry::demo` holds against
+// the SDK's own output.
+//
+// The `contexts.trace` block carries the trace and span ids of the
+// current transaction; without tracing (the backend samples 20 %, this
+// port none) they identify the request the event belongs to and nothing
+// more. A stack trace is what the caller can say about its own frames:
+// there is no runtime reflection to read one.
+
+module sentry::event;
+
+/// The identifiers an event carries: its own id, the trace it belongs
+/// to, the span, and when it happened.
+pub struct Stamp {
+    event_id: String,
+    trace_id: String,
+    span_id: String,
+    timestamp: String,
+}
+
+/// A stamp from its parts.
+///
+/// # Example
+/// ```tuo
+/// let st = sentry::event::stamp(event_id, trace_id, span_id, "2026-09-22T08:30:00.123456Z");
+/// ```
+pub fn stamp(in event_id: Str, in trace_id: Str, in span_id: Str, in timestamp: Str) -> Stamp {
+    Stamp { event_id: std::string::from_str(event_id), trace_id: std::string::from_str(trace_id), span_id: std::string::from_str(span_id), timestamp: std::string::from_str(timestamp) }
+}
+
+/// The event id of a stamp.
+///
+/// # Example
+/// ```tuo
+/// let id = sentry::event::event_id(st);
+/// ```
+pub fn event_id(in st: Stamp) -> String {
+    std::string::from_str(std::string::as_str(st.event_id))
+}
+
+/// The trace id of a stamp.
+///
+/// # Example
+/// ```tuo
+/// let id = sentry::event::trace_id(st);
+/// ```
+pub fn trace_id(in st: Stamp) -> String {
+    std::string::from_str(std::string::as_str(st.trace_id))
+}
+
+/// Stack frames, innermost last, as `stacktrace.frames` wants them.
+pub struct Frames {
+    filenames: Array[String],
+    functions: Array[String],
+    modules: Array[String],
+    lines: Array[Int],
+}
+
+/// No frames.
+///
+/// # Example
+/// ```tuo
+/// var f = sentry::event::no_frames();
+/// ```
+pub fn no_frames() -> Frames {
+    Frames { filenames: std::array::empty(), functions: std::array::empty(), modules: std::array::empty(), lines: std::array::empty() }
+}
+
+/// Add a frame: file, function, module, line.
+///
+/// # Example
+/// ```tuo
+/// sentry::event::push_frame(f, "extraction.tuo", "run_job", "app::tasks", 66);
+/// ```
+pub fn push_frame(mut f: Frames, in filename: Str, in func_name: Str, in module_name: Str, take line: Int) {
+    std::array::push(f.filenames, std::string::from_str(filename));
+    std::array::push(f.functions, std::string::from_str(func_name));
+    std::array::push(f.modules, std::string::from_str(module_name));
+    std::array::push(f.lines, line);
+}
+
+// The members every event ends with: event_id, timestamp, contexts,
+// user, transaction_info, tags, breadcrumbs, release, environment,
+// server_name.
+fn push_tail(mut out: String, in s: sentry::scope::Scope, in st: Stamp) {
+    web::json::push_key(out, "event_id");
+    web::json::push_string(out, std::string::as_str(st.event_id));
+    web::json::push_key(out, "timestamp");
+    web::json::push_string(out, std::string::as_str(st.timestamp));
+    web::json::push_key(out, "contexts");
+    std::string::append(out, "{\"trace\":{");
+    web::json::push_key(out, "trace_id");
+    web::json::push_string(out, std::string::as_str(st.trace_id));
+    web::json::push_key(out, "span_id");
+    web::json::push_string(out, std::string::as_str(st.span_id));
+    std::string::append(out, ",\"parent_span_id\":null}}");
+    sentry::scope::push_user(out, s);
+    web::json::push_key(out, "transaction_info");
+    std::string::append(out, "{}");
+    sentry::scope::push_tags(out, s);
+    sentry::scope::push_breadcrumbs(out, s);
+    sentry::scope::push_origin(out, s);
+    std::string::push_byte(out, 125);
+}
+
+/// `capture_message(message, level=…)`.
+///
+/// # Example
+/// ```tuo
+/// let json = sentry::event::message(scope, "Extraction finished", "info", st);
+/// ```
+pub fn message(in s: sentry::scope::Scope, in text: Str, in level: Str, in st: Stamp) -> String {
+    var out = std::string::from_str("{");
+    web::json::push_key(out, "message");
+    web::json::push_string(out, text);
+    web::json::push_key(out, "level");
+    web::json::push_string(out, level);
+    push_tail(out, s, st);
+    out
+}
+
+fn push_exception(mut out: String, in kind: Str, in value: Str, in mechanism: Str, in frames: Frames) {
+    web::json::push_key(out, "exception");
+    std::string::append(out, "{\"values\":[{\"mechanism\":{");
+    web::json::push_key(out, "type");
+    web::json::push_string(out, mechanism);
+    std::string::append(out, ",\"handled\":true},\"module\":null");
+    web::json::push_key(out, "type");
+    web::json::push_string(out, kind);
+    web::json::push_key(out, "value");
+    web::json::push_string(out, value);
+    if std::array::len(frames.filenames) > 0 {
+        std::string::append(out, ",\"stacktrace\":{\"frames\":[");
+        var i = 0;
+        while i < std::array::len(frames.filenames) {
+            if i > 0 {
+                std::string::push_byte(out, 44);
+            }
+            std::string::push_byte(out, 123);
+            web::json::push_key(out, "filename");
+            web::json::push_string(out, std::string::as_str(std::array::get(frames.filenames, i)));
+            web::json::push_key(out, "function");
+            web::json::push_string(out, std::string::as_str(std::array::get(frames.functions, i)));
+            web::json::push_key(out, "module");
+            web::json::push_string(out, std::string::as_str(std::array::get(frames.modules, i)));
+            web::json::push_key(out, "lineno");
+            web::json::push_int(out, std::array::get(frames.lines, i));
+            std::string::append(out, ",\"in_app\":true}");
+            i = i + 1;
+        }
+        std::string::append(out, "]}");
+    }
+    std::string::append(out, "}]}");
+}
+
+/// `capture_exception(error)`: `kind` is the error's type name, `value`
+/// its text.
+///
+/// # Example
+/// ```tuo
+/// let json = sentry::event::error(scope, "ValueError", "bad input", frames, st);
+/// ```
+pub fn error(in s: sentry::scope::Scope, in kind: Str, in value: Str, in frames: Frames, in st: Stamp) -> String {
+    var out = std::string::from_str("{\"level\":\"error\"");
+    push_exception(out, kind, value, "generic", frames);
+    push_tail(out, s, st);
+    out
+}
+
+/// The logging integration's event for a record at ERROR or above, with
+/// or without an exception (`kind` empty for none) — `logger.exception`
+/// and `logger.error`.
+///
+/// # Example
+/// ```tuo
+/// let json = sentry::event::logged(scope, r, "KeyError", "'missing'", frames, st);
+/// ```
+pub fn logged(in s: sentry::scope::Scope, in r: log::record::Record, in kind: Str, in value: Str, in frames: Frames, in st: Stamp) -> String {
+    var out = std::string::from_str("{");
+    web::json::push_key(out, "level");
+    web::json::push_string(out, sentry::scope::level_name(log::record::level(r)));
+    if std::str::len(kind) > 0 {
+        push_exception(out, kind, value, "logging", frames);
+    }
+    web::json::push_key(out, "logger");
+    web::json::push_string(out, std::string::as_str(log::record::name(r)));
+    web::json::push_key(out, "logentry");
+    std::string::push_byte(out, 123);
+    web::json::push_key(out, "message");
+    web::json::push_string(out, std::string::as_str(log::record::template(r)));
+    web::json::push_key(out, "formatted");
+    web::json::push_string(out, std::string::as_str(log::record::message(r)));
+    web::json::push_key(out, "params");
+    std::string::append(out, std::string::as_str(log::record::params_json(r)));
+    std::string::push_byte(out, 125);
+    push_tail(out, s, st);
+    out
+}
+
+fn bare() -> String {
+    message(sentry::scope::new("production", "r", "cloud"), "bare", "info", stamp("e", "t", "sp", "now"))
+}
+
+spec message {
+    then std::string::as_str(bare()) == "{\"message\":\"bare\",\"level\":\"info\",\"event_id\":\"e\",\"timestamp\":\"now\",\"contexts\":{\"trace\":{\"trace_id\":\"t\",\"span_id\":\"sp\",\"parent_span_id\":null}},\"transaction_info\":{},\"breadcrumbs\":{\"values\":[]},\"release\":\"r\",\"environment\":\"production\",\"server_name\":\"cloud\"}";
+    then web::json::parse(std::string::as_str(bare())).ok;
+}
