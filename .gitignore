@@ -1,2 +1,3 @@
 target/
 examples/oracle.json
+examples/s3_oracle.json

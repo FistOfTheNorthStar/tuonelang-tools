@@ -1,0 +1,329 @@
+// s3::client — the effect boundary: a request on the wire, a reply read.
+//
+// `s3::request` decides every byte; this module moves them, through the
+// same HTTP client the rest of the crate uses (`http://` to a local
+// MinIO, `https://` to R2 with the chain validated against the root
+// store), and reads what comes back into an `Outcome`: the status, the
+// body, and — when S3 refused — the `Code` and `Message` of its XML
+// error. The clock is SNTP's (`tls::clock`), since a signature carries
+// the time and S3 rejects one more than fifteen minutes off.
+//
+// Uploads are sent whole (`put_object_plain`), never `aws-chunked`: the
+// HTTP client frames a body by `Content-Length`. S3, R2, and MinIO all
+// accept that form, and it is what boto3 itself sends over plain HTTP.
+
+module s3::client;
+
+/// A configured client.
+pub struct Client {
+    target: s3::request::Target,
+    resolver: String,
+    clock_server: String,
+    timeout_ms: Int,
+}
+
+/// What a call answered.
+pub struct Outcome {
+    ok: Bool,
+    status: Int,
+    body: String,
+    code: String,
+    message: String,
+}
+
+/// A client for a target, with the crate's default resolver and clock.
+///
+/// # Example
+/// ```tuo
+/// let c = s3::client::new(target, 10000);
+/// ```
+pub fn new(take target: s3::request::Target, take timeout_ms: Int) -> Client {
+    Client { target: target, resolver: std::string::from_str(http::client::default_resolver()), clock_server: std::string::from_str(tls::clock::default_server()), timeout_ms: timeout_ms }
+}
+
+/// Was the call answered with success (2xx)?
+///
+/// # Example
+/// ```tuo
+/// let fine = s3::client::is_ok(o);
+/// ```
+pub fn is_ok(in o: Outcome) -> Bool {
+    o.ok
+}
+
+/// The HTTP status, or 0 when no response arrived.
+///
+/// # Example
+/// ```tuo
+/// let code = s3::client::status(o);
+/// ```
+pub fn status(in o: Outcome) -> Int {
+    o.status
+}
+
+/// The response body: the object for `get`, XML otherwise.
+///
+/// # Example
+/// ```tuo
+/// let data = s3::client::body(o);
+/// ```
+pub fn body(in o: Outcome) -> String {
+    std::string::from_str(std::string::as_str(o.body))
+}
+
+/// S3's error code (`NoSuchKey`, `SignatureDoesNotMatch`), or empty.
+///
+/// # Example
+/// ```tuo
+/// let why = s3::client::code(o);
+/// ```
+pub fn code(in o: Outcome) -> String {
+    std::string::from_str(std::string::as_str(o.code))
+}
+
+/// S3's error message, or empty.
+///
+/// # Example
+/// ```tuo
+/// let text = s3::client::message(o);
+/// ```
+pub fn message(in o: Outcome) -> String {
+    std::string::from_str(std::string::as_str(o.message))
+}
+
+fn unanswered(in why: Str) -> Outcome {
+    Outcome { ok: false, status: 0, body: std::string::empty(), code: std::string::empty(), message: std::string::from_str(why) }
+}
+
+/// `unix` as `X-Amz-Date` spells it: `20260922T083000Z`.
+///
+/// # Example
+/// ```tuo
+/// let s = s3::client::amz_date(1790065800);
+/// ```
+pub fn amz_date(take unix: Int) -> String {
+    let iso = x509::time::render(unix);
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::string::len(iso) {
+        let b = std::string::byte_at(iso, i);
+        if b != 45 && b != 58 {
+            std::string::push_byte(out, b);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// EFFECT: the current time as `X-Amz-Date`, from SNTP; empty when the
+/// clock could not be read.
+///
+/// # Example
+/// ```tuo
+/// let stamp = s3::client::now_stamp(c);
+/// ```
+pub fn now_stamp(in c: Client) -> String {
+    let unix = tls::clock::now_unix(std::string::as_str(c.clock_server), c.timeout_ms);
+    if unix <= 0 {
+        return std::string::empty();
+    }
+    amz_date(unix)
+}
+
+// EFFECT: send a request and read the reply.
+fn send(in c: Client, in r: s3::request::Request) -> Outcome {
+    let response = http::client::fetch_once_trusting(std::string::as_str(r.method), std::string::as_str(s3::request::url(c.target, r)), std::string::as_str(s3::request::extra_headers(r)), std::string::as_str(r.body), c.timeout_ms, std::string::as_str(c.resolver), std::array::empty(), x509::roots::store());
+    if !response.ok {
+        return unanswered("no response");
+    }
+    let fine = response.status >= 200 && response.status < 300;
+    var error_code = std::string::empty();
+    var error_message = std::string::empty();
+    if !fine {
+        error_code = s3::xml::text_of(std::string::as_str(response.body), "Code");
+        error_message = s3::xml::text_of(std::string::as_str(response.body), "Message");
+    }
+    Outcome { ok: fine, status: response.status, body: std::string::from_str(std::string::as_str(response.body)), code: error_code, message: error_message }
+}
+
+// EFFECT: the stamp, or an outcome explaining why there is none.
+fn stamped(in c: Client, mut stamp: String) -> Bool {
+    stamp = now_stamp(c);
+    std::string::len(stamp) > 0
+}
+
+/// EFFECT: `put_object`.
+///
+/// # Example
+/// ```tuo
+/// let o = s3::client::put(c, "extraction/7/result.csv", csv, "text/csv");
+/// ```
+pub fn put(in c: Client, in key: Str, in data: Str, in content_type: Str) -> Outcome {
+    var stamp = std::string::empty();
+    if !stamped(c, stamp) {
+        return unanswered("the clock could not be read");
+    }
+    send(c, s3::request::put_object_plain(c.target, key, data, content_type, std::string::as_str(stamp)))
+}
+
+/// EFFECT: `get_object`; the object is `body`.
+///
+/// # Example
+/// ```tuo
+/// let o = s3::client::get(c, "extraction/7/result.csv");
+/// ```
+pub fn get(in c: Client, in key: Str) -> Outcome {
+    var stamp = std::string::empty();
+    if !stamped(c, stamp) {
+        return unanswered("the clock could not be read");
+    }
+    send(c, s3::request::get_object(c.target, key, std::string::as_str(stamp)))
+}
+
+/// EFFECT: `head_object`; `is_ok` is whether the object exists.
+///
+/// # Example
+/// ```tuo
+/// let exists = s3::client::is_ok(s3::client::head(c, key));
+/// ```
+pub fn head(in c: Client, in key: Str) -> Outcome {
+    var stamp = std::string::empty();
+    if !stamped(c, stamp) {
+        return unanswered("the clock could not be read");
+    }
+    send(c, s3::request::head_object(c.target, key, std::string::as_str(stamp)))
+}
+
+/// EFFECT: `delete_object`. S3 answers 204 whether or not the key existed.
+///
+/// # Example
+/// ```tuo
+/// let o = s3::client::delete(c, key);
+/// ```
+pub fn delete(in c: Client, in key: Str) -> Outcome {
+    var stamp = std::string::empty();
+    if !stamped(c, stamp) {
+        return unanswered("the clock could not be read");
+    }
+    send(c, s3::request::delete_object(c.target, key, std::string::as_str(stamp)))
+}
+
+/// EFFECT: one page of `list_objects_v2`; the body is the XML.
+///
+/// # Example
+/// ```tuo
+/// let o = s3::client::list_page(c, "extraction/7/docs/", "", 1000);
+/// ```
+pub fn list_page(in c: Client, in prefix: Str, in continuation: Str, take max_keys: Int) -> Outcome {
+    var stamp = std::string::empty();
+    if !stamped(c, stamp) {
+        return unanswered("the clock could not be read");
+    }
+    send(c, s3::request::list_objects(c.target, prefix, continuation, max_keys, std::string::as_str(stamp)))
+}
+
+/// EFFECT: every key under `prefix`, following continuation tokens as
+/// the paginator does. `pages` reports how many requests it took; a
+/// failed page ends the walk with what was gathered.
+///
+/// # Example
+/// ```tuo
+/// let keys = s3::client::list(c, "extraction/7/docs/", 1000, pages);
+/// ```
+pub fn list(in c: Client, in prefix: Str, take page_size: Int, mut pages: Int) -> Array[String] {
+    var keys = std::array::empty();
+    var continuation = std::string::empty();
+    pages = 0;
+    var more = true;
+    while more && pages < 100000 {
+        let page = list_page(c, prefix, std::string::as_str(continuation), page_size);
+        pages = pages + 1;
+        if !page.ok {
+            return keys;
+        }
+        let found = s3::xml::listed_keys(std::string::as_str(page.body));
+        var i = 0;
+        while i < std::array::len(found) {
+            std::array::push(keys, std::string::from_str(std::string::as_str(std::array::get(found, i))));
+            i = i + 1;
+        }
+        continuation = s3::xml::continuation(std::string::as_str(page.body));
+        more = std::string::len(continuation) > 0;
+    }
+    keys
+}
+
+/// EFFECT: `delete_objects` over up to 1000 keys.
+///
+/// # Example
+/// ```tuo
+/// let o = s3::client::delete_many(c, keys);
+/// ```
+pub fn delete_many(in c: Client, in keys: Array[String]) -> Outcome {
+    var stamp = std::string::empty();
+    if !stamped(c, stamp) {
+        return unanswered("the clock could not be read");
+    }
+    send(c, s3::request::delete_objects(c.target, keys, std::string::as_str(stamp)))
+}
+
+/// EFFECT: a presigned download URL, good for `expires` seconds.
+///
+/// # Example
+/// ```tuo
+/// let url = s3::client::presigned_get(c, key, "text/csv", "attachment; filename=\"r.csv\"", 900);
+/// ```
+pub fn presigned_get(in c: Client, in key: Str, in response_content_type: Str, in response_disposition: Str, take expires: Int) -> String {
+    var stamp = std::string::empty();
+    if !stamped(c, stamp) {
+        return std::string::empty();
+    }
+    s3::request::presign_get(c.target, key, response_content_type, response_disposition, expires, std::string::as_str(stamp))
+}
+
+/// EFFECT: a presigned upload URL; the uploader must send `content_type`.
+///
+/// # Example
+/// ```tuo
+/// let url = s3::client::presigned_put(c, "source.zip", "application/zip", 3600);
+/// ```
+pub fn presigned_put(in c: Client, in key: Str, in content_type: Str, take expires: Int) -> String {
+    var stamp = std::string::empty();
+    if !stamped(c, stamp) {
+        return std::string::empty();
+    }
+    s3::request::presign_put(c.target, key, content_type, expires, std::string::as_str(stamp))
+}
+
+/// EFFECT: `create_bucket` for the client's bucket.
+///
+/// # Example
+/// ```tuo
+/// let o = s3::client::create_bucket(c);
+/// ```
+pub fn create_bucket(in c: Client) -> Outcome {
+    var stamp = std::string::empty();
+    if !stamped(c, stamp) {
+        return unanswered("the clock could not be read");
+    }
+    send(c, s3::request::create_bucket(c.target, std::string::as_str(stamp)))
+}
+
+/// EFFECT: `delete_bucket` for the client's bucket.
+///
+/// # Example
+/// ```tuo
+/// let o = s3::client::delete_bucket(c);
+/// ```
+pub fn delete_bucket(in c: Client) -> Outcome {
+    var stamp = std::string::empty();
+    if !stamped(c, stamp) {
+        return unanswered("the clock could not be read");
+    }
+    send(c, s3::request::delete_bucket(c.target, std::string::as_str(stamp)))
+}
+
+spec amz_date {
+    then std::string::as_str(amz_date(1788220800)) == "20260901T000000Z";
+    then std::string::as_str(amz_date(1790065800)) == "20260922T083000Z";
+}

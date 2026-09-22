@@ -1,0 +1,164 @@
+// s3::demo — every captured boto3 request, rebuilt.
+//
+// `examples/s3_oracle.py` makes the backend's S3 calls through boto3 with
+// a frozen clock and records what reaches the wire. `build` makes the
+// same calls through `s3::request`, case by case under the same name,
+// and the spec at the bottom holds URL, headers, and body to byte
+// equality — the signature included, which is the point.
+
+module s3::demo;
+
+fn access() -> Str {
+    "AKIAIOSFODNN7EXAMPLE"
+}
+
+fn secret() -> Str {
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+}
+
+fn stamp() -> Str {
+    "20260922T083000Z"
+}
+
+/// The oracle's two targets: R2-shaped over HTTPS, MinIO over HTTP.
+///
+/// # Example
+/// ```tuo
+/// let t = s3::demo::target_of("https");
+/// ```
+pub fn target_of(in label: Str) -> s3::request::Target {
+    if label == "https" {
+        return s3::request::target("https://abc123.r2.cloudflarestorage.com", access(), secret(), "auto", "shallowflaws-uploads");
+    }
+    s3::request::target("http://localhost:9000", access(), secret(), "auto", "shallowflaws-uploads")
+}
+
+fn label_of(in name: Str) -> Str {
+    if std::str::starts_with(name, "https_") {
+        "https"
+    } else {
+        "http"
+    }
+}
+
+fn operation_of(in name: Str) -> String {
+    let n = std::str::len(name);
+    if std::str::starts_with(name, "https_") {
+        return std::string::slice(std::string::from_str(name), 6, n);
+    }
+    std::string::slice(std::string::from_str(name), 5, n)
+}
+
+fn binary_body() -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < 128 {
+        std::string::push_byte(out, i);
+        i = i + 1;
+    }
+    out
+}
+
+fn two_keys() -> Array[String] {
+    var keys = std::array::empty();
+    std::array::push(keys, std::string::from_str("extraction/7/docs/a.pdf"));
+    std::array::push(keys, std::string::from_str("extraction/7/docs/b & c.pdf"));
+    keys
+}
+
+/// A built case: the URL, the header lines, the body.
+pub struct Built {
+    url: String,
+    headers: String,
+    body: String,
+}
+
+fn of_request(in t: s3::request::Target, in r: s3::request::Request) -> Built {
+    Built { url: s3::request::url(t, r), headers: s3::request::header_lines(r), body: std::string::from_str(std::string::as_str(r.body)) }
+}
+
+fn of_url(take url: String) -> Built {
+    Built { url: url, headers: std::string::empty(), body: std::string::empty() }
+}
+
+/// Build the oracle case of this name.
+///
+/// # Example
+/// ```tuo
+/// let b = s3::demo::build("http_put_text");
+/// ```
+pub fn build(in name: Str) -> Built {
+    let t = target_of(label_of(name));
+    let op = operation_of(name);
+    let o = std::string::as_str(op);
+    if o == "put_text" {
+        return of_request(t, s3::request::put_object(t, "extraction/7/result.csv", "id,name\n1,Ada\n", "text/csv; charset=utf-8", stamp()));
+    }
+    if o == "put_empty" {
+        return of_request(t, s3::request::put_object(t, "extraction/7/empty.txt", "", "text/plain", stamp()));
+    }
+    if o == "put_binary" {
+        return of_request(t, s3::request::put_object(t, "photos/job_applicant/logo one.png", std::string::as_str(binary_body()), "image/png", stamp()));
+    }
+    if o == "get" {
+        return of_request(t, s3::request::get_object(t, "photos/job_applicant/logo one.png", stamp()));
+    }
+    if o == "head" {
+        return of_request(t, s3::request::head_object(t, "extraction/7/result.csv", stamp()));
+    }
+    if o == "delete" {
+        return of_request(t, s3::request::delete_object(t, "extraction/7/result.csv", stamp()));
+    }
+    if o == "list" {
+        return of_request(t, s3::request::list_objects(t, "extraction/7/docs/", "", 0, stamp()));
+    }
+    if o == "list_continued" {
+        return of_request(t, s3::request::list_objects(t, "extraction/7/docs/", "1/abc+def=", 50, stamp()));
+    }
+    if o == "delete_objects" {
+        return of_request(t, s3::request::delete_objects(t, two_keys(), stamp()));
+    }
+    if o == "presign_get" {
+        return of_url(s3::request::presign_get(t, "extraction/7/result.csv", "text/csv; charset=utf-8", "attachment; filename=\"result.csv\"", 900, stamp()));
+    }
+    if o == "presign_put" {
+        return of_url(s3::request::presign_put(t, "extraction/7/source.zip", "application/zip", 3600, stamp()));
+    }
+    of_url(std::string::empty())
+}
+
+/// Does the build of case `i` match the capture?
+///
+/// # Example
+/// ```tuo
+/// let same = s3::demo::agrees(0);
+/// ```
+pub fn agrees(take i: Int) -> Bool {
+    let b = build(s3::fixture::name(i));
+    std::string::as_str(b.url) == s3::fixture::url(i) && std::string::as_str(b.headers) == s3::fixture::headers(i) && std::string::as_str(b.body) == s3::fixture::body(i)
+}
+
+/// The first case in `[from, to)` the builder gets wrong, or -1.
+///
+/// # Example
+/// ```tuo
+/// let bad = s3::demo::first_disagreement(0, s3::fixture::count());
+/// ```
+pub fn first_disagreement(take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to {
+        if !agrees(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+spec "every captured boto3 request is reproduced" {
+    then s3::fixture::count() == 22;
+    then first_disagreement(0, 6) == -1;
+    then first_disagreement(6, 11) == -1;
+    then first_disagreement(11, 17) == -1;
+    then first_disagreement(17, 22) == -1;
+}

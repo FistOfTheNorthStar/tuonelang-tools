@@ -1,0 +1,253 @@
+// s3::xml — reading S3's replies.
+//
+// S3 answers a listing, a batch delete, and every error in XML, in a
+// shape simple enough — no attributes that matter, no namespaces to
+// resolve, no CDATA — that a reader of "the text inside the first
+// `<Tag>`" and "the inside of every `<Tag>`" covers all of it. Entities
+// are decoded. A listing's keys come back URL-encoded because the
+// request asked for `encoding-type=url`, and are decoded as botocore
+// decodes them: `+` is a space.
+
+module s3::xml;
+
+fn find_from(in s: Str, in needle: Str, take from: Int) -> Int {
+    let n = std::str::len(s);
+    let m = std::str::len(needle);
+    var i = from;
+    while i + m <= n {
+        if std::str::slice(s, i, i + m) == needle {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+fn open_tag(in tag: Str) -> String {
+    var out = std::string::from_str("<");
+    std::string::append(out, tag);
+    std::string::push_byte(out, 62);
+    out
+}
+
+fn close_tag(in tag: Str) -> String {
+    var out = std::string::from_str("</");
+    std::string::append(out, tag);
+    std::string::push_byte(out, 62);
+    out
+}
+
+// `<Tag>` or `<Tag ...>`: the position after the opening tag, from `from`.
+fn after_open(in s: Str, in tag: Str, take from: Int) -> Int {
+    var at = from;
+    var probe = std::string::from_str("<");
+    std::string::append(probe, tag);
+    let p = std::string::as_str(probe);
+    while true {
+        let hit = find_from(s, p, at);
+        if hit < 0 {
+            return -1;
+        }
+        let next = hit + std::str::len(p);
+        if next < std::str::len(s) && (std::str::byte_at(s, next) == 62 || std::str::byte_at(s, next) == 32) {
+            let end = find_from(s, ">", next);
+            if end < 0 {
+                return -1;
+            }
+            return end + 1;
+        }
+        at = hit + 1;
+    }
+    -1
+}
+
+/// Every occurrence of `<tag>…</tag>`, as the raw text between the tags.
+///
+/// # Example
+/// ```tuo
+/// let blocks = s3::xml::each(listing, "Contents");
+/// ```
+pub fn each(in s: Str, in tag: Str) -> Array[String] {
+    var out = std::array::empty();
+    let closing = close_tag(tag);
+    var at = 0;
+    var guard = 0;
+    while guard < 100000 {
+        guard = guard + 1;
+        let start = after_open(s, tag, at);
+        if start < 0 {
+            return out;
+        }
+        let end = find_from(s, std::string::as_str(closing), start);
+        if end < 0 {
+            return out;
+        }
+        std::array::push(out, std::string::from_str(std::str::slice(s, start, end)));
+        at = end + std::string::len(closing);
+    }
+    out
+}
+
+/// Decode `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, and `&#N;`.
+///
+/// # Example
+/// ```tuo
+/// let t = s3::xml::unescaped("b &amp; c"); // "b & c"
+/// ```
+pub fn unescaped(in s: Str) -> String {
+    var out = std::string::empty();
+    let n = std::str::len(s);
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(s, i);
+        if b == 38 {
+            let semi = find_from(s, ";", i);
+            if semi > i && semi - i <= 8 {
+                let name = std::str::slice(s, i + 1, semi);
+                if name == "amp" {
+                    std::string::push_byte(out, 38);
+                } else if name == "lt" {
+                    std::string::push_byte(out, 60);
+                } else if name == "gt" {
+                    std::string::push_byte(out, 62);
+                } else if name == "quot" {
+                    std::string::push_byte(out, 34);
+                } else if name == "apos" {
+                    std::string::push_byte(out, 39);
+                } else if std::str::starts_with(name, "#") {
+                    let parsed = std::str::parse_int(std::str::slice(name, 1, std::str::len(name)));
+                    let code = match parsed {
+                        Ok { value } => value,
+                        Err { error } => -1,
+                    };
+                    if code >= 0 && code < 128 {
+                        std::string::push_byte(out, code);
+                    } else {
+                        std::string::append(out, std::str::slice(s, i, semi + 1));
+                    }
+                } else {
+                    std::string::append(out, std::str::slice(s, i, semi + 1));
+                }
+                i = semi + 1;
+            } else {
+                std::string::push_byte(out, b);
+                i = i + 1;
+            }
+        } else {
+            std::string::push_byte(out, b);
+            i = i + 1;
+        }
+    }
+    out
+}
+
+/// The decoded text inside the first `<tag>`, or empty.
+///
+/// # Example
+/// ```tuo
+/// let code = s3::xml::text_of(error_body, "Code");
+/// ```
+pub fn text_of(in s: Str, in tag: Str) -> String {
+    let start = after_open(s, tag, 0);
+    if start < 0 {
+        return std::string::empty();
+    }
+    let end = find_from(s, std::string::as_str(close_tag(tag)), start);
+    if end < 0 {
+        return std::string::empty();
+    }
+    unescaped(std::str::slice(s, start, end))
+}
+
+/// Is there a `<tag>` at all?
+///
+/// # Example
+/// ```tuo
+/// let truncated = s3::xml::has(listing, "NextContinuationToken");
+/// ```
+pub fn has(in s: Str, in tag: Str) -> Bool {
+    after_open(s, tag, 0) >= 0
+}
+
+/// A key as a listing with `encoding-type=url` spells it, decoded:
+/// `%XX` and `+`.
+///
+/// # Example
+/// ```tuo
+/// let k = s3::xml::decoded_key("logo+one.png"); // "logo one.png"
+/// ```
+pub fn decoded_key(in s: Str) -> String {
+    var spaced = std::string::empty();
+    var i = 0;
+    while i < std::str::len(s) {
+        let b = std::str::byte_at(s, i);
+        if b == 43 {
+            std::string::append(spaced, "%20");
+        } else {
+            std::string::push_byte(spaced, b);
+        }
+        i = i + 1;
+    }
+    http::url::percent_decode(std::string::as_str(spaced))
+}
+
+/// The keys of a `ListBucketResult`, decoded, in order.
+///
+/// # Example
+/// ```tuo
+/// let keys = s3::xml::listed_keys(listing);
+/// ```
+pub fn listed_keys(in listing: Str) -> Array[String] {
+    var out = std::array::empty();
+    let blocks = each(listing, "Contents");
+    var i = 0;
+    while i < std::array::len(blocks) {
+        std::array::push(out, decoded_key(std::string::as_str(text_of(std::string::as_str(std::array::get(blocks, i)), "Key"))));
+        i = i + 1;
+    }
+    out
+}
+
+/// The `NextContinuationToken` of a truncated listing, or empty.
+///
+/// # Example
+/// ```tuo
+/// let next = s3::xml::continuation(listing);
+/// ```
+pub fn continuation(in listing: Str) -> String {
+    if std::string::as_str(text_of(listing, "IsTruncated")) != "true" {
+        return std::string::empty();
+    }
+    text_of(listing, "NextContinuationToken")
+}
+
+fn sample() -> Str {
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>b</Name><Prefix>docs/</Prefix><NextContinuationToken>1/abc+def=</NextContinuationToken><KeyCount>2</KeyCount><MaxKeys>2</MaxKeys><EncodingType>url</EncodingType><IsTruncated>true</IsTruncated><Contents><Key>docs/b+%26+c.pdf</Key><LastModified>2026-09-22T08:30:00.000Z</LastModified><ETag>&quot;abc&quot;</ETag><Size>3</Size></Contents><Contents><Key>docs/logo+one.png</Key><Size>0</Size></Contents></ListBucketResult>"
+}
+
+fn key_is(take i: Int, in expected: Str) -> Bool {
+    std::string::as_str(std::array::get(listed_keys(sample()), i)) == expected
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+spec listed_keys {
+    then std::array::len(listed_keys(sample())) == 2;
+    then key_is(0, "docs/b & c.pdf");
+    then key_is(1, "docs/logo one.png");
+    then text_is(continuation(sample()), "1/abc+def=");
+    then text_is(continuation("<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>"), "");
+    then std::array::len(listed_keys("<ListBucketResult><KeyCount>0</KeyCount></ListBucketResult>")) == 0;
+}
+
+spec text_of {
+    then text_is(text_of(sample(), "Name"), "b");
+    then text_is(text_of("<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>", "Code"), "NoSuchKey");
+    then text_is(text_of(sample(), "ETag"), "\"abc\"");
+    then text_is(text_of(sample(), "Missing"), "");
+    then text_is(unescaped("a &lt;b&gt; &amp; &#65;&#x;&bogus;"), "a <b> & A&#x;&bogus;");
+    then has(sample(), "NextContinuationToken");
+    then !has("<Prefixed/>", "Prefix");
+}
