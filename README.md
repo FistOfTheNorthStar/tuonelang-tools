@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Nine ports so far:
+Eleven ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -17,6 +17,8 @@ Nine ports so far:
 | **`x509`**, **`ec`**, **`rsa`** — certificate parsing, chain validation, a root store, ECDSA on P-256/P-384, RSA PKCS#1 v1.5 and PSS, SHA-384 | the `ssl` module's trust half (`certifi`, `cryptography`'s verifier) | 380 specs (RFC 6979 and a test PKI natively), a 27-check oracle over chains captured from Cloudflare, Sentry, and Stripe |
 | **`sql`** — a typed query builder, DDL, Alembic's revision chain, SCRAM login, nested transactions, a connection pool | `sqlalchemy` (Core), `alembic`, `asyncpg`'s login | 34 specs, 117 statements compiled by SQLAlchemy 2.0 and Alembic 1.20 rebuilt byte for byte, RFC 7677, and a 51-check live oracle against PostgreSQL 18 |
 | **`s3`** — SigV4 signing, the seven S3 calls the backend makes, presigned URLs, CRC-32 checksums | `boto3` (the R2 half) | 38 specs, 22 requests captured from boto3 1.43 reproduced byte for byte, and a 35-check live oracle against MinIO |
+| **`log`** — `logging`'s records, levels, `%`-formatting, and the backend's two line formats | `logging` (as `app/main.py` configures it) | 12 specs, 7 records formatted as CPython 3.14 formats them |
+| **`sentry`** — DSNs, scope with breadcrumbs and tags, message and error events, the envelope, the logging integration | `sentry-sdk` | 37 specs, 7 envelopes serialized by sentry-sdk 2.69 reproduced byte for byte, and a 12-check loopback oracle |
 | **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
 
 ```bash
@@ -26,8 +28,9 @@ Nine ports so far:
                         # complete TLS 1.3 handshakes with three openssl s_server instances,
                         # fetch https:// from Stripe, Sentry, and Cloudflare, and drive the
                         # Redis client against shallowflaws's docker compose redis on 6380,
-                        # and the S3 client against its MinIO on 9000, and run the
-                        # query layer against a throwaway PostgreSQL
+                        # and the S3 client against its MinIO on 9000, post to a
+                        # Sentry-shaped loopback receiver, and run the query layer
+                        # against a throwaway PostgreSQL
 ```
 
 Every port is pure tuonelang over the v0 core, with the catalog modules
@@ -336,6 +339,96 @@ CAs; adding one is one base64 line. And the catalog's own caveat carries
 over: `std::bignum` is variable-time, so the client's X25519 step leaks
 timing on its ephemeral key. Signature *verification* is variable-time
 by design, and there is no signing function in `ec` or `rsa` at all.
+
+---
+
+## `log` and `sentry` — what the backend says about itself
+
+The backend logs through Python's `logging` — a logger per module, five
+levels, `%`-templates — with a format `app/main.py` chooses by
+environment, and ships errors to Sentry through `sentry-sdk`, whose
+logging integration turns every log record into a breadcrumb and every
+error into an event. The two ports are those two layers, and the seam
+between them.
+
+```tuo
+let cfg = log::logger::production();
+var r = log::record::new("app.tasks.extraction_tasks", log::record::error(), "worker gave up after %d attempts", now_ms);
+log::record::int(r, 3);
+let _ = log::logger::emit(cfg, 2, r);                       // the JSON line, to stderr
+let o = sentry::client::record(sentry, r, "", "", frames);  // a breadcrumb — and, at ERROR, an event
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `log::record` — records, levels, `getMessage`'s `%s`/`%d`/`%%`, the arguments with their types | ✅ proven against CPython |
+| `log::format` — `asctime`, the development line, the production JSON line | ✅ proven |
+| `log::logger` — the root threshold, stderr, an in-memory journal | ✅ proven |
+| `sentry::dsn` — the DSN, the envelope endpoint, `X-Sentry-Auth`, the organisation id | ✅ proven against sentry-sdk |
+| `sentry::scope` — environment, release, server name, tags, user, the last hundred breadcrumbs, the logging integration's breadcrumb | ✅ proven |
+| `sentry::event`, `sentry::envelope` — message, exception, and logged events; the three-line envelope | ✅ 7 of 7 captured envelopes reproduced |
+| `sentry::client` — ids, the SNTP clock, the POST | ✅ 12 loopback checks |
+
+### The oracles are CPython and sentry-sdk
+
+`examples/sentry_oracle.py` formats seven records with CPython 3.14's
+`logging` under both of the backend's formats, and makes a fixed
+sequence of calls — messages, logged records, a logged exception, a
+captured one, tags and a user set along the way — against sentry-sdk
+2.69 with a transport that keeps the envelopes. What is Python's rather
+than the protocol's is stripped from each event (the installed modules,
+`sys.argv`, the CPython runtime, the SDK block, the frame locals), and
+every id and timestamp is fixed, so the port can be given the same
+inputs. `log::demo` and `sentry::demo` make the same records and calls,
+and the specs hold the lines and the envelopes to byte equality.
+
+```bash
+../shallowflaws/.venv/bin/python examples/sentry_oracle.py   # writes examples/sentry_oracle.json
+python3 examples/sentry_fixture.py && tuo fmt src/log/fixture.tuo src/sentry/fixture.tuo
+```
+
+### What the specs pin that a comment cannot
+
+**The production log format is not JSON.** `app/main.py` writes
+`{"time":"%(asctime)s",…,"message":"%(message)s"}` by hand, so a message
+with a quote or a newline produces a line no parser accepts; two of the
+seven captured records show it. `log::format::production` escapes, and
+the spec shows both what CPython wrote and what this port writes.
+`asctime` has a comma before the milliseconds.
+
+**Events are ordered as the SDK orders them.** `message`, `level`, then
+`event_id`, `timestamp`, `contexts.trace`, `user` if set,
+`transaction_info` (always `{}`), `tags` if set, `breadcrumbs` (always,
+`{"values":[]}` when empty), `release`, `environment`, `server_name` —
+and for a logged record, `level`, `exception` if one was attached,
+`logger`, `logentry` with the template, the formatted text, and the
+parameters as typed JSON (`[3]`, `["memory"]`). `CRITICAL` is `fatal`.
+
+**Breadcrumbs differ by origin.** The logging integration writes `type`,
+`level`, `category` (the logger's name), `message`, `timestamp`, `data`
+— with the handler's `asctime` copied into `data`, because the backend's
+format uses it; `add_breadcrumb` writes `category`, `message`, `level`,
+`data`, `timestamp`, `type: "default"`. An ERROR record's event is made
+before the record joins the breadcrumbs. The hundred-and-first
+breadcrumb drops the first.
+
+**The envelope is three lines and a newline**: a header with the event
+id, `sent_at`, and a `trace` block carrying the environment, release,
+public key, and organisation id (from `o123456.ingest…`); an item header
+with `content_type` and the payload's byte length; the payload.
+
+### What is deliberately not here
+
+Envelopes are sent uncompressed (the SDK gzips them; Sentry accepts
+both). Stack frames are what the caller names — there is no runtime
+reflection to read a stack. Not modelled: tracing and transactions
+(the backend samples 20 %; the `contexts.trace` ids identify a request
+and nothing more), sessions, attachments, `before_send`, sampling,
+retries and the transport queue, the Celery and FastAPI integrations'
+own tags, and `logging`'s handlers, filters, and per-logger levels
+beyond the root threshold. Timestamps are whole seconds from SNTP.
 
 ---
 
@@ -909,6 +1002,22 @@ src/web/demo.tuo         the oracle's FastAPI app, reimplemented
 examples/web.tuo         the socket oracle: web::demo behind http::server
 examples/web_oracle.py   the FastAPI app and requests the fixture was captured from
 examples/web_fixture.py  oracle.json to src/web/fixture.tuo
+
+src/log/record.tuo       records, levels, getMessage, params as JSON
+src/log/format.tuo       asctime and the two line formats
+src/log/logger.tuo       the root threshold, emit to a descriptor, a journal
+src/log/fixture.tuo      7 records as CPython formatted them (generated)
+src/log/demo.tuo         the same 7, built here
+src/sentry/dsn.tuo       the DSN, the endpoint, the auth header
+src/sentry/scope.tuo     tags, user, breadcrumbs, the logging integration's crumb
+src/sentry/event.tuo     message, exception, and logged events
+src/sentry/envelope.tuo  the envelope
+src/sentry/fixture.tuo   7 envelopes as sentry-sdk serialized them (generated)
+src/sentry/demo.tuo      the same sequence, replayed
+src/sentry/client.tuo    ids, the SNTP clock, the POST
+examples/sentry.tuo      the loopback oracle: a Sentry-shaped receiver and the client
+examples/sentry_oracle.py    CPython logging and sentry-sdk, recorded
+examples/sentry_fixture.py   sentry_oracle.json to the two fixtures
 
 src/s3/crc32.tuo         CRC-32, base64
 src/s3/sigv4.tuo         AWS Signature Version 4: headers and presigned queries
