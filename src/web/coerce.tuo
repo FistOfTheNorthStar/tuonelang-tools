@@ -447,6 +447,169 @@ pub fn float_from_text(in raw: Str) -> FloatResult {
 // Booleans.
 // ----------------------------------------------------------------------------
 
+/// The result of a `Decimal` conversion: whether it parsed, whether it is
+/// finite, and Python's rendering of it.
+pub struct DecimalResult {
+    ok: Bool,
+    finite: Bool,
+    text: String,
+}
+
+fn no_decimal() -> DecimalResult {
+    DecimalResult { ok: false, finite: true, text: std::string::empty() }
+}
+
+fn not_finite() -> DecimalResult {
+    DecimalResult { ok: true, finite: false, text: std::string::empty() }
+}
+
+fn lowered_ascii(in raw: Str) -> String {
+    lowered(std::string::as_str(trimmed(raw)))
+}
+
+/// Parse text as Python's `Decimal` does — whitespace stripped, an
+/// optional sign, digits with `_` separators, a fraction, an exponent —
+/// and render it as `str(Decimal)` does: `"00012"` is `12`, `"5."` is `5`,
+/// `".5"` is `0.5`, `"100e-3"` is `0.100`, `"1E1"` is `1E+1`, `"-0"` stays
+/// `-0`. `inf` and `nan` parse but are not finite. Only ASCII digits.
+///
+/// # Example
+/// ```tuo
+/// let d = web::coerce::decimal_from_text(" 40.5 "); // "40.5"
+/// ```
+pub fn decimal_from_text(in raw: Str) -> DecimalResult {
+    let folded = lowered_ascii(raw);
+    let text = std::string::as_str(folded);
+    let n = std::str::len(text);
+    if n == 0 {
+        return no_decimal();
+    }
+    var at = 0;
+    var negative = false;
+    let first = std::str::byte_at(text, 0);
+    if first == 45 || first == 43 {
+        negative = first == 45;
+        at = 1;
+    }
+    let rest = std::string::as_str(std::str::to_lower(std::string::as_str(trimmed(std::string::as_str(std::string::slice(folded, at, n))))));
+    if rest == "inf" || rest == "infinity" || rest == "nan" || rest == "snan" {
+        return not_finite();
+    }
+    // Collect the coefficient digits and where the point falls.
+    var digits = std::string::empty();
+    var point_seen = false;
+    var after_point = 0;
+    var any_digit = false;
+    while at < n {
+        let b = std::str::byte_at(text, at);
+        if is_digit(b) {
+            std::string::push_byte(digits, b);
+            any_digit = true;
+            if point_seen {
+                after_point = after_point + 1;
+            }
+        } else if b == 46 && !point_seen {
+            point_seen = true;
+        } else if b == 95 && any_digit {
+        // An underscore between digits, as Python allows.
+        } else if b == 101 {
+            break;
+        } else {
+            return no_decimal();
+        }
+        at = at + 1;
+    }
+    if !any_digit {
+        return no_decimal();
+    }
+    var exponent = 0 - after_point;
+    if at < n {
+        // An exponent: e, an optional sign, digits.
+        at = at + 1;
+        var exp_negative = false;
+        if at < n && (std::str::byte_at(text, at) == 45 || std::str::byte_at(text, at) == 43) {
+            exp_negative = std::str::byte_at(text, at) == 45;
+            at = at + 1;
+        }
+        var exp_digits = 0;
+        var value = 0;
+        while at < n {
+            let b = std::str::byte_at(text, at);
+            if !is_digit(b) {
+                return no_decimal();
+            }
+            if value < 100000 {
+                value = value * 10 + (b - 48);
+            }
+            exp_digits = exp_digits + 1;
+            at = at + 1;
+        }
+        if exp_digits == 0 {
+            return no_decimal();
+        }
+        if exp_negative {
+            exponent = exponent - value;
+        } else {
+            exponent = exponent + value;
+        }
+    }
+    // Strip leading zeros of the coefficient, keeping one.
+    var lead = 0;
+    while lead + 1 < std::string::len(digits) && std::string::byte_at(digits, lead) == 48 {
+        lead = lead + 1;
+    }
+    let coefficient = std::string::slice(digits, lead, std::string::len(digits));
+    DecimalResult { ok: true, finite: true, text: decimal_text(negative, std::string::as_str(coefficient), exponent) }
+}
+
+/// `str(Decimal)` for a sign, a coefficient, and an exponent — Python's
+/// placement of the point and its choice of scientific notation.
+///
+/// # Example
+/// ```tuo
+/// let t = web::coerce::decimal_text(false, "100", -3); // "0.100"
+/// ```
+pub fn decimal_text(take negative: Bool, in coefficient: Str, take exponent: Int) -> String {
+    var out = std::string::empty();
+    if negative {
+        std::string::push_byte(out, 45);
+    }
+    let width = std::str::len(coefficient);
+    let left = exponent + width;
+    var dot = 1;
+    if exponent <= 0 && left > 0 - 6 {
+        dot = left;
+    }
+    if dot <= 0 {
+        std::string::append(out, "0.");
+        var z = dot;
+        while z < 0 {
+            std::string::push_byte(out, 48);
+            z = z + 1;
+        }
+        std::string::append(out, coefficient);
+    } else if dot >= width {
+        std::string::append(out, coefficient);
+        var z = width;
+        while z < dot {
+            std::string::push_byte(out, 48);
+            z = z + 1;
+        }
+    } else {
+        std::string::append(out, std::string::as_str(std::string::slice(std::string::from_str(coefficient), 0, dot)));
+        std::string::push_byte(out, 46);
+        std::string::append(out, std::string::as_str(std::string::slice(std::string::from_str(coefficient), dot, width)));
+    }
+    if left != dot {
+        std::string::push_byte(out, 69);
+        if left - dot >= 0 {
+            std::string::push_byte(out, 43);
+        }
+        web::json::push_int(out, left - dot);
+    }
+    out
+}
+
 /// A boolean from text: 1 for `1 on t true y yes`, 0 for `0 off f false n
 /// no`, compared without case and without trimming; -1 otherwise.
 ///
@@ -896,6 +1059,52 @@ spec number_text {
     then text_is(number_text(0.0 - 74.006, true), "-74.006");
     then text_is(number_text(0.0, true), "0.0");
     then text_is(number_text(0.9999999, true), "1.0");
+}
+
+fn decimal_is(in text: Str, in expected: Str) -> Bool {
+    let d = decimal_from_text(text);
+    d.ok && d.finite && std::string::as_str(d.text) == expected
+}
+
+fn decimal_refused(in text: Str) -> Bool {
+    !decimal_from_text(text).ok
+}
+
+fn decimal_infinite(in text: Str) -> Bool {
+    let d = decimal_from_text(text);
+    d.ok && !d.finite
+}
+
+spec decimal_from_text {
+    then decimal_is("40.5", "40.5");
+    then decimal_is(" 40.5 ", "40.5");
+    then decimal_is("60.1699", "60.1699");
+    then decimal_is("+5", "5");
+    then decimal_is(".5", "0.5");
+    then decimal_is("5.", "5");
+    then decimal_is("-0", "-0");
+    then decimal_is("00012", "12");
+    then decimal_is("1_000", "1000");
+    then decimal_is("1e3", "1E+3");
+    then decimal_is("1E1", "1E+1");
+    then decimal_is("1e-2", "0.01");
+    then decimal_is("100e-3", "0.100");
+    then decimal_is("0.0000001", "1E-7");
+    then decimal_is("0.000001", "0.000001");
+    then decimal_is("1.0", "1.0");
+    then decimal_is("-179.25", "-179.25");
+    then decimal_infinite("inf");
+    then decimal_infinite("-Infinity");
+    then decimal_infinite("nan");
+    then decimal_refused("");
+    then decimal_refused("  ");
+    then decimal_refused("north");
+    then decimal_refused("0x10");
+    then decimal_refused("-");
+    then decimal_refused("1.2.3");
+    then decimal_refused("1,5");
+    then decimal_refused("1e");
+    then decimal_refused("_1");
 }
 
 spec bool_from_text {

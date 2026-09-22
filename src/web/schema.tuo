@@ -93,6 +93,17 @@ pub fn kind_string_list() -> Int {
     5
 }
 
+/// A `Decimal` field: accepted from a number or a string, kept as
+/// Python renders it, and answered as a JSON string.
+///
+/// # Example
+/// ```tuo
+/// let k = web::schema::kind_decimal();
+/// ```
+pub fn kind_decimal() -> Int {
+    6
+}
+
 /// A model: fields in declaration order.
 pub struct Schema {
     names: Array[String],
@@ -106,6 +117,9 @@ pub struct Schema {
     gt: Array[Float],
     le: Array[Float],
     lt: Array[Float],
+    checks: Array[Int],
+    check_chars: Array[String],
+    check_messages: Array[String],
 }
 
 /// An empty model.
@@ -115,7 +129,7 @@ pub struct Schema {
 /// var s = web::schema::new();
 /// ```
 pub fn new() -> Schema {
-    Schema { names: std::array::empty(), kinds: std::array::empty(), required: std::array::empty(), nullable: std::array::empty(), min_lengths: std::array::empty(), max_lengths: std::array::empty(), bound_flags: std::array::empty(), ge: std::array::empty(), gt: std::array::empty(), le: std::array::empty(), lt: std::array::empty() }
+    Schema { names: std::array::empty(), kinds: std::array::empty(), required: std::array::empty(), nullable: std::array::empty(), min_lengths: std::array::empty(), max_lengths: std::array::empty(), bound_flags: std::array::empty(), ge: std::array::empty(), gt: std::array::empty(), le: std::array::empty(), lt: std::array::empty(), checks: std::array::empty(), check_chars: std::array::empty(), check_messages: std::array::empty() }
 }
 
 /// Add a field of `kind`. `required` fields must be present; `nullable`
@@ -145,6 +159,9 @@ pub fn field(mut s: Schema, in name: Str, take kind: Int, take required: Bool, t
     std::array::push(s.gt, 0.0);
     std::array::push(s.le, 0.0);
     std::array::push(s.lt, 0.0);
+    std::array::push(s.checks, 0);
+    std::array::push(s.check_chars, std::string::empty());
+    std::array::push(s.check_messages, std::string::empty());
 }
 
 /// A required `str`.
@@ -217,6 +234,16 @@ pub fn optional_float(mut s: Schema, in name: Str) {
     field(s, name, kind_float(), false, true);
 }
 
+/// An `Optional[Decimal] = None`.
+///
+/// # Example
+/// ```tuo
+/// web::schema::optional_decimal(s, "location_lat");
+/// ```
+pub fn optional_decimal(mut s: Schema, in name: Str) {
+    field(s, name, kind_decimal(), false, true);
+}
+
 /// A `bool` with a default.
 ///
 /// # Example
@@ -252,6 +279,39 @@ pub fn length(mut s: Schema, take min: Int, take max: Int) {
     if i >= 0 {
         std::array::set(s.min_lengths, i, min);
         std::array::set(s.max_lengths, i, max);
+    }
+}
+
+/// A `field_validator` on the last string field that strips it and
+/// refuses a blank: `Value error, <message>`. The stored text is the
+/// stripped value.
+///
+/// # Example
+/// ```tuo
+/// web::schema::stripped_not_blank(s, "Name cannot be empty");
+/// ```
+pub fn stripped_not_blank(mut s: Schema, in message: Str) {
+    let i = last(s);
+    if i >= 0 {
+        std::array::set(s.checks, i, 1);
+        std::array::set(s.check_messages, i, std::string::from_str(message));
+    }
+}
+
+/// A `field_validator` on the last string field that strips it, turns a
+/// blank into `None`, and otherwise allows only the bytes in `allowed`:
+/// `Value error, <message>`.
+///
+/// # Example
+/// ```tuo
+/// web::schema::stripped_chars(s, "0123456789+-()", "Phone number can only contain numbers, +, -, (, and )");
+/// ```
+pub fn stripped_chars(mut s: Schema, in allowed: Str, in message: Str) {
+    let i = last(s);
+    if i >= 0 {
+        std::array::set(s.checks, i, 2);
+        std::array::set(s.check_chars, i, std::string::from_str(allowed));
+        std::array::set(s.check_messages, i, std::string::from_str(message));
     }
 }
 
@@ -565,6 +625,63 @@ fn accept_email(mut m: Model, take i: Int, in text: Str, in loc: Str, in input: 
     web::errors::add(m.errors, "value_error", loc, std::string::as_str(msg), input, std::string::as_str(ctx));
 }
 
+fn value_error(mut m: Model, in loc: Str, in message: Str, in input: Str) {
+    var msg = std::string::from_str("Value error, ");
+    std::string::append(msg, message);
+    web::errors::add(m.errors, "value_error", loc, std::string::as_str(msg), input, "{\"error\":{}}");
+}
+
+/// Run the field's `field_validator`, if any, and store the string.
+fn accept_checked(mut m: Model, in s: Schema, take i: Int, in text: Str, in loc: Str, in input: Str) {
+    let check = std::array::get(s.checks, i);
+    if check == 0 {
+        std::array::set(m.states, i, 2);
+        std::array::set(m.texts, i, std::string::from_str(text));
+        return;
+    }
+    let stripped = web::coerce::trimmed(text);
+    if std::string::len(stripped) == 0 {
+        if check == 1 {
+            value_error(m, loc, std::string::as_str(std::array::get(s.check_messages, i)), input);
+        } else {
+            std::array::set(m.states, i, 1);
+        }
+        return;
+    }
+    if check == 2 {
+        let allowed = std::array::get(s.check_chars, i);
+        var k = 0;
+        while k < std::string::len(stripped) {
+            if !std::str::contains_byte(std::string::as_str(allowed), std::string::byte_at(stripped, k)) {
+                value_error(m, loc, std::string::as_str(std::array::get(s.check_messages, i)), input);
+                return;
+            }
+            k = k + 1;
+        }
+    }
+    std::array::set(m.states, i, 2);
+    std::array::set(m.texts, i, stripped);
+}
+
+/// Accept a `Decimal` from text: pydantic's parse, Python's rendering,
+/// and the bounds compared as doubles.
+fn accept_decimal_text(mut m: Model, in s: Schema, take i: Int, in text: Str, in loc: Str, in input: Str) {
+    let d = web::coerce::decimal_from_text(text);
+    if !d.ok {
+        web::errors::add(m.errors, "decimal_parsing", loc, "Input should be a valid decimal", input, "");
+        return;
+    }
+    if !d.finite {
+        web::errors::add(m.errors, "finite_number", loc, "Input should be a finite number", input, "");
+        return;
+    }
+    let f = web::coerce::float_from_text(std::string::as_str(d.text));
+    if bounds_ok(m, s, i, f.value, loc, input) {
+        std::array::set(m.states, i, 2);
+        std::array::set(m.texts, i, std::string::from_str(std::string::as_str(d.text)));
+    }
+}
+
 /// Convert and check text for field `i` — the path every query and path
 /// parameter takes, and the one a JSON string takes for a non-string
 /// field.
@@ -572,9 +689,10 @@ fn accept_text(mut m: Model, in s: Schema, take i: Int, in text: Str, in loc: St
     let kind = std::array::get(s.kinds, i);
     if kind == kind_string() {
         if length_ok(m, s, i, loc, text, input) {
-            std::array::set(m.states, i, 2);
-            std::array::set(m.texts, i, std::string::from_str(text));
+            accept_checked(m, s, i, text, loc, input);
         }
+    } else if kind == kind_decimal() {
+        accept_decimal_text(m, s, i, text, loc, input);
     } else if kind == kind_email() {
         accept_email(m, i, text, loc, input);
     } else if kind == kind_int() {
@@ -613,6 +731,8 @@ fn type_error(mut m: Model, take kind: Int, in loc: Str, in input: Str) {
         web::errors::add(m.errors, "bool_type", loc, "Input should be a valid boolean", input, "");
     } else if kind == kind_string_list() {
         web::errors::add(m.errors, "list_type", loc, "Input should be a valid list", input, "");
+    } else if kind == kind_decimal() {
+        web::errors::add(m.errors, "decimal_type", loc, "Decimal input should be an integer, float, string or Decimal object", input, "");
     } else {
         web::errors::add(m.errors, "string_type", loc, "Input should be a valid string", input, "");
     }
@@ -690,6 +810,14 @@ fn accept_node(mut m: Model, in s: Schema, take i: Int, in d: web::json::Doc, ta
             } else {
                 web::errors::add(m.errors, "bool_parsing", std::string::as_str(loc), "Input should be a valid boolean, unable to interpret input", std::string::as_str(input), "");
             }
+        } else {
+            type_error(m, kind, std::string::as_str(loc), std::string::as_str(input));
+        }
+        return;
+    }
+    if kind == kind_decimal() {
+        if is_number {
+            accept_decimal_text(m, s, i, std::string::as_str(token), std::string::as_str(loc), std::string::as_str(input));
         } else {
             type_error(m, kind, std::string::as_str(loc), std::string::as_str(input));
         }
@@ -871,6 +999,37 @@ fn errors_of(in body: Str) -> String {
     web::errors::render(m.errors)
 }
 
+// The backend's registration model: Decimal coordinates, a name that
+// cannot be blank, a phone of digits and punctuation.
+fn applicant() -> Schema {
+    var s = new();
+    optional_decimal(s, "location_lat");
+    at_least(s, 0.0 - 90.0);
+    at_most(s, 90.0);
+    email(s, "email");
+    optional_string(s, "name");
+    length(s, 0 - 1, 255);
+    stripped_not_blank(s, "Name cannot be empty");
+    optional_string(s, "phone");
+    length(s, 0 - 1, 40);
+    stripped_chars(s, "0123456789+-()", "Phone number can only contain numbers, +, -, (, and )");
+    s
+}
+
+fn applicant_errors(in body: Str) -> String {
+    let m = validate_body(applicant(), body, true);
+    web::errors::render(m.errors)
+}
+
+fn applicant_text(in body: Str, in name: Str) -> String {
+    let m = validate_body(applicant(), body, true);
+    text_of(m, name)
+}
+
+fn applicant_has(in body: Str, in name: Str) -> Bool {
+    has(validate_body(applicant(), body, true), name)
+}
+
 fn text_is(in actual: String, in expected: Str) -> Bool {
     std::string::as_str(actual) == expected
 }
@@ -925,6 +1084,23 @@ spec "errors are FastAPI's bytes" {
     then text_is(errors_of("[1,2]"), "{\"detail\":[{\"type\":\"model_attributes_type\",\"loc\":[\"body\"],\"msg\":\"Input should be a valid dictionary or object to extract fields from\",\"input\":[1,2]}]}");
     then text_is(errors_of(""), "{\"detail\":[{\"type\":\"missing\",\"loc\":[\"body\"],\"msg\":\"Field required\",\"input\":null}]}");
     then text_is(errors_of("{\"email\": "), "{\"detail\":[{\"type\":\"json_invalid\",\"loc\":[\"body\",10],\"msg\":\"JSON decode error\",\"input\":{},\"ctx\":{\"error\":\"Expecting value\"}}]}");
+}
+
+spec "decimals and field validators" {
+    then text_is(applicant_text("{\"email\":\"a@b.co\",\"location_lat\":60.1699}", "location_lat"), "60.1699");
+    then text_is(applicant_text("{\"email\":\"a@b.co\",\"location_lat\":\"-0.5\"}", "location_lat"), "-0.5");
+    then text_is(applicant_text("{\"email\":\"a@b.co\",\"location_lat\":40}", "location_lat"), "40");
+    then text_is(applicant_text("{\"email\":\"a@b.co\",\"location_lat\":\" 1e1 \"}", "location_lat"), "1E+1");
+    then text_is(applicant_errors("{\"email\":\"a@b.co\",\"location_lat\":91}"), "{\"detail\":[{\"type\":\"less_than_equal\",\"loc\":[\"body\",\"location_lat\"],\"msg\":\"Input should be less than or equal to 90\",\"input\":91,\"ctx\":{\"le\":90}}]}");
+    then text_is(applicant_errors("{\"email\":\"a@b.co\",\"location_lat\":\"north\"}"), "{\"detail\":[{\"type\":\"decimal_parsing\",\"loc\":[\"body\",\"location_lat\"],\"msg\":\"Input should be a valid decimal\",\"input\":\"north\"}]}");
+    then text_is(applicant_errors("{\"email\":\"a@b.co\",\"location_lat\":true}"), "{\"detail\":[{\"type\":\"decimal_type\",\"loc\":[\"body\",\"location_lat\"],\"msg\":\"Decimal input should be an integer, float, string or Decimal object\",\"input\":true}]}");
+    then text_is(applicant_errors("{\"email\":\"a@b.co\",\"location_lat\":\"inf\"}"), "{\"detail\":[{\"type\":\"finite_number\",\"loc\":[\"body\",\"location_lat\"],\"msg\":\"Input should be a finite number\",\"input\":\"inf\"}]}");
+    then text_is(applicant_text("{\"email\":\"a@b.co\",\"name\":\"  Kim \"}", "name"), "Kim");
+    then text_is(applicant_errors("{\"email\":\"a@b.co\",\"name\":\"   \"}"), "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"name\"],\"msg\":\"Value error, Name cannot be empty\",\"input\":\"   \",\"ctx\":{\"error\":{}}}]}");
+    then text_is(applicant_text("{\"email\":\"a@b.co\",\"phone\":\" +358(40)-123 \"}", "phone"), "+358(40)-123");
+    then !applicant_has("{\"email\":\"a@b.co\",\"phone\":\"   \"}", "phone");
+    then text_is(applicant_errors("{\"email\":\"a@b.co\",\"phone\":\"+1 555 CALL\"}"), "{\"detail\":[{\"type\":\"value_error\",\"loc\":[\"body\",\"phone\"],\"msg\":\"Value error, Phone number can only contain numbers, +, -, (, and )\",\"input\":\"+1 555 CALL\",\"ctx\":{\"error\":{}}}]}");
+    then text_is(applicant_errors("{\"location_lat\":\"x\",\"name\":\" \"}"), "{\"detail\":[{\"type\":\"decimal_parsing\",\"loc\":[\"body\",\"location_lat\"],\"msg\":\"Input should be a valid decimal\",\"input\":\"x\"},{\"type\":\"missing\",\"loc\":[\"body\",\"email\"],\"msg\":\"Field required\",\"input\":{\"location_lat\":\"x\",\"name\":\" \"}},{\"type\":\"value_error\",\"loc\":[\"body\",\"name\"],\"msg\":\"Value error, Name cannot be empty\",\"input\":\" \",\"ctx\":{\"error\":{}}}]}");
 }
 
 spec validate_pairs {
