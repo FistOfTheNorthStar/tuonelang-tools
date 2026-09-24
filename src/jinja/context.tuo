@@ -1,0 +1,131 @@
+// jinja::context — what a template is rendered against.
+//
+// Jinja2 renders against a dict of Python values: strings, numbers,
+// booleans, `None`, nested dicts, and `Markup` strings that autoescaping
+// leaves alone. The port takes the same as JSON — `web::json` keeps the
+// tree — plus the dotted paths of the values that are `Markup`, which
+// JSON cannot say. A lookup walks the path member by member; a missing
+// name is Jinja's `Undefined`: empty when printed, false when tested.
+
+module jinja::context;
+
+/// A context: the JSON tree and the safe paths.
+pub struct Context {
+    doc: web::json::Doc,
+    safe: Array[String],
+}
+
+/// A context from JSON and the safe paths, one per line.
+///
+/// # Example
+/// ```tuo
+/// let ctx = jinja::context::from_json("{\"name\":\"Ada\"}", "");
+/// ```
+pub fn from_json(in json: Str, in safe_paths: Str) -> Context {
+    var safe = std::array::empty();
+    if std::str::len(safe_paths) > 0 {
+        let lines = std::str::split(safe_paths, "\n");
+        var i = 0;
+        while i < std::array::len(lines) {
+            std::array::push(safe, std::string::from_str(std::string::as_str(std::array::get(lines, i))));
+            i = i + 1;
+        }
+    }
+    Context { doc: web::json::parse(json), safe: safe }
+}
+
+/// Did the JSON parse?
+///
+/// # Example
+/// ```tuo
+/// let fine = jinja::context::is_ok(ctx);
+/// ```
+pub fn is_ok(in ctx: Context) -> Bool {
+    ctx.doc.ok
+}
+
+/// Mark a dotted path as `Markup`.
+///
+/// # Example
+/// ```tuo
+/// jinja::context::mark_safe(ctx, "greeting");
+/// ```
+pub fn mark_safe(mut ctx: Context, in path: Str) {
+    std::array::push(ctx.safe, std::string::from_str(path));
+}
+
+/// Is the value at `path` marked safe?
+///
+/// # Example
+/// ```tuo
+/// let raw = jinja::context::is_safe(ctx, "t.welcome.body");
+/// ```
+pub fn is_safe(in ctx: Context, in path: Str) -> Bool {
+    var i = 0;
+    while i < std::array::len(ctx.safe) {
+        if std::string::as_str(std::array::get(ctx.safe, i)) == path {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+/// The node at a dotted path, or -1.
+///
+/// # Example
+/// ```tuo
+/// let node = jinja::context::lookup(ctx, "t.welcome.heading");
+/// ```
+pub fn lookup(in ctx: Context, in path: Str) -> Int {
+    if !ctx.doc.ok {
+        return -1;
+    }
+    var node = web::json::root(ctx.doc);
+    let parts = std::str::split(path, ".");
+    var i = 0;
+    while i < std::array::len(parts) {
+        if node < 0 || web::json::kind_of(ctx.doc, node) != web::json::kind_object() {
+            return -1;
+        }
+        node = web::json::member(ctx.doc, node, std::string::as_str(std::array::get(parts, i)));
+        i = i + 1;
+    }
+    node
+}
+
+/// The JSON kind of a node.
+///
+/// # Example
+/// ```tuo
+/// let k = jinja::context::kind(ctx, node);
+/// ```
+pub fn kind(in ctx: Context, take node: Int) -> Int {
+    web::json::kind_of(ctx.doc, node)
+}
+
+/// The text of a scalar node: the string's decoded text, a number's
+/// spelling.
+///
+/// # Example
+/// ```tuo
+/// let t = jinja::context::text(ctx, node);
+/// ```
+pub fn text(in ctx: Context, take node: Int) -> String {
+    web::json::text_of(ctx.doc, node)
+}
+
+fn sample() -> Context {
+    from_json("{\"name\":\"Ada\",\"t\":{\"welcome\":{\"heading\":\"Hi <b>\"}},\"n\":3,\"none\":null}", "t.welcome.heading\ngreeting")
+}
+
+spec lookup {
+    then lookup(sample(), "name") >= 0;
+    then std::string::as_str(text(sample(), lookup(sample(), "t.welcome.heading"))) == "Hi <b>";
+    then lookup(sample(), "t.missing.x") == -1;
+    then lookup(sample(), "name.x") == -1;
+    then lookup(sample(), "nope") == -1;
+    then is_safe(sample(), "t.welcome.heading");
+    then !is_safe(sample(), "name");
+    then kind(sample(), lookup(sample(), "n")) == web::json::kind_int();
+}

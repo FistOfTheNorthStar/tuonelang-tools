@@ -1,0 +1,614 @@
+// jinja::expr — the expressions inside `{{ }}` and `{% if %}`.
+//
+// The templates use a small language: names with dotted attributes,
+// string and number literals, `true`/`false`/`none`, comparisons, `not`,
+// `and`, `or`, `a if c else b`, and filters with arguments. This is a
+// tokenizer and a recursive-descent evaluator for exactly that, with
+// Python's truthiness (empty strings, zero, `None`, and `False` are
+// false) and Jinja's rendering of each kind (`None` prints as `None`,
+// booleans as `True`/`False`). No tree is built: each production
+// evaluates as it parses.
+//
+// A value carries whether it is safe — a `Markup` from the context, the
+// result of `|safe`, or an already-escaped `|e` — so the renderer knows
+// whether to escape it.
+
+module jinja::expr;
+
+/// `Undefined`.
+pub fn kind_undefined() -> Int {
+    0
+}
+
+/// `None`.
+pub fn kind_none() -> Int {
+    1
+}
+
+/// A boolean.
+pub fn kind_bool() -> Int {
+    2
+}
+
+/// An integer.
+pub fn kind_int() -> Int {
+    3
+}
+
+/// A float, kept by its spelling.
+pub fn kind_float() -> Int {
+    4
+}
+
+/// A string.
+pub fn kind_string() -> Int {
+    5
+}
+
+/// A dict — a JSON object in the context.
+pub fn kind_dict() -> Int {
+    6
+}
+
+/// A value.
+pub struct Value {
+    kind: Int,
+    text: String,
+    safe: Bool,
+    node: Int,
+}
+
+fn undefined() -> Value {
+    Value { kind: kind_undefined(), text: std::string::empty(), safe: false, node: -1 }
+}
+
+/// A string value.
+///
+/// # Example
+/// ```tuo
+/// let v = jinja::expr::string_value("x", false);
+/// ```
+pub fn string_value(in text: Str, take safe: Bool) -> Value {
+    Value { kind: kind_string(), text: std::string::from_str(text), safe: safe, node: -1 }
+}
+
+fn bool_value(take b: Bool) -> Value {
+    Value { kind: kind_bool(), text: std::string::from_str(if b {
+        "True"
+    } else {
+        "False"
+    }), safe: false, node: -1 }
+}
+
+fn int_value(take n: Int) -> Value {
+    Value { kind: kind_int(), text: std::str::to_string(n), safe: false, node: -1 }
+}
+
+/// The value at a dotted path of the context.
+///
+/// # Example
+/// ```tuo
+/// let v = jinja::expr::of_path(ctx, "t.welcome.heading");
+/// ```
+pub fn of_path(in ctx: jinja::context::Context, in path: Str) -> Value {
+    let node = jinja::context::lookup(ctx, path);
+    if node < 0 {
+        return undefined();
+    }
+    let k = jinja::context::kind(ctx, node);
+    if k == web::json::kind_null() {
+        return Value { kind: kind_none(), text: std::string::from_str("None"), safe: false, node: node };
+    }
+    if k == web::json::kind_true() {
+        return bool_value(true);
+    }
+    if k == web::json::kind_false() {
+        return bool_value(false);
+    }
+    if k == web::json::kind_int() {
+        return Value { kind: kind_int(), text: jinja::context::text(ctx, node), safe: false, node: node };
+    }
+    if k == web::json::kind_float() {
+        return Value { kind: kind_float(), text: jinja::context::text(ctx, node), safe: false, node: node };
+    }
+    if k == web::json::kind_string() {
+        return Value { kind: kind_string(), text: jinja::context::text(ctx, node), safe: jinja::context::is_safe(ctx, path), node: node };
+    }
+    Value { kind: kind_dict(), text: std::string::empty(), safe: false, node: node }
+}
+
+/// Python's truthiness.
+///
+/// # Example
+/// ```tuo
+/// let yes = jinja::expr::truthy(v);
+/// ```
+pub fn truthy(in v: Value) -> Bool {
+    if v.kind == kind_undefined() || v.kind == kind_none() {
+        return false;
+    }
+    if v.kind == kind_bool() {
+        return std::string::as_str(v.text) == "True";
+    }
+    if v.kind == kind_int() {
+        return std::string::as_str(v.text) != "0";
+    }
+    if v.kind == kind_float() {
+        let f = web::coerce::float_from_text(std::string::as_str(v.text));
+        return !f.ok || f.value != 0.0;
+    }
+    if v.kind == kind_string() {
+        return std::string::len(v.text) > 0;
+    }
+    true
+}
+
+/// The value as the template prints it, escaped when `autoescape` is on
+/// and the value is not safe. `Undefined` prints as nothing.
+///
+/// # Example
+/// ```tuo
+/// let s = jinja::expr::printed(v, true);
+/// ```
+pub fn printed(in v: Value, take autoescape: Bool) -> String {
+    if v.kind == kind_undefined() {
+        return std::string::empty();
+    }
+    if v.kind == kind_dict() {
+        return std::string::from_str("{...}");
+    }
+    if autoescape && !v.safe {
+        return jinja::escape::html(std::string::as_str(v.text));
+    }
+    std::string::from_str(std::string::as_str(v.text))
+}
+
+fn is_number(in v: Value) -> Bool {
+    v.kind == kind_int() || v.kind == kind_float()
+}
+
+fn as_float(in v: Value) -> Float {
+    let f = web::coerce::float_from_text(std::string::as_str(v.text));
+    f.value
+}
+
+/// `a == b`, as Python compares: numbers by value, strings by text,
+/// otherwise by kind and text.
+///
+/// # Example
+/// ```tuo
+/// let same = jinja::expr::equal(a, b);
+/// ```
+pub fn equal(in a: Value, in b: Value) -> Bool {
+    if is_number(a) && is_number(b) {
+        return as_float(a) == as_float(b);
+    }
+    if is_number(a) || is_number(b) {
+        // A number and a bool compare by value; anything else is unequal.
+        if a.kind == kind_bool() && is_number(b) {
+            return as_float(b) == (if truthy(a) {
+                1.0
+            } else {
+                0.0
+            });
+        }
+        if b.kind == kind_bool() && is_number(a) {
+            return as_float(a) == (if truthy(b) {
+                1.0
+            } else {
+                0.0
+            });
+        }
+        return false;
+    }
+    if (a.kind == kind_undefined() || a.kind == kind_none()) && (b.kind == kind_undefined() || b.kind == kind_none()) {
+        return true;
+    }
+    a.kind == b.kind && std::string::as_str(a.text) == std::string::as_str(b.text)
+}
+
+fn byte_less(in a: Str, in b: Str) -> Bool {
+    let n = std::str::len(a);
+    let m = std::str::len(b);
+    var i = 0;
+    while i < n && i < m {
+        let x = std::str::byte_at(a, i);
+        let y = std::str::byte_at(b, i);
+        if x != y {
+            return x < y;
+        }
+        i = i + 1;
+    }
+    n < m
+}
+
+/// `a < b`: numbers by value, strings by bytes; anything else is false.
+///
+/// # Example
+/// ```tuo
+/// let yes = jinja::expr::less(a, b);
+/// ```
+pub fn less(in a: Value, in b: Value) -> Bool {
+    if is_number(a) && is_number(b) {
+        return as_float(a) < as_float(b);
+    }
+    if a.kind == kind_string() && b.kind == kind_string() {
+        return byte_less(std::string::as_str(a.text), std::string::as_str(b.text));
+    }
+    false
+}
+
+// ----------------------------------------------------------------------------
+// Tokens.
+// ----------------------------------------------------------------------------
+
+/// Expression tokens: kinds 0 name, 1 string, 2 number, 3 punctuation.
+pub struct Tokens {
+    kinds: Array[Int],
+    texts: Array[String],
+}
+
+fn is_name_byte(take b: Int) -> Bool {
+    (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95
+}
+
+fn is_digit(take b: Int) -> Bool {
+    b >= 48 && b <= 57
+}
+
+fn hex_value(in s: Str, take from: Int, take width: Int) -> Int {
+    var value = 0;
+    var i = 0;
+    while i < width {
+        let b = std::str::byte_at(s, from + i);
+        var d = 0;
+        if b >= 48 && b <= 57 {
+            d = b - 48;
+        } else if b >= 97 && b <= 102 {
+            d = b - 87;
+        } else if b >= 65 && b <= 70 {
+            d = b - 55;
+        }
+        value = value * 16 + d;
+        i = i + 1;
+    }
+    value
+}
+
+fn push_utf8(mut out: String, take code: Int) {
+    if code < 128 {
+        std::string::push_byte(out, code);
+    } else if code < 2048 {
+        std::string::push_byte(out, 192 + code / 64);
+        std::string::push_byte(out, 128 + code % 64);
+    } else {
+        std::string::push_byte(out, 224 + code / 4096);
+        std::string::push_byte(out, 128 + (code / 64) % 64);
+        std::string::push_byte(out, 128 + code % 64);
+    }
+}
+
+/// Tokenize an expression.
+///
+/// # Example
+/// ```tuo
+/// let t = jinja::expr::tokenize("amount | currency(currency)");
+/// ```
+pub fn tokenize(in s: Str) -> Tokens {
+    var t = Tokens { kinds: std::array::empty(), texts: std::array::empty() };
+    let n = std::str::len(s);
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(s, i);
+        if b == 32 || b == 9 || b == 10 || b == 13 {
+            i = i + 1;
+        } else if b == 34 || b == 39 {
+            var text = std::string::empty();
+            i = i + 1;
+            while i < n && std::str::byte_at(s, i) != b {
+                if std::str::byte_at(s, i) == 92 && i + 1 < n {
+                    // Python's escapes, as Jinja's string literals take them.
+                    let e = std::str::byte_at(s, i + 1);
+                    if e == 110 {
+                        std::string::push_byte(text, 10);
+                        i = i + 2;
+                    } else if e == 116 {
+                        std::string::push_byte(text, 9);
+                        i = i + 2;
+                    } else if e == 117 && i + 5 < n {
+                        push_utf8(text, hex_value(s, i + 2, 4));
+                        i = i + 6;
+                    } else {
+                        std::string::push_byte(text, e);
+                        i = i + 2;
+                    }
+                } else {
+                    std::string::push_byte(text, std::str::byte_at(s, i));
+                    i = i + 1;
+                }
+            }
+            i = i + 1;
+            std::array::push(t.kinds, 1);
+            std::array::push(t.texts, text);
+        } else if is_digit(b) {
+            var text = std::string::empty();
+            while i < n && (is_digit(std::str::byte_at(s, i)) || std::str::byte_at(s, i) == 46) {
+                std::string::push_byte(text, std::str::byte_at(s, i));
+                i = i + 1;
+            }
+            std::array::push(t.kinds, 2);
+            std::array::push(t.texts, text);
+        } else if is_name_byte(b) {
+            var text = std::string::empty();
+            while i < n && is_name_byte(std::str::byte_at(s, i)) {
+                std::string::push_byte(text, std::str::byte_at(s, i));
+                i = i + 1;
+            }
+            std::array::push(t.kinds, 0);
+            std::array::push(t.texts, text);
+        } else {
+            var text = std::string::empty();
+            std::string::push_byte(text, b);
+            if i + 1 < n && std::str::byte_at(s, i + 1) == 61 && (b == 61 || b == 33 || b == 60 || b == 62) {
+                std::string::push_byte(text, 61);
+                i = i + 1;
+            }
+            i = i + 1;
+            std::array::push(t.kinds, 3);
+            std::array::push(t.texts, text);
+        }
+    }
+    t
+}
+
+// A copy, not a borrow: a `Str` borrowed from an array element and
+// returned dangles in native code (docs/COMPILER-FINDING-3.md).
+fn at(in t: Tokens, take i: Int) -> String {
+    if i < std::array::len(t.texts) {
+        std::string::from_str(std::string::as_str(std::array::get(t.texts, i)))
+    } else {
+        std::string::empty()
+    }
+}
+
+fn kind_at(in t: Tokens, take i: Int) -> Int {
+    if i < std::array::len(t.kinds) {
+        std::array::get(t.kinds, i)
+    } else {
+        -1
+    }
+}
+
+fn is_word(in t: Tokens, take i: Int, in word: Str) -> Bool {
+    kind_at(t, i) == 0 && std::string::as_str(at(t, i)) == word
+}
+
+fn is_punct(in t: Tokens, take i: Int, in p: Str) -> Bool {
+    kind_at(t, i) == 3 && std::string::as_str(at(t, i)) == p
+}
+
+// ----------------------------------------------------------------------------
+// The evaluator. `pos` is the cursor, advanced as productions consume.
+// ----------------------------------------------------------------------------
+
+fn parse_or(in ctx: jinja::context::Context, in t: Tokens, mut pos: Int) -> Value {
+    var left = parse_and(ctx, t, pos);
+    while is_word(t, pos, "or") {
+        pos = pos + 1;
+        let right = parse_and(ctx, t, pos);
+        if !truthy(left) {
+            left = right;
+        } else {
+            let _ = right;
+        }
+    }
+    left
+}
+
+fn parse_and(in ctx: jinja::context::Context, in t: Tokens, mut pos: Int) -> Value {
+    var left = parse_not(ctx, t, pos);
+    while is_word(t, pos, "and") {
+        pos = pos + 1;
+        let right = parse_not(ctx, t, pos);
+        if truthy(left) {
+            left = right;
+        } else {
+            let _ = right;
+        }
+    }
+    left
+}
+
+fn parse_not(in ctx: jinja::context::Context, in t: Tokens, mut pos: Int) -> Value {
+    if is_word(t, pos, "not") {
+        pos = pos + 1;
+        let inner = parse_not(ctx, t, pos);
+        return bool_value(!truthy(inner));
+    }
+    parse_comparison(ctx, t, pos)
+}
+
+fn parse_comparison(in ctx: jinja::context::Context, in t: Tokens, mut pos: Int) -> Value {
+    let left = parse_filtered(ctx, t, pos);
+    if kind_at(t, pos) != 3 {
+        return left;
+    }
+    let op = at(t, pos);
+    let o = std::string::as_str(op);
+    if o != "==" && o != "!=" && o != "<" && o != ">" && o != "<=" && o != ">=" {
+        return left;
+    }
+    pos = pos + 1;
+    let right = parse_filtered(ctx, t, pos);
+    if o == "==" {
+        return bool_value(equal(left, right));
+    }
+    if o == "!=" {
+        return bool_value(!equal(left, right));
+    }
+    if o == "<" {
+        return bool_value(less(left, right));
+    }
+    if o == ">" {
+        return bool_value(less(right, left));
+    }
+    if o == "<=" {
+        return bool_value(less(left, right) || equal(left, right));
+    }
+    bool_value(less(right, left) || equal(left, right))
+}
+
+fn parse_filtered(in ctx: jinja::context::Context, in t: Tokens, mut pos: Int) -> Value {
+    var value = parse_primary(ctx, t, pos);
+    while is_punct(t, pos, "|") {
+        pos = pos + 1;
+        let name = at(t, pos);
+        pos = pos + 1;
+        var args = std::array::empty();
+        if is_punct(t, pos, "(") {
+            pos = pos + 1;
+            while pos < std::array::len(t.kinds) && !is_punct(t, pos, ")") {
+                let arg = parse_or(ctx, t, pos);
+                std::array::push(args, arg.text);
+                if is_punct(t, pos, ",") {
+                    pos = pos + 1;
+                }
+            }
+            pos = pos + 1;
+        }
+        value = jinja::filters::apply(std::string::as_str(name), value, args);
+    }
+    value
+}
+
+fn parse_primary(in ctx: jinja::context::Context, in t: Tokens, mut pos: Int) -> Value {
+    let k = kind_at(t, pos);
+    if k == 1 {
+        let v = string_value(std::string::as_str(at(t, pos)), false);
+        pos = pos + 1;
+        return v;
+    }
+    if k == 2 {
+        let text = at(t, pos);
+        pos = pos + 1;
+        if std::str::contains_byte(std::string::as_str(text), 46) {
+            return Value { kind: kind_float(), text: text, safe: false, node: -1 };
+        }
+        return Value { kind: kind_int(), text: text, safe: false, node: -1 };
+    }
+    if is_punct(t, pos, "(") {
+        pos = pos + 1;
+        let inner = parse_ternary(ctx, t, pos);
+        if is_punct(t, pos, ")") {
+            pos = pos + 1;
+        }
+        return inner;
+    }
+    if k == 0 {
+        let word_owned = at(t, pos);
+        let word = std::string::as_str(word_owned);
+        if word == "true" || word == "True" {
+            pos = pos + 1;
+            return bool_value(true);
+        }
+        if word == "false" || word == "False" {
+            pos = pos + 1;
+            return bool_value(false);
+        }
+        if word == "none" || word == "None" {
+            pos = pos + 1;
+            return Value { kind: kind_none(), text: std::string::from_str("None"), safe: false, node: -1 };
+        }
+        var path = std::string::from_str(word);
+        pos = pos + 1;
+        while is_punct(t, pos, ".") && kind_at(t, pos + 1) == 0 {
+            std::string::push_byte(path, 46);
+            std::string::append(path, std::string::as_str(at(t, pos + 1)));
+            pos = pos + 2;
+        }
+        return of_path(ctx, std::string::as_str(path));
+    }
+    pos = pos + 1;
+    undefined()
+}
+
+fn parse_ternary(in ctx: jinja::context::Context, in t: Tokens, mut pos: Int) -> Value {
+    let chosen = parse_or(ctx, t, pos);
+    if !is_word(t, pos, "if") {
+        return chosen;
+    }
+    pos = pos + 1;
+    let condition = parse_or(ctx, t, pos);
+    var otherwise = undefined();
+    if is_word(t, pos, "else") {
+        pos = pos + 1;
+        otherwise = parse_ternary(ctx, t, pos);
+    }
+    var result = chosen;
+    if !truthy(condition) {
+        result = otherwise;
+    } else {
+        let _ = otherwise;
+    }
+    result
+}
+
+/// Evaluate an expression against a context.
+///
+/// # Example
+/// ```tuo
+/// let v = jinja::expr::evaluate(ctx, "name if name else \"—\"");
+/// ```
+pub fn evaluate(in ctx: jinja::context::Context, in source: Str) -> Value {
+    let t = tokenize(source);
+    var pos = 0;
+    parse_ternary(ctx, t, pos)
+}
+
+fn sample() -> jinja::context::Context {
+    jinja::context::from_json("{\"name\":\"Ada <b>\",\"safe_name\":\"<i>Ada</i>\",\"n\":3,\"z\":0,\"f\":0.5,\"empty\":\"\",\"flag\":true,\"nothing\":null,\"t\":{\"a\":{\"b\":\"deep\"}},\"amount\":\"12.5\",\"currency\":\"USD\"}", "safe_name")
+}
+
+fn prints(in source: Str, in expected: Str) -> Bool {
+    std::string::as_str(printed(evaluate(sample(), source), true)) == expected
+}
+
+fn holds(in source: Str) -> Bool {
+    truthy(evaluate(sample(), source))
+}
+
+spec evaluate {
+    then prints("name", "Ada &lt;b&gt;");
+    then prints("safe_name", "<i>Ada</i>");
+    then prints("t.a.b", "deep");
+    then prints("n", "3");
+    then prints("f", "0.5");
+    then prints("nothing", "None");
+    then prints("missing", "");
+    then prints("flag", "True");
+    then prints("\"lit\"", "lit");
+    then prints("'q\"x'", "q&#34;x");
+    then prints("name if empty else \"\\u2014\"", "\u{2014}");
+    then prints("\"a\\nb\\t\\u00e9\"", "a\nb\t\u{e9}");
+    then prints("name if n else 'no'", "Ada &lt;b&gt;");
+    then prints("(n)", "3");
+}
+
+spec truthy {
+    then holds("n") && !holds("z") && !holds("empty") && !holds("nothing") && !holds("missing") && holds("f") && holds("flag");
+    then holds("n != 1") && !holds("n != 3") && holds("n == 3") && holds("n > 2") && !holds("n > 3") && holds("n >= 3") && holds("z < 1") && holds("z <= 0");
+    then holds("name == \"Ada <b>\"") && !holds("name == 'x'") && holds("missing == nothing");
+    then holds("not z") && !holds("not n") && holds("n and flag") && !holds("n and z") && holds("z or n") && !holds("z or empty");
+    then holds("n > 1 and n < 5") && holds("not (n > 5)");
+}
+
+spec "the filters the templates use" {
+    then prints("amount | currency(currency)", "12.50 USD");
+    then prints("amount | currency", "12.50 EUR");
+    then prints("name | e", "Ada &lt;b&gt;");
+    then prints("name | safe", "Ada <b>");
+    then prints("name | upper", "ADA &lt;B&gt;");
+    then prints("missing | default('x')", "x");
+    then prints("name | length", "7");
+    then prints("' pad ' | trim", "pad");
+}

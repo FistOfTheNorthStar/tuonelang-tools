@@ -1,2 +1,5 @@
 target/
 examples/oracle.json
+examples/s3_oracle.json
+examples/sentry_oracle.json
+examples/jinja_oracle.json

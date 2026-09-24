@@ -1,0 +1,235 @@
+// examples/s3 — the live oracle for the S3 client.
+//
+// `s3::request` is pinned to boto3's bytes by specs. What specs cannot
+// show is that a server accepts those bytes: that the signature
+// verifies, that the CRC-32 is checked, that a presigned URL works in a
+// plain HTTP client, that a listing pages. This program shows it against
+// the MinIO that `shallowflaws/docker/docker-compose.yml` publishes on
+// 127.0.0.1:9000 (minioadmin / minioadmin), in a bucket of its own that
+// it creates and deletes:
+//
+//     tuo run examples/s3.tuo <the S3_SRC list in run-tests.sh>
+//
+// The clock is SNTP's, so it needs UDP to the internet as well. It prints
+// one line per check and exits with the number that failed.
+
+module s3_check;
+
+fn endpoint() -> Str {
+    "http://localhost:9000"
+}
+
+fn timeout() -> Int {
+    10000
+}
+
+fn say(in text: Str) -> Int {
+    var line = std::string::from_str(text);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    0
+}
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    let _ = say(std::string::as_str(line));
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn note(in o: s3::client::Outcome) {
+    var line = std::string::from_str("      ");
+    std::str::push_int(line, s3::client::status(o));
+    std::str::push(line, " ");
+    std::str::push(line, std::string::as_str(s3::client::code(o)));
+    std::str::push(line, " ");
+    std::str::push(line, std::string::as_str(s3::client::message(o)));
+    let _ = say(std::string::as_str(line));
+}
+
+fn client_with(in secret: Str) -> s3::client::Client {
+    s3::client::new(s3::request::target(endpoint(), "minioadmin", secret, "us-east-1", "tuo-oracle"), timeout())
+}
+
+fn binary_body() -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < 1000 {
+        std::string::push_byte(out, (i * 7 + 3) % 256);
+        i = i + 1;
+    }
+    out
+}
+
+fn body_is(in o: s3::client::Outcome, in expected: Str) -> Bool {
+    std::string::as_str(s3::client::body(o)) == expected
+}
+
+fn expect(in label: Str, in o: s3::client::Outcome, take ok: Bool) -> Int {
+    if !ok {
+        note(o);
+    }
+    report(label, ok)
+}
+
+fn fine(in label: Str, in o: s3::client::Outcome) -> Int {
+    let ok = s3::client::is_ok(o);
+    expect(label, o, ok)
+}
+
+// A copy, not a borrow: a `Str` borrowed from an array element and
+// returned dangles in native code (docs/COMPILER-FINDING-3.md).
+fn key_at(in keys: Array[String], take i: Int) -> String {
+    if i < std::array::len(keys) {
+        std::string::from_str(std::string::as_str(std::array::get(keys, i)))
+    } else {
+        std::string::empty()
+    }
+}
+
+fn key_is(in keys: Array[String], take i: Int, in expected: Str) -> Bool {
+    std::string::as_str(key_at(keys, i)) == expected
+}
+
+// EFFECT: a signed request with one header value replaced, sent raw.
+fn tampered(in c: s3::client::Client, in r: s3::request::Request, in header_name: Str, in value: Str) -> Int {
+    var extra = std::string::empty();
+    var i = 0;
+    while i < std::array::len(r.header_names) {
+        let name = std::string::as_str(std::array::get(r.header_names, i));
+        if name != "content-length" {
+            if name == header_name {
+                http::message::header_line(extra, name, value);
+            } else {
+                http::message::header_line(extra, name, std::string::as_str(std::array::get(r.header_values, i)));
+            }
+        }
+        i = i + 1;
+    }
+    let response = http::client::fetch_once(std::string::as_str(r.method), std::string::as_str(s3::request::url(c.target, r)), std::string::as_str(extra), std::string::as_str(r.body), timeout(), http::client::default_resolver());
+    response.status
+}
+
+// EFFECT: a PUT signed with UNSIGNED-PAYLOAD and a chosen CRC-32 header,
+// so the checksum check is reached without the signature failing first.
+fn unsigned_with_crc(in c: s3::client::Client, in key: Str, in data: Str, in crc: Str, in stamp: Str) -> Int {
+    var r = s3::sigv4::signable("PUT", std::string::as_str(s3::request::object_path(c.target, key)));
+    s3::sigv4::header(r, "content-type", "text/plain");
+    s3::sigv4::header(r, "x-amz-checksum-crc32", crc);
+    s3::sigv4::header(r, "x-amz-date", stamp);
+    s3::sigv4::header(r, "x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+    s3::sigv4::payload(r, "UNSIGNED-PAYLOAD");
+    var extra = std::string::empty();
+    var i = 0;
+    while i < std::array::len(r.header_names) {
+        http::message::header_line(extra, std::string::as_str(std::array::get(r.header_names, i)), std::string::as_str(std::array::get(r.header_values, i)));
+        i = i + 1;
+    }
+    http::message::header_line(extra, "authorization", std::string::as_str(s3::sigv4::authorization(r, std::string::as_str(s3::request::host(c.target)), "minioadmin", "minioadmin", stamp, "us-east-1")));
+    var url = std::string::from_str(endpoint());
+    std::string::append(url, std::string::as_str(r.path));
+    let response = http::client::fetch_once("PUT", std::string::as_str(url), std::string::as_str(extra), data, timeout(), http::client::default_resolver());
+    response.status
+}
+
+fn main() -> Int {
+    var failed = 0;
+    let c = client_with("minioadmin");
+    let stamp = s3::client::now_stamp(c);
+    failed = failed + report("clock: SNTP gave an X-Amz-Date", std::string::len(stamp) == 16);
+    if std::string::len(stamp) == 0 {
+        return failed;
+    }
+
+    let made = s3::client::create_bucket(c);
+    failed = failed + expect("create_bucket (or it already exists)", made, s3::client::is_ok(made) || std::string::as_str(s3::client::code(made)) == "BucketAlreadyOwnedByYou");
+
+    let csv = "id,name\n1,Ada\n2,Bob\n";
+    failed = failed + fine("put_object: text, CRC-32 in a header, payload signed", s3::client::put(c, "extraction/7/result.csv", csv, "text/csv; charset=utf-8"));
+    let put_binary = s3::client::put(c, "photos/job_applicant/logo one.png", std::string::as_str(binary_body()), "image/png");
+    failed = failed + expect("put_object: 1000 binary bytes, a space in the key", put_binary, s3::client::is_ok(put_binary));
+    failed = failed + fine("put_object: an empty body", s3::client::put(c, "extraction/7/docs/empty.txt", "", "text/plain"));
+    failed = failed + fine("put_object: a key with & and +", s3::client::put(c, "extraction/7/docs/b & c+d.pdf", "pdf", "application/pdf"));
+    failed = failed + fine("put_object: a third document", s3::client::put(c, "extraction/7/docs/z.pdf", "pdf", "application/pdf"));
+
+    let present = s3::client::head(c, "extraction/7/result.csv");
+    failed = failed + expect("head_object: an existing key is 200", present, s3::client::status(present) == 200);
+    let absent = s3::client::head(c, "extraction/7/nope.csv");
+    failed = failed + expect("head_object: a missing key is 404", absent, s3::client::status(absent) == 404);
+
+    let got = s3::client::get(c, "extraction/7/result.csv");
+    failed = failed + expect("get_object: the text came back", got, body_is(got, csv));
+    let got_binary = s3::client::get(c, "photos/job_applicant/logo one.png");
+    failed = failed + expect("get_object: the binary came back byte for byte", got_binary, std::string::as_str(s3::client::body(got_binary)) == std::string::as_str(binary_body()));
+    let missing = s3::client::get(c, "extraction/7/nope.csv");
+    failed = failed + expect("get_object: a missing key is NoSuchKey", missing, s3::client::status(missing) == 404 && std::string::as_str(s3::client::code(missing)) == "NoSuchKey");
+
+    var pages = 0;
+    let keys = s3::client::list(c, "extraction/7/docs/", 2, pages);
+    failed = failed + report("list_objects_v2: three keys under the prefix, decoded", std::array::len(keys) == 3 && key_is(keys, 0, "extraction/7/docs/b & c+d.pdf") && key_is(keys, 1, "extraction/7/docs/empty.txt") && key_is(keys, 2, "extraction/7/docs/z.pdf"));
+    failed = failed + report("list_objects_v2: paged twice at max-keys 2, by continuation token", pages == 2);
+    var none = 0;
+    failed = failed + report("list_objects_v2: an unknown prefix lists nothing", std::array::len(s3::client::list(c, "nowhere/", 1000, none)) == 0);
+
+    // A presigned download works in a client that knows nothing of S3.
+    let url = s3::client::presigned_get(c, "extraction/7/result.csv", "text/csv", "attachment; filename=\"result.csv\"", 900);
+    let downloaded = http::client::get(std::string::as_str(url), timeout());
+    failed = failed + report("presigned GET: fetched by a plain HTTP GET", downloaded.ok && downloaded.status == 200 && std::string::as_str(downloaded.body) == csv);
+    failed = failed + report("presigned GET: the response headers asked for were honoured", std::string::as_str(http::client::header(downloaded, "Content-Type")) == "text/csv" && std::string::as_str(http::client::header(downloaded, "Content-Disposition")) == "attachment; filename=\"result.csv\"");
+    var broken = std::string::from_str(std::string::as_str(url));
+    std::string::push_byte(broken, 48);
+    let refused = http::client::get(std::string::as_str(broken), timeout());
+    failed = failed + report("presigned GET: a tampered signature is 403", refused.status == 403);
+
+    // A presigned upload: PUT with the content type the signature names.
+    let upload = s3::client::presigned_put(c, "extraction/7/source.zip", "application/zip", 3600);
+    var ct = std::string::empty();
+    http::message::header_line(ct, "Content-Type", "application/zip");
+    let uploaded = http::client::fetch_once("PUT", std::string::as_str(upload), std::string::as_str(ct), "PK\u{3}\u{4}zip", timeout(), http::client::default_resolver());
+    failed = failed + report("presigned PUT: accepted with the signed content type", uploaded.status == 200);
+    var other = std::string::empty();
+    http::message::header_line(other, "Content-Type", "text/plain");
+    let wrong_type = http::client::fetch_once("PUT", std::string::as_str(upload), std::string::as_str(other), "x", timeout(), http::client::default_resolver());
+    failed = failed + report("presigned PUT: refused with another content type", wrong_type.status == 403);
+    let stored = s3::client::get(c, "extraction/7/source.zip");
+    failed = failed + expect("presigned PUT: the upload is readable through the client", stored, body_is(stored, "PK\u{3}\u{4}zip"));
+
+    // The server checks what the signature and the checksum protect.
+    let good = s3::request::put_object_plain(c.target, "extraction/7/tamper.txt", "hello", "text/plain", std::string::as_str(stamp));
+    let bad_crc = unsigned_with_crc(c, "extraction/7/tamper.txt", "hello", "AAAAAA==", std::string::as_str(stamp));
+    failed = failed + report("put_object: a wrong CRC-32 under UNSIGNED-PAYLOAD is refused", bad_crc == 400);
+    let good_crc = unsigned_with_crc(c, "extraction/7/tamper.txt", "hello", std::string::as_str(s3::crc32::header_value("hello")), std::string::as_str(stamp));
+    failed = failed + report("put_object: UNSIGNED-PAYLOAD with the right CRC-32 is accepted", good_crc == 200);
+    let _ = s3::client::delete(c, "extraction/7/tamper.txt");
+    let bad_sig = tampered(c, good, "authorization", "AWS4-HMAC-SHA256 Credential=minioadmin/20260922/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000");
+    failed = failed + report("put_object: a wrong signature is 403", bad_sig == 403);
+    let impostor = client_with("not-the-secret");
+    let forged = s3::client::head(impostor, "extraction/7/result.csv");
+    failed = failed + expect("head_object: a wrong secret is 403", forged, s3::client::status(forged) == 403);
+    let never = s3::client::head(c, "extraction/7/tamper.txt");
+    failed = failed + expect("put_object: nothing was stored by the refused uploads", never, s3::client::status(never) == 404);
+
+    // Tear down: the paginated delete the extraction task does.
+    var docs = 0;
+    let to_delete = s3::client::list(c, "extraction/7/docs/", 1000, docs);
+    let deleted = s3::client::delete_many(c, to_delete);
+    failed = failed + expect("delete_objects: three keys in one request", deleted, s3::client::is_ok(deleted) && std::array::len(s3::xml::each(std::string::as_str(s3::client::body(deleted)), "Deleted")) == 3);
+    var after = 0;
+    failed = failed + report("delete_objects: the prefix is empty afterwards", std::array::len(s3::client::list(c, "extraction/7/docs/", 1000, after)) == 0);
+    failed = failed + fine("delete_object: result.csv", s3::client::delete(c, "extraction/7/result.csv"));
+    failed = failed + fine("delete_object: source.zip", s3::client::delete(c, "extraction/7/source.zip"));
+    failed = failed + fine("delete_object: the photo", s3::client::delete(c, "photos/job_applicant/logo one.png"));
+    let gone = s3::client::delete(c, "extraction/7/result.csv");
+    failed = failed + expect("delete_object: deleting a missing key is still 204", gone, s3::client::status(gone) == 204);
+    failed = failed + fine("delete_bucket: the empty bucket is removed", s3::client::delete_bucket(c));
+    failed
+}

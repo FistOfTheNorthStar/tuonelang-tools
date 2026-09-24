@@ -1,0 +1,285 @@
+// sentry::client — the effect boundary: ids, the clock, the POST.
+//
+// What the pure modules leave to be supplied — an event id, a trace and
+// span id, the time — comes from `std::crypto::nonce` and SNTP here, and
+// the envelope goes to the DSN's endpoint as sentry-sdk sends it: a POST
+// with `Content-Type: application/x-sentry-envelope` and `X-Sentry-Auth`.
+// The SDK gzips its envelopes; this client sends them plain, which
+// Sentry accepts. Nothing is queued: a capture is one request, answered
+// before the call returns, and a failure to reach Sentry is the
+// `Outcome`, never an exception in the caller's path.
+//
+// `record` is the logging integration: every record at INFO or above
+// becomes a breadcrumb, and one at ERROR or above becomes an event too.
+
+module sentry::client;
+
+/// A configured client.
+pub struct Client {
+    ok: Bool,
+    dsn: sentry::dsn::Dsn,
+    scope: sentry::scope::Scope,
+    resolver: String,
+    clock_server: String,
+    timeout_ms: Int,
+    trace_id: String,
+}
+
+/// What a capture answered: the HTTP status (0 when Sentry was not
+/// reached) and the event id that was sent.
+pub struct Outcome {
+    status: Int,
+    event_id: String,
+}
+
+/// `sentry_sdk.init(dsn=…, environment=…, release=…, server_name=…)`.
+/// Not `ok` when the DSN is malformed — `init` without a DSN is a
+/// no-op in the SDK, and every capture here then answers status 0.
+///
+/// # Example
+/// ```tuo
+/// var c = sentry::client::new(dsn, "production", "shallowflaws@2026.09.22", "cloud", 10000);
+/// ```
+pub fn new(in dsn_text: Str, in environment: Str, in release: Str, in server_name: Str, take timeout_ms: Int) -> Client {
+    let d = sentry::dsn::parse(dsn_text);
+    Client { ok: sentry::dsn::is_ok(d), dsn: d, scope: sentry::scope::new(environment, release, server_name), resolver: std::string::from_str(http::client::default_resolver()), clock_server: std::string::from_str(tls::clock::default_server()), timeout_ms: timeout_ms, trace_id: fresh_id() }
+}
+
+/// Is the client configured?
+///
+/// # Example
+/// ```tuo
+/// let on = sentry::client::is_ok(c);
+/// ```
+pub fn is_ok(in c: Client) -> Bool {
+    c.ok
+}
+
+/// The status of an outcome.
+///
+/// # Example
+/// ```tuo
+/// let s = sentry::client::status(o);
+/// ```
+pub fn status(in o: Outcome) -> Int {
+    o.status
+}
+
+/// The event id an outcome sent.
+///
+/// # Example
+/// ```tuo
+/// let id = sentry::client::event_id(o);
+/// ```
+pub fn event_id(in o: Outcome) -> String {
+    std::string::from_str(std::string::as_str(o.event_id))
+}
+
+fn hex_of(in bytes: Array[Int]) -> String {
+    std::crypto::to_hex(bytes)
+}
+
+/// EFFECT: `uuid.uuid4().hex` — 32 hex characters with the version and
+/// variant bits set.
+///
+/// # Example
+/// ```tuo
+/// let id = sentry::client::fresh_id();
+/// ```
+pub fn fresh_id() -> String {
+    uuid4_of(std::crypto::nonce(16))
+}
+
+/// Sixteen random bytes as a version-4 UUID's hex: the version nibble
+/// and the variant bits set, as `uuid4` sets them.
+///
+/// # Example
+/// ```tuo
+/// let id = sentry::client::uuid4_of(bytes);
+/// ```
+pub fn uuid4_of(take bytes: Array[Int]) -> String {
+    std::array::set(bytes, 6, (std::array::get(bytes, 6) % 16) + 64);
+    std::array::set(bytes, 8, (std::array::get(bytes, 8) % 64) + 128);
+    hex_of(bytes)
+}
+
+/// EFFECT: a span id — 16 hex characters.
+///
+/// # Example
+/// ```tuo
+/// let id = sentry::client::fresh_span();
+/// ```
+pub fn fresh_span() -> String {
+    hex_of(std::crypto::nonce(8))
+}
+
+/// `unix` as the SDK writes a timestamp: `2026-09-22T08:30:00.000000Z`.
+///
+/// # Example
+/// ```tuo
+/// let t = sentry::client::iso_time(1790065800);
+/// ```
+pub fn iso_time(take unix: Int) -> String {
+    let iso = x509::time::render(unix);
+    var out = std::string::slice(iso, 0, 19);
+    std::string::append(out, ".000000Z");
+    out
+}
+
+/// EFFECT: the current time from SNTP, as the SDK writes it; empty when
+/// the clock could not be read.
+///
+/// # Example
+/// ```tuo
+/// let t = sentry::client::now_iso(c);
+/// ```
+pub fn now_iso(in c: Client) -> String {
+    let unix = tls::clock::now_unix(std::string::as_str(c.clock_server), c.timeout_ms);
+    if unix <= 0 {
+        return std::string::empty();
+    }
+    iso_time(unix)
+}
+
+/// EFFECT: the current time as `asctime`, for breadcrumb data; empty
+/// when the clock could not be read.
+///
+/// # Example
+/// ```tuo
+/// let t = sentry::client::now_asctime(c);
+/// ```
+pub fn now_asctime(in c: Client) -> String {
+    let unix = tls::clock::now_unix(std::string::as_str(c.clock_server), c.timeout_ms);
+    if unix <= 0 {
+        return std::string::empty();
+    }
+    log::format::asctime(unix * 1000)
+}
+
+/// `set_tag`.
+///
+/// # Example
+/// ```tuo
+/// sentry::client::set_tag(c, "job_id", "7");
+/// ```
+pub fn set_tag(mut c: Client, in name: Str, in value: Str) {
+    sentry::scope::set_tag(c.scope, name, value);
+}
+
+/// `set_user({"id": …})`.
+///
+/// # Example
+/// ```tuo
+/// sentry::client::set_user(c, "42");
+/// ```
+pub fn set_user(mut c: Client, in id: Str) {
+    sentry::scope::set_user(c.scope, id);
+}
+
+/// EFFECT: `add_breadcrumb`, stamped now.
+///
+/// # Example
+/// ```tuo
+/// sentry::client::add_breadcrumb(c, "auth", "login", "info", "{\"user_id\":42}");
+/// ```
+pub fn add_breadcrumb(mut c: Client, in category: Str, in message: Str, in level: Str, in data: Str) {
+    let now = now_iso(c);
+    sentry::scope::add_breadcrumb(c.scope, category, message, level, data, std::string::as_str(now));
+}
+
+fn unsent(take event_id: String) -> Outcome {
+    Outcome { status: 0, event_id: event_id }
+}
+
+// EFFECT: stamp, wrap, and POST a payload builder's output.
+fn send(in c: Client, in payload: Str, in st: sentry::event::Stamp, in sent_at: Str) -> Outcome {
+    if !c.ok {
+        return unsent(sentry::event::event_id(st));
+    }
+    let envelope = sentry::envelope::serialize(c.dsn, c.scope, st, sent_at, payload);
+    var extra = std::string::empty();
+    http::message::header_line(extra, "Content-Type", "application/x-sentry-envelope");
+    http::message::header_line(extra, "X-Sentry-Auth", std::string::as_str(sentry::dsn::auth_header(c.dsn, sentry::dsn::client_name())));
+    let response = http::client::fetch_once_trusting("POST", std::string::as_str(sentry::dsn::envelope_url(c.dsn)), std::string::as_str(extra), std::string::as_str(envelope), c.timeout_ms, std::string::as_str(c.resolver), std::array::empty(), x509::roots::store());
+    if !response.ok {
+        return unsent(sentry::event::event_id(st));
+    }
+    Outcome { status: response.status, event_id: sentry::event::event_id(st) }
+}
+
+fn stamp_now(in c: Client) -> sentry::event::Stamp {
+    let now = now_iso(c);
+    sentry::event::stamp(std::string::as_str(fresh_id()), std::string::as_str(c.trace_id), std::string::as_str(fresh_span()), std::string::as_str(now))
+}
+
+/// EFFECT: `capture_message(text, level=…)`.
+///
+/// # Example
+/// ```tuo
+/// let o = sentry::client::capture_message(c, "Extraction finished", "info");
+/// ```
+pub fn capture_message(in c: Client, in text: Str, in level: Str) -> Outcome {
+    let st = stamp_now(c);
+    let sent_at = now_iso(c);
+    send(c, std::string::as_str(sentry::event::message(c.scope, text, level, st)), st, std::string::as_str(sent_at))
+}
+
+/// EFFECT: `capture_exception`: an error of `kind` with `value`, and the
+/// frames the caller can name.
+///
+/// # Example
+/// ```tuo
+/// let o = sentry::client::capture_error(c, "ValueError", "bad input", frames);
+/// ```
+pub fn capture_error(in c: Client, in kind: Str, in value: Str, in frames: sentry::event::Frames) -> Outcome {
+    let st = stamp_now(c);
+    let sent_at = now_iso(c);
+    send(c, std::string::as_str(sentry::event::error(c.scope, kind, value, frames, st)), st, std::string::as_str(sent_at))
+}
+
+/// EFFECT: the logging integration for one record: a breadcrumb at INFO
+/// or above, and at ERROR or above an event as well — with an exception
+/// attached when `kind` is not empty (`logger.exception`). The event is
+/// made before the record joins the breadcrumbs, as the SDK does.
+///
+/// # Example
+/// ```tuo
+/// let o = sentry::client::record(c, r, "", "", sentry::event::no_frames());
+/// ```
+pub fn record(mut c: Client, in r: log::record::Record, in kind: Str, in value: Str, in frames: sentry::event::Frames) -> Outcome {
+    var outcome = unsent(std::string::empty());
+    if log::record::level(r) >= log::record::error() {
+        let st = stamp_now(c);
+        let sent_at = now_iso(c);
+        outcome = send(c, std::string::as_str(sentry::event::logged(c.scope, r, kind, value, frames, st)), st, std::string::as_str(sent_at));
+    }
+    let now = now_iso(c);
+    sentry::scope::note(c.scope, r, std::string::as_str(now), std::string::as_str(log::format::asctime(log::record::unix_ms(r))));
+    outcome
+}
+
+fn id_shape_ok(in id: String) -> Bool {
+    if std::string::len(id) != 32 {
+        return false;
+    }
+    let version = std::string::byte_at(id, 12);
+    let variant = std::string::byte_at(id, 16);
+    version == 52 && (variant == 56 || variant == 57 || variant == 97 || variant == 98)
+}
+
+fn counting(take from: Int) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < 16 {
+        std::array::push(out, (from + i * 17) % 256);
+        i = i + 1;
+    }
+    out
+}
+
+spec uuid4_of {
+    then id_shape_ok(uuid4_of(counting(0)));
+    then id_shape_ok(uuid4_of(counting(200)));
+    then std::string::as_str(uuid4_of(counting(0))) == "00112233445546778899aabbccddeeff";
+    then std::string::as_str(iso_time(1790065800)) == "2026-09-22T08:30:00.000000Z";
+}

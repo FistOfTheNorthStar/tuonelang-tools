@@ -1,0 +1,257 @@
+// log::record — a log record, as Python's `logging` makes one.
+//
+// The backend logs through the standard library: `logger.info("sent to
+// %s", address)`, a name per module, five levels. A record here is the
+// logger's name, the level, the template and its arguments, and the
+// time, with `message` doing what `LogRecord.getMessage` does — the
+// `%`-formatting of the template with the arguments, which is deferred
+// in Python so a record below the threshold costs nothing.
+//
+// Arguments are kept with their kind, because Sentry's `logentry.params`
+// carries them as JSON values: `3` stays a number, `"timeout"` a string.
+
+module log::record;
+
+/// `logging.DEBUG`.
+///
+/// # Example
+/// ```tuo
+/// let l = log::record::debug(); // 10
+/// ```
+pub fn debug() -> Int {
+    10
+}
+
+/// `logging.INFO`.
+///
+/// # Example
+/// ```tuo
+/// let l = log::record::info(); // 20
+/// ```
+pub fn info() -> Int {
+    20
+}
+
+/// `logging.WARNING`.
+///
+/// # Example
+/// ```tuo
+/// let l = log::record::warning(); // 30
+/// ```
+pub fn warning() -> Int {
+    30
+}
+
+/// `logging.ERROR`.
+///
+/// # Example
+/// ```tuo
+/// let l = log::record::error(); // 40
+/// ```
+pub fn error() -> Int {
+    40
+}
+
+/// `logging.CRITICAL`.
+///
+/// # Example
+/// ```tuo
+/// let l = log::record::critical(); // 50
+/// ```
+pub fn critical() -> Int {
+    50
+}
+
+/// `logging.getLevelName`: `DEBUG`, `INFO`, …, or `Level N`.
+///
+/// # Example
+/// ```tuo
+/// let n = log::record::level_name(30); // "WARNING"
+/// ```
+pub fn level_name(take level: Int) -> String {
+    if level == 10 {
+        return std::string::from_str("DEBUG");
+    }
+    if level == 20 {
+        return std::string::from_str("INFO");
+    }
+    if level == 30 {
+        return std::string::from_str("WARNING");
+    }
+    if level == 40 {
+        return std::string::from_str("ERROR");
+    }
+    if level == 50 {
+        return std::string::from_str("CRITICAL");
+    }
+    var out = std::string::from_str("Level ");
+    std::str::push_int(out, level);
+    out
+}
+
+/// A record.
+pub struct Record {
+    name: String,
+    level: Int,
+    template: String,
+    arg_kinds: Array[Int],
+    args: Array[String],
+    unix_ms: Int,
+}
+
+/// A record with no arguments yet; `unix_ms` is the time in milliseconds
+/// since the epoch.
+///
+/// # Example
+/// ```tuo
+/// var r = log::record::new("app.services.email", log::record::info(), "[SES] Email sent to %s", now_ms);
+/// ```
+pub fn new(in name: Str, take level: Int, in template: Str, take unix_ms: Int) -> Record {
+    Record { name: std::string::from_str(name), level: level, template: std::string::from_str(template), arg_kinds: std::array::empty(), args: std::array::empty(), unix_ms: unix_ms }
+}
+
+/// Add a string argument.
+///
+/// # Example
+/// ```tuo
+/// log::record::text(r, "a@b.co");
+/// ```
+pub fn text(mut r: Record, in value: Str) {
+    std::array::push(r.arg_kinds, 0);
+    std::array::push(r.args, std::string::from_str(value));
+}
+
+/// Add an integer argument.
+///
+/// # Example
+/// ```tuo
+/// log::record::int(r, 7);
+/// ```
+pub fn int(mut r: Record, take value: Int) {
+    std::array::push(r.arg_kinds, 1);
+    std::array::push(r.args, std::str::to_string(value));
+}
+
+/// The logger's name.
+///
+/// # Example
+/// ```tuo
+/// let n = log::record::name(r);
+/// ```
+pub fn name(in r: Record) -> String {
+    std::string::from_str(std::string::as_str(r.name))
+}
+
+/// The level.
+///
+/// # Example
+/// ```tuo
+/// let l = log::record::level(r);
+/// ```
+pub fn level(in r: Record) -> Int {
+    r.level
+}
+
+/// The template, before formatting.
+///
+/// # Example
+/// ```tuo
+/// let t = log::record::template(r);
+/// ```
+pub fn template(in r: Record) -> String {
+    std::string::from_str(std::string::as_str(r.template))
+}
+
+/// The time, in milliseconds since the epoch.
+///
+/// # Example
+/// ```tuo
+/// let t = log::record::unix_ms(r);
+/// ```
+pub fn unix_ms(in r: Record) -> Int {
+    r.unix_ms
+}
+
+/// `getMessage`: the template with `%s`, `%d`, and `%%` resolved. A
+/// template with no arguments is returned as written, as Python does.
+/// Other conversions are left in place.
+///
+/// # Example
+/// ```tuo
+/// let m = log::record::message(r);
+/// ```
+pub fn message(in r: Record) -> String {
+    if std::array::len(r.args) == 0 {
+        return std::string::from_str(std::string::as_str(r.template));
+    }
+    var out = std::string::empty();
+    let t = std::string::as_str(r.template);
+    let n = std::str::len(t);
+    var next = 0;
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(t, i);
+        if b == 37 && i + 1 < n {
+            let c = std::str::byte_at(t, i + 1);
+            if c == 37 {
+                std::string::push_byte(out, 37);
+                i = i + 2;
+            } else if (c == 115 || c == 100 || c == 114) && next < std::array::len(r.args) {
+                std::string::append(out, std::string::as_str(std::array::get(r.args, next)));
+                next = next + 1;
+                i = i + 2;
+            } else {
+                std::string::push_byte(out, b);
+                i = i + 1;
+            }
+        } else {
+            std::string::push_byte(out, b);
+            i = i + 1;
+        }
+    }
+    out
+}
+
+/// The arguments as a JSON array — Sentry's `logentry.params`.
+///
+/// # Example
+/// ```tuo
+/// let p = log::record::params_json(r); // ["a@b.co",3]
+/// ```
+pub fn params_json(in r: Record) -> String {
+    var out = std::string::from_str("[");
+    var i = 0;
+    while i < std::array::len(r.args) {
+        if i > 0 {
+            std::string::push_byte(out, 44);
+        }
+        if std::array::get(r.arg_kinds, i) == 1 {
+            std::string::append(out, std::string::as_str(std::array::get(r.args, i)));
+        } else {
+            web::json::push_string(out, std::string::as_str(std::array::get(r.args, i)));
+        }
+        i = i + 1;
+    }
+    std::string::push_byte(out, 93);
+    out
+}
+
+fn sample() -> Record {
+    var r = new("app.tasks", warning(), "retrying job %d after %s (100%%)", 1790065800123);
+    int(r, 7);
+    text(r, "timeout");
+    r
+}
+
+fn message_is(in expected: Str) -> Bool {
+    std::string::as_str(message(sample())) == expected
+}
+
+spec message {
+    then message_is("retrying job 7 after timeout (100%)");
+    then std::string::as_str(message(new("a", info(), "100%% done", 0))) == "100%% done";
+    then std::string::as_str(params_json(sample())) == "[7,\"timeout\"]";
+    then std::string::as_str(params_json(new("a", info(), "x", 0))) == "[]";
+    then std::string::as_str(level_name(50)) == "CRITICAL";
+    then std::string::as_str(level_name(25)) == "Level 25";
+}

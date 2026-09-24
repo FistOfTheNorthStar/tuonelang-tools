@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Eight ports so far:
+Twelve ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -16,6 +16,10 @@ Eight ports so far:
 | **`tls`** — a TLS 1.3 client on the catalog's `std::tls`, and `https://` in the HTTP client | the `ssl` module | RFC 8448's trace reproduced from the client's side, a 12-check loopback oracle against `std::tls`, an 8-check interop oracle against three OpenSSL servers, and live `https://` to Stripe, Sentry, and Cloudflare |
 | **`x509`**, **`ec`**, **`rsa`** — certificate parsing, chain validation, a root store, ECDSA on P-256/P-384, RSA PKCS#1 v1.5 and PSS, SHA-384 | the `ssl` module's trust half (`certifi`, `cryptography`'s verifier) | 380 specs (RFC 6979 and a test PKI natively), a 27-check oracle over chains captured from Cloudflare, Sentry, and Stripe |
 | **`sql`** — a typed query builder, DDL, Alembic's revision chain, SCRAM login, nested transactions, a connection pool | `sqlalchemy` (Core), `alembic`, `asyncpg`'s login | 34 specs, 117 statements compiled by SQLAlchemy 2.0 and Alembic 1.20 rebuilt byte for byte, RFC 7677, and a 51-check live oracle against PostgreSQL 18 |
+| **`s3`** — SigV4 signing, the seven S3 calls the backend makes, presigned URLs, CRC-32 checksums | `boto3` (the R2 half) | 15 specs, 22 requests captured from boto3 1.43 reproduced byte for byte, and a 35-check live oracle against MinIO |
+| **`log`** — `logging`'s records, levels, `%`-formatting, and the backend's two line formats | `logging` (as `app/main.py` configures it) | 4 specs, 7 records formatted as CPython 3.14 formats them |
+| **`sentry`** — DSNs, scope with breadcrumbs and tags, message and error events, the envelope, the logging integration | `sentry-sdk` | 6 specs, 7 envelopes serialized by sentry-sdk 2.69 reproduced byte for byte, and a 12-check loopback oracle |
+| **`jinja`** — the template engine: inheritance, `if`/`elif`/`else`, expressions with filters, autoescaping with `Markup`, Jinja's whitespace rules | `jinja2`, `markupsafe` | 9 specs, and 100 renders of the backend's 30 email templates by Jinja2 3.1.6 reproduced byte for byte |
 | **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
 
 ```bash
@@ -25,7 +29,9 @@ Eight ports so far:
                         # complete TLS 1.3 handshakes with three openssl s_server instances,
                         # fetch https:// from Stripe, Sentry, and Cloudflare, and drive the
                         # Redis client against shallowflaws's docker compose redis on 6380,
-                        # and run the query layer against a throwaway PostgreSQL
+                        # and the S3 client against its MinIO on 9000, post to a
+                        # Sentry-shaped loopback receiver, and run the query layer
+                        # against a throwaway PostgreSQL
 ```
 
 Every port is pure tuonelang over the v0 core, with the catalog modules
@@ -334,6 +340,277 @@ CAs; adding one is one base64 line. And the catalog's own caveat carries
 over: `std::bignum` is variable-time, so the client's X25519 step leaks
 timing on its ephemeral key. Signature *verification* is variable-time
 by design, and there is no signing function in `ec` or `rsa` at all.
+
+---
+
+## `jinja` — the template engine
+
+Every email the backend sends is a Jinja2 template: a child that
+`{% extends %}` a base and fills one `{% block %}`, with `{% if %}`
+branches, `{{ }}` expressions over nested dicts and one custom filter,
+rendered twice — HTML with autoescaping and `Markup` translations, text
+without. This port is that engine: the lexer with the two whitespace
+options the backend turns on, an evaluator for the expressions the
+templates use, and a renderer with inheritance.
+
+```tuo
+var l = jinja::template::loader();
+jinja::template::add(l, "base.html", base_source);
+jinja::template::add(l, "auth/welcome.html", welcome_source);
+var ctx = jinja::context::from_json(context_json, safe_paths);
+let html = jinja::template::render(l, "auth/welcome.html", ctx);
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `jinja::escape` — MarkupSafe's `escape` | ✅ proven |
+| `jinja::context` — the context as JSON, with the paths that are `Markup` | ✅ proven |
+| `jinja::lexer` — text, `{{ }}`, `{% %}`, `{# #}`; `trim_blocks`, `lstrip_blocks`, `-` and `+` | ✅ proven |
+| `jinja::expr` — names with attributes, literals with Python's escapes, comparisons, `not`/`and`/`or`, `a if c else b`, filters; Python's truthiness | ✅ proven |
+| `jinja::filters` — the backend's `currency`, and `safe`, `e`, `upper`, `lower`, `trim`, `length`, `default` | ✅ proven |
+| `jinja::template` — `if`/`elif`/`else` nesting, `extends` and `block` through any depth, `select_autoescape(["html"])`, the dropped trailing newline | ✅ 100 of 100 captured renders reproduced |
+
+### The oracle is Jinja2 rendering the backend's own templates
+
+`examples/jinja_oracle.py` calls every email function in `app/emails` —
+password reset, welcome with and without a verification link, purchases,
+payment failures, analysis started and complete, unread message,
+extraction complete and failed, VIES success and failure — in English
+and Finnish, with names and titles that carry markup, quotes, and
+non-ASCII text, and records what Jinja2 3.1.6 rendered through the
+backend's own environment: the template, the context it was given as
+JSON with the `Markup` paths listed, and the output. The thirty template
+sources go into the fixture as shipped. `jinja::demo` renders the same
+hundred and the spec holds each to byte equality.
+
+```bash
+../shallowflaws/.venv/bin/python examples/jinja_oracle.py   # writes examples/jinja_oracle.json
+python3 examples/jinja_fixture.py && tuo fmt src/jinja/fixture.tuo
+```
+
+### What the specs pin that a comment cannot
+
+**Whitespace is the hard part.** `trim_blocks` drops one newline after a
+block tag or a comment; `lstrip_blocks` drops the blanks from the start
+of a line up to one; neither touches `{{ }}`; `keep_trailing_newline` is
+off, so one final newline of every template source is dropped. The
+difference between `default<p>` and `default\n<p>` is a spec line.
+
+**Escaping is MarkupSafe's**: `&#34;` and `&#39;` for the quotes, and a
+`Markup` value — a translation string with author markup, a
+pre-escaped greeting — passes through untouched, while the name inside
+it was escaped before it got there.
+
+**`{{ x if x else "\u2014" }}`** needs three things at once: the inline
+conditional, Python's `\u` escape in a Jinja string literal, and an
+undefined name printing as nothing. **`{{ amount | currency(currency) }}`**
+is `f"{float(amount):.2f} {currency}"`, so `"12.5"` is `12.50 USD` and
+`"nope"` is `nope EUR`.
+
+**`elif` inside an inactive branch stays inactive**, and a branch already
+taken keeps `else` from firing — the nested spec, and the four
+`tier_reached` renders that first exposed it.
+
+### What is deliberately not here
+
+`for` loops, `set`, `include`, `import`, macros, `with`, `raw`, tests
+(`is defined`), subscripts (`x["k"]`), arithmetic, method calls, the
+rest of the built-in filters, and the sandbox — none of which the
+backend's templates use. An unknown filter leaves its input unchanged
+where Jinja would refuse the template. Rounding in `currency` is
+decimal, not binary: `0.005` is `0.01` here and `0.01` in CPython too,
+but a value that differs in the seventeenth digit could round the other
+way. The backend's own translation interpolation
+(`_interpolate_translations`) stays in Python: the oracle records its
+result as the context.
+
+---
+
+## `log` and `sentry` — what the backend says about itself
+
+The backend logs through Python's `logging` — a logger per module, five
+levels, `%`-templates — with a format `app/main.py` chooses by
+environment, and ships errors to Sentry through `sentry-sdk`, whose
+logging integration turns every log record into a breadcrumb and every
+error into an event. The two ports are those two layers, and the seam
+between them.
+
+```tuo
+let cfg = log::logger::production();
+var r = log::record::new("app.tasks.extraction_tasks", log::record::error(), "worker gave up after %d attempts", now_ms);
+log::record::int(r, 3);
+let _ = log::logger::emit(cfg, 2, r);                       // the JSON line, to stderr
+let o = sentry::client::record(sentry, r, "", "", frames);  // a breadcrumb — and, at ERROR, an event
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `log::record` — records, levels, `getMessage`'s `%s`/`%d`/`%%`, the arguments with their types | ✅ proven against CPython |
+| `log::format` — `asctime`, the development line, the production JSON line | ✅ proven |
+| `log::logger` — the root threshold, stderr, an in-memory journal | ✅ proven |
+| `sentry::dsn` — the DSN, the envelope endpoint, `X-Sentry-Auth`, the organisation id | ✅ proven against sentry-sdk |
+| `sentry::scope` — environment, release, server name, tags, user, the last hundred breadcrumbs, the logging integration's breadcrumb | ✅ proven |
+| `sentry::event`, `sentry::envelope` — message, exception, and logged events; the three-line envelope | ✅ 7 of 7 captured envelopes reproduced |
+| `sentry::client` — ids, the SNTP clock, the POST | ✅ 12 loopback checks |
+
+### The oracles are CPython and sentry-sdk
+
+`examples/sentry_oracle.py` formats seven records with CPython 3.14's
+`logging` under both of the backend's formats, and makes a fixed
+sequence of calls — messages, logged records, a logged exception, a
+captured one, tags and a user set along the way — against sentry-sdk
+2.69 with a transport that keeps the envelopes. What is Python's rather
+than the protocol's is stripped from each event (the installed modules,
+`sys.argv`, the CPython runtime, the SDK block, the frame locals), and
+every id and timestamp is fixed, so the port can be given the same
+inputs. `log::demo` and `sentry::demo` make the same records and calls,
+and the specs hold the lines and the envelopes to byte equality.
+
+```bash
+../shallowflaws/.venv/bin/python examples/sentry_oracle.py   # writes examples/sentry_oracle.json
+python3 examples/sentry_fixture.py && tuo fmt src/log/fixture.tuo src/sentry/fixture.tuo
+```
+
+### What the specs pin that a comment cannot
+
+**The production log format is not JSON.** `app/main.py` writes
+`{"time":"%(asctime)s",…,"message":"%(message)s"}` by hand, so a message
+with a quote or a newline produces a line no parser accepts; two of the
+seven captured records show it. `log::format::production` escapes, and
+the spec shows both what CPython wrote and what this port writes.
+`asctime` has a comma before the milliseconds.
+
+**Events are ordered as the SDK orders them.** `message`, `level`, then
+`event_id`, `timestamp`, `contexts.trace`, `user` if set,
+`transaction_info` (always `{}`), `tags` if set, `breadcrumbs` (always,
+`{"values":[]}` when empty), `release`, `environment`, `server_name` —
+and for a logged record, `level`, `exception` if one was attached,
+`logger`, `logentry` with the template, the formatted text, and the
+parameters as typed JSON (`[3]`, `["memory"]`). `CRITICAL` is `fatal`.
+
+**Breadcrumbs differ by origin.** The logging integration writes `type`,
+`level`, `category` (the logger's name), `message`, `timestamp`, `data`
+— with the handler's `asctime` copied into `data`, because the backend's
+format uses it; `add_breadcrumb` writes `category`, `message`, `level`,
+`data`, `timestamp`, `type: "default"`. An ERROR record's event is made
+before the record joins the breadcrumbs. The hundred-and-first
+breadcrumb drops the first.
+
+**The envelope is three lines and a newline**: a header with the event
+id, `sent_at`, and a `trace` block carrying the environment, release,
+public key, and organisation id (from `o123456.ingest…`); an item header
+with `content_type` and the payload's byte length; the payload.
+
+### What is deliberately not here
+
+Envelopes are sent uncompressed (the SDK gzips them; Sentry accepts
+both). Stack frames are what the caller names — there is no runtime
+reflection to read a stack. Not modelled: tracing and transactions
+(the backend samples 20 %; the `contexts.trace` ids identify a request
+and nothing more), sessions, attachments, `before_send`, sampling,
+retries and the transport queue, the Celery and FastAPI integrations'
+own tags, and `logging`'s handlers, filters, and per-logger levels
+beyond the root threshold. Timestamps are whole seconds from SNTP.
+
+---
+
+## `s3` — the R2 half of boto3
+
+The backend keeps uploads and extraction results in Cloudflare R2 and,
+in development, in a local MinIO — both speak S3. Of boto3's thousands
+of operations it calls seven: `put_object`, `get_object`, `head_object`,
+`delete_object`, `list_objects_v2` behind a paginator, `delete_objects`,
+and `generate_presigned_url` for a download and an upload. This port is
+those seven, on the crate's own HTTP and HTTPS clients, with every byte
+boto3 would send — the SigV4 signature included — reproduced from a
+capture of boto3 itself.
+
+```tuo
+let target = s3::request::target(endpoint, access_key, secret_key, "auto", bucket);
+let c = s3::client::new(target, 10000);
+let stored = s3::client::put(c, "extraction/7/result.csv", csv, "text/csv");
+let url = s3::client::presigned_get(c, "extraction/7/result.csv", "text/csv", "attachment; filename=\"result.csv\"", 900);
+let keys = s3::client::list(c, "extraction/7/docs/", 1000, pages);
+let swept = s3::client::delete_many(c, keys);
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `s3::crc32` — CRC-32, as `x-amz-checksum-crc32` carries it | ✅ proven |
+| `s3::sigv4` — canonical request, string to sign, signing key, `Authorization`, presigned queries | ✅ proven against boto3's signatures |
+| `s3::request` — the seven calls as bytes, `aws-chunked` and whole-body uploads, `create_bucket`/`delete_bucket` for tests | ✅ 22 of 22 captured requests reproduced |
+| `s3::xml` — listings, batch-delete results, errors | ✅ proven |
+| `s3::client` — the calls on the wire, the clock from SNTP, errors as `Code` and `Message` | ✅ 35 live checks against MinIO |
+
+### The oracle is boto3 itself
+
+`examples/s3_oracle.py` builds the backend's client exactly as
+`get_r2_client` does — `s3v4`, path-style addressing, region `auto` — in
+`shallowflaws`'s virtualenv (boto3 1.43.98), freezes botocore's clock,
+uses the AWS documentation's example credentials, and makes each call
+against an R2-shaped HTTPS endpoint and the docker compose MinIO over
+HTTP. A `before-send` hook records what would have left the process:
+method, URL, headers, body. `src/s3/fixture.tuo` is the recording;
+`s3::demo` makes the same calls through `s3::request` and one spec holds
+URL, headers, and body to byte equality.
+
+```bash
+../shallowflaws/.venv/bin/python examples/s3_oracle.py   # writes examples/s3_oracle.json
+python3 examples/s3_fixture.py && tuo fmt src/s3/fixture.tuo
+```
+
+### What the specs pin that a comment cannot
+
+**The signature is over exactly these bytes.** Path encoded once
+(`logo one.png` is `logo%20one.png`), query values encoded
+(`extraction%2F7%2Fdocs%2F`), pairs sorted by name for signing but sent in
+the order boto3 adds them, headers lowercased and sorted with `host`
+among them, and the credential scope `20260922/auto/s3/aws4_request`. A
+presigned URL is the same signature with the `X-Amz-*` parameters in the
+query, `UNSIGNED-PAYLOAD` as the digest, and the signed headers reduced
+to `host` — or `content-type;host` for an upload, which is why the
+uploader must send the content type it was signed with.
+
+**Uploads differ by scheme.** Over HTTPS boto3 sends `aws-chunked`: one
+chunk, a zero chunk, the CRC-32 as a trailer, `STREAMING-UNSIGNED-PAYLOAD-TRAILER`
+as the digest, no `Content-Length`. Over HTTP it sends the body whole,
+the CRC-32 in a header, and the body's SHA-256 signed. Both are
+reproduced; the client sends the whole-body form on either scheme
+(see below).
+
+**The empty body has a checksum too**: `AAAAAA==`, and `Content-Length: 0`
+on a PUT or DELETE but not on a GET. `?delete` is sent bare, signed as
+`delete=`.
+
+**Listings are decoded as botocore decodes them.** The request asks for
+`encoding-type=url`, so `b & c+d.pdf` comes back as `b+%26+c%2Bd.pdf`;
+`+` is a space, then `%XX`.
+
+### The live oracle
+
+`examples/s3.tuo` runs against the MinIO that `shallowflaws/docker` starts,
+in a bucket it creates and deletes: the seven calls, a listing of three
+keys paged two at a time by continuation token, a presigned download
+fetched by a plain `http::client::get` with the response headers it asked
+for honoured, a presigned upload accepted with the signed content type
+and refused with another, a wrong CRC-32 refused under
+`UNSIGNED-PAYLOAD`, a wrong signature and a wrong secret refused, and a
+batch delete of everything under a prefix.
+
+### What is deliberately not here
+
+The client sends every upload whole, never `aws-chunked`: the HTTP
+client frames a body by `Content-Length`, and S3, R2, and MinIO all take
+the whole-body form. Not modelled: multipart uploads, copy, versioning,
+bucket policies, `list_objects` v1, virtual-host addressing, retries,
+and the SES half of boto3 (`send_email`), which is a different service
+signed the same way.
 
 ---
 
@@ -659,7 +936,13 @@ HTTP/2, no `Expect: 100-continue`, no compression, no `Upgrade`. The
 `http::server`'s handler, which receives the raw request and returns the
 raw response.
 
-### A compiler finding, since fixed
+### Compiler findings
+
+One since fixed, one open (`docs/COMPILER-FINDING-3.md`: a `Str` borrowed
+from an array element and returned dangles in native code while the
+interpreter reads it correctly — never return such a borrow).
+
+#### The first, since fixed
 
 Writing the loopback oracle surfaced a code-generation refusal: a
 temporary owned value in the right operand of `&&` or `||` failed MIR
@@ -805,6 +1088,44 @@ src/web/demo.tuo         the oracle's FastAPI app, reimplemented
 examples/web.tuo         the socket oracle: web::demo behind http::server
 examples/web_oracle.py   the FastAPI app and requests the fixture was captured from
 examples/web_fixture.py  oracle.json to src/web/fixture.tuo
+
+src/jinja/escape.tuo     MarkupSafe's escape
+src/jinja/context.tuo    the context as JSON; the Markup paths
+src/jinja/lexer.tuo      text, output, block, comment; the whitespace rules
+src/jinja/expr.tuo       the expression evaluator
+src/jinja/filters.tuo    currency, and a few built-ins
+src/jinja/template.tuo   the renderer: if/elif/else, extends, block
+src/jinja/fixture.tuo    30 templates and 100 renders by Jinja2 (generated)
+src/jinja/demo.tuo       the same 100, rendered here
+examples/jinja_oracle.py     the backend's email functions, recorded
+examples/jinja_fixture.py    jinja_oracle.json to src/jinja/fixture.tuo
+
+src/log/record.tuo       records, levels, getMessage, params as JSON
+src/log/format.tuo       asctime and the two line formats
+src/log/logger.tuo       the root threshold, emit to a descriptor, a journal
+src/log/fixture.tuo      7 records as CPython formatted them (generated)
+src/log/demo.tuo         the same 7, built here
+src/sentry/dsn.tuo       the DSN, the endpoint, the auth header
+src/sentry/scope.tuo     tags, user, breadcrumbs, the logging integration's crumb
+src/sentry/event.tuo     message, exception, and logged events
+src/sentry/envelope.tuo  the envelope
+src/sentry/fixture.tuo   7 envelopes as sentry-sdk serialized them (generated)
+src/sentry/demo.tuo      the same sequence, replayed
+src/sentry/client.tuo    ids, the SNTP clock, the POST
+examples/sentry.tuo      the loopback oracle: a Sentry-shaped receiver and the client
+examples/sentry_oracle.py    CPython logging and sentry-sdk, recorded
+examples/sentry_fixture.py   sentry_oracle.json to the two fixtures
+
+src/s3/crc32.tuo         CRC-32, base64
+src/s3/sigv4.tuo         AWS Signature Version 4: headers and presigned queries
+src/s3/request.tuo       the seven calls as bytes; aws-chunked and whole-body uploads
+src/s3/fixture.tuo       22 requests captured from boto3 (generated)
+src/s3/demo.tuo          the same 22, built here
+src/s3/xml.tuo           listings, delete results, errors
+src/s3/client.tuo        the effect boundary: send, read, the SNTP clock
+examples/s3.tuo          the live oracle (needs the docker compose MinIO on 9000)
+examples/s3_oracle.py    boto3 with a frozen clock, recording what it sends
+examples/s3_fixture.py   s3_oracle.json to src/s3/fixture.tuo
 
 src/sql/table.tuo        tables as data; CREATE TABLE, indexes, drops
 src/sql/clause.tuo       expressions as text with deferred parameters; render

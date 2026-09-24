@@ -1,0 +1,552 @@
+// s3::request — the requests boto3 makes, as bytes.
+//
+// The backend calls seven things on its S3 client: `put_object`,
+// `get_object`, `head_object`, `delete_object`, `list_objects_v2` (paged
+// by a continuation token), `delete_objects`, and `generate_presigned_url`
+// for a download and an upload. Each is a function here from a `Target`
+// (endpoint, credentials, bucket) and a timestamp to a `Request`: method,
+// path, query, the headers that matter, the body — everything boto3
+// 1.43 puts on the wire for the same call, signature included, which
+// `s3::demo` holds byte for byte against a capture of boto3 itself.
+//
+// Two things boto3 decides that a caller of this module does not: the
+// checksum rides in a trailer over HTTPS (`aws-chunked`) and in a header
+// over HTTP, and every body is CRC-32 checksummed. `put_object` follows
+// the endpoint's scheme; `put_object_plain` is the header form on any
+// scheme, which is what `s3::client` sends, since it frames bodies with
+// `Content-Length`.
+
+module s3::request;
+
+/// Where requests go, and who signs them.
+pub struct Target {
+    ok: Bool,
+    https: Bool,
+    host: String,
+    access: String,
+    secret: String,
+    region: String,
+    bucket: String,
+}
+
+/// A request ready for the wire.
+pub struct Request {
+    method: String,
+    path: String,
+    query: String,
+    header_names: Array[String],
+    header_values: Array[String],
+    body: String,
+}
+
+/// A target from an endpoint URL (`https://<account>.r2.cloudflarestorage.com`,
+/// `http://localhost:9000`), credentials, a region (`auto` for R2), and
+/// the bucket. Not `ok` when the URL is malformed.
+///
+/// # Example
+/// ```tuo
+/// let t = s3::request::target("http://localhost:9000", access, secret, "auto", "uploads");
+/// ```
+pub fn target(in endpoint: Str, in access: Str, in secret: Str, in region: Str, in bucket: Str) -> Target {
+    let u = http::url::parse(endpoint);
+    Target { ok: u.ok, https: u.https, host: http::url::host_header(u), access: std::string::from_str(access), secret: std::string::from_str(secret), region: std::string::from_str(region), bucket: std::string::from_str(bucket) }
+}
+
+/// Did the endpoint parse?
+///
+/// # Example
+/// ```tuo
+/// let fine = s3::request::is_ok(t);
+/// ```
+pub fn is_ok(in t: Target) -> Bool {
+    t.ok
+}
+
+/// The `Host` the target's requests carry.
+///
+/// # Example
+/// ```tuo
+/// let h = s3::request::host(t);
+/// ```
+pub fn host(in t: Target) -> String {
+    std::string::from_str(std::string::as_str(t.host))
+}
+
+/// Is the endpoint HTTPS?
+///
+/// # Example
+/// ```tuo
+/// let tls = s3::request::is_https(t);
+/// ```
+pub fn is_https(in t: Target) -> Bool {
+    t.https
+}
+
+/// The path of an object: `/bucket/key`, the key encoded once.
+///
+/// # Example
+/// ```tuo
+/// let p = s3::request::object_path(t, "logo one.png"); // "/uploads/logo%20one.png"
+/// ```
+pub fn object_path(in t: Target, in key: Str) -> String {
+    var out = std::string::from_str("/");
+    std::string::append(out, std::string::as_str(t.bucket));
+    std::string::push_byte(out, 47);
+    std::string::append(out, std::string::as_str(s3::sigv4::encode(key, true)));
+    out
+}
+
+fn bucket_path(in t: Target) -> String {
+    var out = std::string::from_str("/");
+    std::string::append(out, std::string::as_str(t.bucket));
+    out
+}
+
+// Sign `r` and lay it out as a Request.
+fn finish(in t: Target, mut r: s3::sigv4::Signable, in timestamp: Str, in body: Str) -> Request {
+    s3::sigv4::header(r, "x-amz-date", timestamp);
+    s3::sigv4::header(r, "x-amz-content-sha256", std::string::as_str(r.payload_hash));
+    let auth = s3::sigv4::authorization(r, std::string::as_str(t.host), std::string::as_str(t.access), std::string::as_str(t.secret), timestamp, std::string::as_str(t.region));
+    var names = std::array::empty();
+    var values = std::array::empty();
+    var i = 0;
+    while i < std::array::len(r.header_names) {
+        std::array::push(names, std::string::from_str(std::string::as_str(std::array::get(r.header_names, i))));
+        std::array::push(values, std::string::from_str(std::string::as_str(std::array::get(r.header_values, i))));
+        i = i + 1;
+    }
+    std::array::push(names, std::string::from_str("authorization"));
+    std::array::push(values, auth);
+    let m = std::string::as_str(r.method);
+    if std::str::len(body) > 0 || m == "POST" || m == "PUT" || m == "DELETE" {
+        std::array::push(names, std::string::from_str("content-length"));
+        std::array::push(values, std::str::to_string(std::str::len(body)));
+    }
+    Request { method: std::string::from_str(std::string::as_str(r.method)), path: std::string::from_str(std::string::as_str(r.path)), query: s3::sigv4::wire_query(r), header_names: names, header_values: values, body: std::string::from_str(body) }
+}
+
+/// `put_object` with the body sent whole: `Content-Length`, the CRC-32 in
+/// a header, the payload's SHA-256 signed.
+///
+/// # Example
+/// ```tuo
+/// let r = s3::request::put_object_plain(t, "a.csv", body, "text/csv", stamp);
+/// ```
+pub fn put_object_plain(in t: Target, in key: Str, in body: Str, in content_type: Str, in timestamp: Str) -> Request {
+    var r = s3::sigv4::signable("PUT", std::string::as_str(object_path(t, key)));
+    s3::sigv4::header(r, "content-type", content_type);
+    s3::sigv4::header(r, "x-amz-checksum-crc32", std::string::as_str(s3::crc32::header_value(body)));
+    s3::sigv4::header(r, "x-amz-sdk-checksum-algorithm", "CRC32");
+    s3::sigv4::payload(r, std::string::as_str(std::crypto::sha256(body)));
+    finish(t, r, timestamp, body)
+}
+
+fn hex_length(take n: Int) -> String {
+    if n == 0 {
+        return std::string::from_str("0");
+    }
+    var digits = std::array::empty();
+    var v = n;
+    while v > 0 {
+        std::array::push(digits, v % 16);
+        v = v / 16;
+    }
+    var out = std::string::empty();
+    var i = std::array::len(digits) - 1;
+    while i >= 0 {
+        let d = std::array::get(digits, i);
+        std::string::push_byte(out, if d < 10 {
+            48 + d
+        } else {
+            87 + d
+        });
+        i = i - 1;
+    }
+    out
+}
+
+/// The `aws-chunked` body: one chunk, the terminating chunk, and the
+/// CRC-32 trailer.
+///
+/// # Example
+/// ```tuo
+/// let b = s3::request::chunked_body("id,name\n1,Ada\n");
+/// ```
+pub fn chunked_body(in body: Str) -> String {
+    var out = std::string::empty();
+    if std::str::len(body) > 0 {
+        std::string::append(out, std::string::as_str(hex_length(std::str::len(body))));
+        std::string::append(out, "\r\n");
+        std::string::append(out, body);
+        std::string::append(out, "\r\n");
+    }
+    std::string::append(out, "0\r\nx-amz-checksum-crc32:");
+    std::string::append(out, std::string::as_str(s3::crc32::header_value(body)));
+    std::string::append(out, "\r\n\r\n");
+    out
+}
+
+/// `put_object` as boto3 sends it over HTTPS: `aws-chunked`, the CRC-32
+/// in a trailer, the payload unsigned.
+///
+/// # Example
+/// ```tuo
+/// let r = s3::request::put_object_chunked(t, "a.csv", body, "text/csv", stamp);
+/// ```
+pub fn put_object_chunked(in t: Target, in key: Str, in body: Str, in content_type: Str, in timestamp: Str) -> Request {
+    var r = s3::sigv4::signable("PUT", std::string::as_str(object_path(t, key)));
+    s3::sigv4::header(r, "content-type", content_type);
+    s3::sigv4::header(r, "content-encoding", "aws-chunked");
+    s3::sigv4::header(r, "x-amz-trailer", "x-amz-checksum-crc32");
+    s3::sigv4::header(r, "x-amz-decoded-content-length", std::string::as_str(std::str::to_string(std::str::len(body))));
+    s3::sigv4::header(r, "x-amz-sdk-checksum-algorithm", "CRC32");
+    s3::sigv4::payload(r, "STREAMING-UNSIGNED-PAYLOAD-TRAILER");
+    var out = finish(t, r, timestamp, "");
+    // Chunked framing carries no Content-Length.
+    var names = std::array::empty();
+    var values = std::array::empty();
+    var i = 0;
+    while i < std::array::len(out.header_names) {
+        if std::string::as_str(std::array::get(out.header_names, i)) != "content-length" {
+            std::array::push(names, std::string::from_str(std::string::as_str(std::array::get(out.header_names, i))));
+            std::array::push(values, std::string::from_str(std::string::as_str(std::array::get(out.header_values, i))));
+        }
+        i = i + 1;
+    }
+    std::array::push(names, std::string::from_str("transfer-encoding"));
+    std::array::push(values, std::string::from_str("chunked"));
+    out.header_names = names;
+    out.header_values = values;
+    out.body = chunked_body(body);
+    out
+}
+
+/// `put_object` as boto3 would send it to this target.
+///
+/// # Example
+/// ```tuo
+/// let r = s3::request::put_object(t, "a.csv", body, "text/csv", stamp);
+/// ```
+pub fn put_object(in t: Target, in key: Str, in body: Str, in content_type: Str, in timestamp: Str) -> Request {
+    if t.https {
+        put_object_chunked(t, key, body, content_type, timestamp)
+    } else {
+        put_object_plain(t, key, body, content_type, timestamp)
+    }
+}
+
+/// `get_object`.
+///
+/// # Example
+/// ```tuo
+/// let r = s3::request::get_object(t, "a.csv", stamp);
+/// ```
+pub fn get_object(in t: Target, in key: Str, in timestamp: Str) -> Request {
+    var r = s3::sigv4::signable("GET", std::string::as_str(object_path(t, key)));
+    s3::sigv4::header(r, "x-amz-checksum-mode", "ENABLED");
+    finish(t, r, timestamp, "")
+}
+
+/// `head_object`.
+///
+/// # Example
+/// ```tuo
+/// let r = s3::request::head_object(t, "a.csv", stamp);
+/// ```
+pub fn head_object(in t: Target, in key: Str, in timestamp: Str) -> Request {
+    var r = s3::sigv4::signable("HEAD", std::string::as_str(object_path(t, key)));
+    finish(t, r, timestamp, "")
+}
+
+/// `delete_object`.
+///
+/// # Example
+/// ```tuo
+/// let r = s3::request::delete_object(t, "a.csv", stamp);
+/// ```
+pub fn delete_object(in t: Target, in key: Str, in timestamp: Str) -> Request {
+    var r = s3::sigv4::signable("DELETE", std::string::as_str(object_path(t, key)));
+    finish(t, r, timestamp, "")
+}
+
+/// `list_objects_v2`: `prefix`, an empty or previous `continuation`
+/// token, and `max_keys` (0 for the server's default).
+///
+/// # Example
+/// ```tuo
+/// let r = s3::request::list_objects(t, "extraction/7/docs/", "", 0, stamp);
+/// ```
+pub fn list_objects(in t: Target, in prefix: Str, in continuation: Str, take max_keys: Int, in timestamp: Str) -> Request {
+    var r = s3::sigv4::signable("GET", std::string::as_str(bucket_path(t)));
+    s3::sigv4::query(r, "list-type", "2");
+    s3::sigv4::query(r, "prefix", prefix);
+    if std::str::len(continuation) > 0 {
+        s3::sigv4::query(r, "continuation-token", continuation);
+    }
+    if max_keys > 0 {
+        s3::sigv4::query(r, "max-keys", std::string::as_str(std::str::to_string(max_keys)));
+    }
+    s3::sigv4::query(r, "encoding-type", "url");
+    finish(t, r, timestamp, "")
+}
+
+fn push_escaped(mut out: String, in text: Str) {
+    var i = 0;
+    while i < std::str::len(text) {
+        let b = std::str::byte_at(text, i);
+        if b == 38 {
+            std::string::append(out, "&amp;");
+        } else if b == 60 {
+            std::string::append(out, "&lt;");
+        } else if b == 62 {
+            std::string::append(out, "&gt;");
+        } else {
+            std::string::push_byte(out, b);
+        }
+        i = i + 1;
+    }
+}
+
+/// The body of `delete_objects`.
+///
+/// # Example
+/// ```tuo
+/// let xml = s3::request::delete_body(keys);
+/// ```
+pub fn delete_body(in keys: Array[String]) -> String {
+    var out = std::string::from_str("<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+    var i = 0;
+    while i < std::array::len(keys) {
+        std::string::append(out, "<Object><Key>");
+        push_escaped(out, std::string::as_str(std::array::get(keys, i)));
+        std::string::append(out, "</Key></Object>");
+        i = i + 1;
+    }
+    std::string::append(out, "</Delete>");
+    out
+}
+
+/// `delete_objects` over up to 1000 keys.
+///
+/// # Example
+/// ```tuo
+/// let r = s3::request::delete_objects(t, keys, stamp);
+/// ```
+pub fn delete_objects(in t: Target, in keys: Array[String], in timestamp: Str) -> Request {
+    let body = delete_body(keys);
+    var r = s3::sigv4::signable("POST", std::string::as_str(bucket_path(t)));
+    s3::sigv4::query(r, "delete", "");
+    s3::sigv4::header(r, "x-amz-checksum-crc32", std::string::as_str(s3::crc32::header_value(std::string::as_str(body))));
+    s3::sigv4::header(r, "x-amz-sdk-checksum-algorithm", "CRC32");
+    s3::sigv4::payload(r, std::string::as_str(std::crypto::sha256(std::string::as_str(body))));
+    finish(t, r, timestamp, std::string::as_str(body))
+}
+
+/// `create_bucket` for the target's bucket — not a call the backend
+/// makes, but the one the live oracle starts with.
+///
+/// # Example
+/// ```tuo
+/// let r = s3::request::create_bucket(t, stamp);
+/// ```
+pub fn create_bucket(in t: Target, in timestamp: Str) -> Request {
+    var r = s3::sigv4::signable("PUT", std::string::as_str(bucket_path(t)));
+    finish(t, r, timestamp, "")
+}
+
+/// `delete_bucket` for the target's bucket, which must be empty.
+///
+/// # Example
+/// ```tuo
+/// let r = s3::request::delete_bucket(t, stamp);
+/// ```
+pub fn delete_bucket(in t: Target, in timestamp: Str) -> Request {
+    var r = s3::sigv4::signable("DELETE", std::string::as_str(bucket_path(t)));
+    finish(t, r, timestamp, "")
+}
+
+fn scheme(in t: Target) -> Str {
+    if t.https {
+        "https://"
+    } else {
+        "http://"
+    }
+}
+
+fn presigned_url(in t: Target, in r: s3::sigv4::Signable) -> String {
+    var out = std::string::from_str(scheme(t));
+    std::string::append(out, std::string::as_str(t.host));
+    std::string::append(out, std::string::as_str(r.path));
+    std::string::push_byte(out, 63);
+    std::string::append(out, std::string::as_str(s3::sigv4::wire_query(r)));
+    out
+}
+
+/// `generate_presigned_url("get_object", …)` with the response headers the
+/// backend asks for; either may be empty.
+///
+/// # Example
+/// ```tuo
+/// let url = s3::request::presign_get(t, "a.csv", "text/csv", "attachment; filename=\"a.csv\"", 900, stamp);
+/// ```
+pub fn presign_get(in t: Target, in key: Str, in response_content_type: Str, in response_disposition: Str, take expires: Int, in timestamp: Str) -> String {
+    var r = s3::sigv4::signable("GET", std::string::as_str(object_path(t, key)));
+    if std::str::len(response_content_type) > 0 {
+        s3::sigv4::query(r, "response-content-type", response_content_type);
+    }
+    if std::str::len(response_disposition) > 0 {
+        s3::sigv4::query(r, "response-content-disposition", response_disposition);
+    }
+    s3::sigv4::presign(r, std::string::as_str(t.host), std::string::as_str(t.access), std::string::as_str(t.secret), timestamp, std::string::as_str(t.region), expires);
+    presigned_url(t, r)
+}
+
+/// `generate_presigned_url("put_object", …)` with a `ContentType` the
+/// uploader must then send.
+///
+/// # Example
+/// ```tuo
+/// let url = s3::request::presign_put(t, "source.zip", "application/zip", 3600, stamp);
+/// ```
+pub fn presign_put(in t: Target, in key: Str, in content_type: Str, take expires: Int, in timestamp: Str) -> String {
+    var r = s3::sigv4::signable("PUT", std::string::as_str(object_path(t, key)));
+    s3::sigv4::header(r, "content-type", content_type);
+    s3::sigv4::presign(r, std::string::as_str(t.host), std::string::as_str(t.access), std::string::as_str(t.secret), timestamp, std::string::as_str(t.region), expires);
+    presigned_url(t, r)
+}
+
+/// The request's full URL.
+///
+/// # Example
+/// ```tuo
+/// let u = s3::request::url(t, r);
+/// ```
+pub fn url(in t: Target, in r: Request) -> String {
+    var out = std::string::from_str(scheme(t));
+    std::string::append(out, std::string::as_str(t.host));
+    std::string::append(out, std::string::as_str(r.path));
+    if std::string::len(r.query) > 0 {
+        std::string::push_byte(out, 63);
+        std::string::append(out, std::string::as_str(r.query));
+    }
+    out
+}
+
+/// The request target: path and query.
+///
+/// # Example
+/// ```tuo
+/// let t = s3::request::request_target(r);
+/// ```
+pub fn request_target(in r: Request) -> String {
+    var out = std::string::from_str(std::string::as_str(r.path));
+    if std::string::len(r.query) > 0 {
+        std::string::push_byte(out, 63);
+        std::string::append(out, std::string::as_str(r.query));
+    }
+    out
+}
+
+/// The headers as `name: value` lines, one per line, names sorted — the
+/// form the fixture compares.
+///
+/// # Example
+/// ```tuo
+/// let lines = s3::request::header_lines(r);
+/// ```
+pub fn header_lines(in r: Request) -> String {
+    var order = std::array::empty();
+    var i = 0;
+    while i < std::array::len(r.header_names) {
+        var at = std::array::len(order);
+        while at > 0 && byte_less(std::string::as_str(std::array::get(r.header_names, i)), std::string::as_str(std::array::get(r.header_names, std::array::get(order, at - 1)))) {
+            at = at - 1;
+        }
+        std::array::push(order, 0);
+        var k = std::array::len(order) - 1;
+        while k > at {
+            std::array::set(order, k, std::array::get(order, k - 1));
+            k = k - 1;
+        }
+        std::array::set(order, at, i);
+        i = i + 1;
+    }
+    var out = std::string::empty();
+    i = 0;
+    while i < std::array::len(order) {
+        let k = std::array::get(order, i);
+        std::string::append(out, std::string::as_str(std::array::get(r.header_names, k)));
+        std::string::append(out, ": ");
+        std::string::append(out, std::string::as_str(std::array::get(r.header_values, k)));
+        std::string::push_byte(out, 10);
+        i = i + 1;
+    }
+    out
+}
+
+fn byte_less(in a: Str, in b: Str) -> Bool {
+    let n = std::str::len(a);
+    let m = std::str::len(b);
+    var i = 0;
+    while i < n && i < m {
+        let x = std::str::byte_at(a, i);
+        let y = std::str::byte_at(b, i);
+        if x != y {
+            return x < y;
+        }
+        i = i + 1;
+    }
+    n < m
+}
+
+/// The header lines as `http::message::request` wants its `extra`,
+/// `Content-Length` left out since that function adds it.
+///
+/// # Example
+/// ```tuo
+/// let extra = s3::request::extra_headers(r);
+/// ```
+pub fn extra_headers(in r: Request) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::array::len(r.header_names) {
+        if std::string::as_str(std::array::get(r.header_names, i)) != "content-length" {
+            http::message::header_line(out, std::string::as_str(std::array::get(r.header_names, i)), std::string::as_str(std::array::get(r.header_values, i)));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn minio() -> Target {
+    target("http://localhost:9000", "AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "auto", "shallowflaws-uploads")
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+spec target {
+    then is_ok(minio());
+    then text_is(host(minio()), "localhost:9000");
+    then !is_https(minio());
+    then text_is(host(target("https://abc123.r2.cloudflarestorage.com", "a", "s", "auto", "b")), "abc123.r2.cloudflarestorage.com");
+    then !is_ok(target("ftp://x", "a", "s", "auto", "b"));
+    then text_is(object_path(minio(), "photos/job_applicant/logo one.png"), "/shallowflaws-uploads/photos/job_applicant/logo%20one.png");
+}
+
+spec chunked_body {
+    then text_is(chunked_body("id,name\n1,Ada\n"), "e\r\nid,name\n1,Ada\n\r\n0\r\nx-amz-checksum-crc32:tsOTXA==\r\n\r\n");
+    then text_is(chunked_body(""), "0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n");
+    then text_is(hex_length(256), "100");
+}
+
+spec delete_body {
+    then text_is(delete_body(std::array::empty()), "<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></Delete>");
+}
+
+spec head_object {
+    then std::str::starts_with(std::string::as_str(header_lines(head_object(minio(), "extraction/7/result.csv", "20260922T083000Z"))), "authorization: AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/auto/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=");
+    then text_is(url(minio(), list_objects(minio(), "extraction/7/docs/", "", 0, "20260922T083000Z")), "http://localhost:9000/shallowflaws-uploads?list-type=2&prefix=extraction%2F7%2Fdocs%2F&encoding-type=url");
+    then text_is(url(minio(), delete_objects(minio(), std::array::empty(), "20260922T083000Z")), "http://localhost:9000/shallowflaws-uploads?delete");
+}

@@ -1,0 +1,101 @@
+// log::format — the two lines the backend writes.
+//
+// `app/main.py` configures `logging.basicConfig` with one of two
+// formats: in development
+// `%(asctime)s - %(name)s - %(levelname)s - %(message)s`, in production
+// a JSON object with the same four fields. `asctime` is `logging`'s
+// default: `2026-09-22 08:30:00,123`, with a comma before the
+// milliseconds. Rendered here in UTC; Python uses the process's local
+// time, which in the containers is UTC too.
+//
+// The production format string is written by hand in the backend and
+// does not escape the message, so a quote or a newline in a message
+// produces a line that is not JSON. `production` here escapes, which is
+// what the format was meant to do; `log::demo` shows where the two
+// differ.
+
+module log::format;
+
+fn two(mut out: String, take n: Int) {
+    if n < 10 {
+        std::string::push_byte(out, 48);
+    }
+    std::str::push_int(out, n);
+}
+
+/// `asctime`: `YYYY-MM-DD HH:MM:SS,mmm` in UTC.
+///
+/// # Example
+/// ```tuo
+/// let t = log::format::asctime(1790065800123); // "2026-09-22 08:30:00,123"
+/// ```
+pub fn asctime(take unix_ms: Int) -> String {
+    var ms = unix_ms % 1000;
+    var seconds = unix_ms / 1000;
+    if ms < 0 {
+        ms = ms + 1000;
+        seconds = seconds - 1;
+    }
+    let iso = x509::time::render(seconds);
+    var out = std::string::empty();
+    var i = 0;
+    while i < 19 {
+        let b = std::string::byte_at(iso, i);
+        std::string::push_byte(out, if b == 84 {
+            32
+        } else {
+            b
+        });
+        i = i + 1;
+    }
+    std::string::push_byte(out, 44);
+    if ms < 100 {
+        std::string::push_byte(out, 48);
+    }
+    two(out, ms);
+    out
+}
+
+/// The development line.
+///
+/// # Example
+/// ```tuo
+/// let line = log::format::development(r);
+/// ```
+pub fn development(in r: log::record::Record) -> String {
+    var out = asctime(log::record::unix_ms(r));
+    std::string::append(out, " - ");
+    std::string::append(out, std::string::as_str(log::record::name(r)));
+    std::string::append(out, " - ");
+    std::string::append(out, std::string::as_str(log::record::level_name(log::record::level(r))));
+    std::string::append(out, " - ");
+    std::string::append(out, std::string::as_str(log::record::message(r)));
+    out
+}
+
+/// The production line: `{"time":…,"name":…,"level":…,"message":…}`,
+/// every value escaped.
+///
+/// # Example
+/// ```tuo
+/// let line = log::format::production(r);
+/// ```
+pub fn production(in r: log::record::Record) -> String {
+    var out = std::string::from_str("{");
+    web::json::push_key(out, "time");
+    web::json::push_string(out, std::string::as_str(asctime(log::record::unix_ms(r))));
+    web::json::push_key(out, "name");
+    web::json::push_string(out, std::string::as_str(log::record::name(r)));
+    web::json::push_key(out, "level");
+    web::json::push_string(out, std::string::as_str(log::record::level_name(log::record::level(r))));
+    web::json::push_key(out, "message");
+    web::json::push_string(out, std::string::as_str(log::record::message(r)));
+    std::string::push_byte(out, 125);
+    out
+}
+
+spec asctime {
+    then std::string::as_str(asctime(1790065800123)) == "2026-09-22 08:30:00,123";
+    then std::string::as_str(asctime(1790065800005)) == "2026-09-22 08:30:00,005";
+    then std::string::as_str(asctime(0)) == "1970-01-01 00:00:00,000";
+}

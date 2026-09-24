@@ -130,6 +130,10 @@ fn literal_null() -> Int {
     5
 }
 
+fn literal_interval() -> Int {
+    6
+}
+
 /// An empty clause, for accumulating into.
 ///
 /// # Example
@@ -345,6 +349,18 @@ pub fn null() -> Clause {
     literal_of("", 1, "", literal_null())
 }
 
+/// An interval value by its spelling (`"24 hours"`), bound as a parameter
+/// cast to INTERVAL — so that time can come from the database:
+/// `now() + $1::INTERVAL`.
+///
+/// # Example
+/// ```tuo
+/// let expiry = sql::clause::plus(sql::clause::call0("now"), sql::clause::interval("24 hours"));
+/// ```
+pub fn interval(in spelling: Str) -> Clause {
+    literal_of(spelling, 0, "INTERVAL", literal_interval())
+}
+
 fn is_numeric_cast(in cast: Str) -> Bool {
     cast == "FLOAT" || std::str::starts_with(cast, "NUMERIC")
 }
@@ -353,6 +369,9 @@ fn is_numeric_cast(in cast: Str) -> Bool {
 // SQLAlchemy types a Python int as INTEGER whatever it is compared with
 // (BIGINT aside), and everything else as the other side's type.
 fn adopted_cast(in lit: Clause, in against: Str) -> String {
+    if lit.literal == literal_interval() {
+        return std::string::from_str("INTERVAL");
+    }
     if lit.literal == literal_int() {
         if against == "BIGINT" {
             return std::string::from_str("BIGINT");
@@ -1379,6 +1398,12 @@ spec plus {
     then shows(gt(plus(id(), int(1)), int(5)), "people.id + $1::INTEGER > $2::INTEGER");
     then shows(times(plus(id(), int(1)), int(5)), "(people.id + $1::INTEGER) * $2::INTEGER");
     then shows(minus(id(), minus(id(), int(5))), "people.id - (people.id - $1::INTEGER)");
+}
+
+spec interval {
+    then shows(plus(call0("now"), interval("24 hours")), "now() + $1::INTERVAL");
+    then sends(minus(call0("now"), interval("60 seconds")), "60 seconds\u{1f}");
+    then shows(gt(id(), minus(call0("now"), interval("1 day"))), "people.id > now() - $1::INTERVAL");
 }
 
 spec as_value {

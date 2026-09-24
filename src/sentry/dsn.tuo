@@ -1,0 +1,191 @@
+// sentry::dsn — `SENTRY_DSN`, taken apart.
+//
+// A DSN is `https://<public key>@<host>/<project id>`. From it the SDK
+// derives the envelope endpoint, `https://<host>/api/<project id>/envelope/`,
+// the `X-Sentry-Auth` header that carries the key, and — when the host is
+// `o<digits>.ingest…` — the organisation id it puts in the envelope's
+// trace header. All of that is here, pinned to what sentry-sdk 2.69
+// produced for the same DSN.
+
+module sentry::dsn;
+
+/// A DSN's parts.
+pub struct Dsn {
+    ok: Bool,
+    https: Bool,
+    host: String,
+    public_key: String,
+    project_id: String,
+    org_id: String,
+}
+
+fn malformed() -> Dsn {
+    Dsn { ok: false, https: false, host: std::string::empty(), public_key: std::string::empty(), project_id: std::string::empty(), org_id: std::string::empty() }
+}
+
+fn index_of(in s: Str, take needle: Int, take from: Int) -> Int {
+    var i = from;
+    while i < std::str::len(s) {
+        if std::str::byte_at(s, i) == needle {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+/// Take a DSN apart. Not `ok` when any part is missing.
+///
+/// # Example
+/// ```tuo
+/// let d = sentry::dsn::parse("https://abc@o123.ingest.de.sentry.io/4507000000000000");
+/// ```
+pub fn parse(in text: Str) -> Dsn {
+    var https = true;
+    var at = 0;
+    if std::str::starts_with(text, "https://") {
+        at = 8;
+    } else if std::str::starts_with(text, "http://") {
+        https = false;
+        at = 7;
+    } else {
+        return malformed();
+    }
+    let sign = index_of(text, 64, at);
+    if sign < 0 {
+        return malformed();
+    }
+    // A secret key after a colon is ignored, as the SDK ignores it.
+    var key_end = index_of(text, 58, at);
+    if key_end < 0 || key_end > sign {
+        key_end = sign;
+    }
+    let slash = index_of(text, 47, sign);
+    if slash < 0 || slash + 1 >= std::str::len(text) || key_end == at || slash == sign + 1 {
+        return malformed();
+    }
+    let host = std::str::slice(text, sign + 1, slash);
+    var project = std::str::slice(text, slash + 1, std::str::len(text));
+    let last = index_of(project, 47, 0);
+    if last >= 0 {
+        // A path before the project id (`/prefix/123`): the id is the last segment.
+        var tail = project;
+        var cut = last;
+        while cut >= 0 {
+            tail = std::str::slice(tail, cut + 1, std::str::len(tail));
+            cut = index_of(tail, 47, 0);
+        }
+        project = tail;
+    }
+    if std::str::len(project) == 0 {
+        return malformed();
+    }
+    var org = std::string::empty();
+    if std::str::len(host) > 1 && std::str::byte_at(host, 0) == 111 {
+        var i = 1;
+        while i < std::str::len(host) && std::str::is_digit(std::str::byte_at(host, i)) {
+            std::string::push_byte(org, std::str::byte_at(host, i));
+            i = i + 1;
+        }
+        if i >= std::str::len(host) || std::str::byte_at(host, i) != 46 {
+            org = std::string::empty();
+        }
+    }
+    Dsn { ok: true, https: https, host: std::string::from_str(host), public_key: std::string::from_str(std::str::slice(text, at, key_end)), project_id: std::string::from_str(project), org_id: org }
+}
+
+/// Did the DSN parse?
+///
+/// # Example
+/// ```tuo
+/// let fine = sentry::dsn::is_ok(d);
+/// ```
+pub fn is_ok(in d: Dsn) -> Bool {
+    d.ok
+}
+
+/// The public key.
+///
+/// # Example
+/// ```tuo
+/// let k = sentry::dsn::public_key(d);
+/// ```
+pub fn public_key(in d: Dsn) -> String {
+    std::string::from_str(std::string::as_str(d.public_key))
+}
+
+/// The organisation id, or empty when the host does not name one.
+///
+/// # Example
+/// ```tuo
+/// let o = sentry::dsn::org_id(d);
+/// ```
+pub fn org_id(in d: Dsn) -> String {
+    std::string::from_str(std::string::as_str(d.org_id))
+}
+
+/// The envelope endpoint.
+///
+/// # Example
+/// ```tuo
+/// let url = sentry::dsn::envelope_url(d);
+/// ```
+pub fn envelope_url(in d: Dsn) -> String {
+    var out = std::string::from_str(if d.https {
+        "https://"
+    } else {
+        "http://"
+    });
+    std::string::append(out, std::string::as_str(d.host));
+    std::string::append(out, "/api/");
+    std::string::append(out, std::string::as_str(d.project_id));
+    std::string::append(out, "/envelope/");
+    out
+}
+
+/// The `X-Sentry-Auth` value; `client` names the SDK (`sentry.python/2.69.2`).
+///
+/// # Example
+/// ```tuo
+/// let auth = sentry::dsn::auth_header(d, sentry::dsn::client_name());
+/// ```
+pub fn auth_header(in d: Dsn, in client: Str) -> String {
+    var out = std::string::from_str("Sentry sentry_key=");
+    std::string::append(out, std::string::as_str(d.public_key));
+    std::string::append(out, ", sentry_version=7, sentry_client=");
+    std::string::append(out, client);
+    out
+}
+
+/// What this port calls itself in the auth header and the envelope.
+///
+/// # Example
+/// ```tuo
+/// let c = sentry::dsn::client_name();
+/// ```
+pub fn client_name() -> Str {
+    "sentry.tuonelang/0.1.0"
+}
+
+fn sample() -> Dsn {
+    parse("https://abcdef0123456789abcdef0123456789@o123456.ingest.de.sentry.io/4507000000000000")
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+spec parse {
+    then is_ok(sample());
+    then text_is(public_key(sample()), "abcdef0123456789abcdef0123456789");
+    then text_is(org_id(sample()), "123456");
+    then text_is(envelope_url(sample()), "https://o123456.ingest.de.sentry.io/api/4507000000000000/envelope/");
+    then text_is(auth_header(sample(), "sentry.python/2.69.2"), "Sentry sentry_key=abcdef0123456789abcdef0123456789, sentry_version=7, sentry_client=sentry.python/2.69.2");
+    then text_is(org_id(parse("https://k@sentry.example.com/7")), "");
+    then text_is(envelope_url(parse("http://k@localhost:8000/prefix/7")), "http://localhost:8000/api/7/envelope/");
+    then text_is(public_key(parse("https://k:secret@host/7")), "k");
+    then !is_ok(parse("https://host/7"));
+    then !is_ok(parse("https://k@host"));
+    then !is_ok(parse("https://k@host/"));
+    then !is_ok(parse("ftp://k@host/7"));
+}

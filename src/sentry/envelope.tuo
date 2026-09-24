@@ -1,0 +1,95 @@
+// sentry::envelope — the wire format.
+//
+// An envelope is three lines: a JSON header naming the event, when it
+// was sent, and the trace it belongs to (with the environment, release,
+// public key, and organisation, which Sentry uses for sampling); a JSON
+// item header with the item's type and byte length; the item; a
+// newline. Serialized exactly as sentry-sdk 2.69 does, which is what
+// makes the fixture comparable.
+
+module sentry::envelope;
+
+/// The envelope for one event payload.
+///
+/// # Example
+/// ```tuo
+/// let bytes = sentry::envelope::serialize(dsn, scope, st, "2026-09-22T08:30:01.000000Z", payload);
+/// ```
+pub fn serialize(in d: sentry::dsn::Dsn, in s: sentry::scope::Scope, in st: sentry::event::Stamp, in sent_at: Str, in payload: Str) -> String {
+    var out = std::string::from_str("{");
+    web::json::push_key(out, "event_id");
+    web::json::push_string(out, std::string::as_str(sentry::event::event_id(st)));
+    web::json::push_key(out, "sent_at");
+    web::json::push_string(out, sent_at);
+    web::json::push_key(out, "trace");
+    std::string::push_byte(out, 123);
+    web::json::push_key(out, "trace_id");
+    web::json::push_string(out, std::string::as_str(sentry::event::trace_id(st)));
+    web::json::push_key(out, "environment");
+    web::json::push_string(out, std::string::as_str(sentry::scope::environment(s)));
+    let release = sentry::scope::release(s);
+    if std::string::len(release) > 0 {
+        web::json::push_key(out, "release");
+        web::json::push_string(out, std::string::as_str(release));
+    }
+    web::json::push_key(out, "public_key");
+    web::json::push_string(out, std::string::as_str(sentry::dsn::public_key(d)));
+    let org = sentry::dsn::org_id(d);
+    if std::string::len(org) > 0 {
+        web::json::push_key(out, "org_id");
+        web::json::push_string(out, std::string::as_str(org));
+    }
+    std::string::append(out, "}}\n{\"type\":\"event\",\"content_type\":\"application/json\",\"length\":");
+    web::json::push_int(out, std::str::len(payload));
+    std::string::append(out, "}\n");
+    std::string::append(out, payload);
+    std::string::push_byte(out, 10);
+    out
+}
+
+/// The item length an envelope declares, or -1 when it is not one.
+///
+/// # Example
+/// ```tuo
+/// let n = sentry::envelope::declared_length(bytes);
+/// ```
+pub fn declared_length(in envelope: Str) -> Int {
+    let first = std::str::find(envelope, "\n");
+    let second_from = match first {
+        Some { value } => value + 1,
+        None => -1,
+    };
+    if second_from < 0 {
+        return -1;
+    }
+    let rest = std::str::slice(envelope, second_from, std::str::len(envelope));
+    let line_end = match std::str::find(rest, "\n") {
+        Some { value } => value,
+        None => -1,
+    };
+    if line_end < 0 {
+        return -1;
+    }
+    let d = web::json::parse(std::str::slice(rest, 0, line_end));
+    if !d.ok {
+        return -1;
+    }
+    let node = web::json::member(d, web::json::root(d), "length");
+    if node < 0 {
+        return -1;
+    }
+    match std::str::parse_int(std::string::as_str(web::json::text_of(d, node))) {
+        Ok { value } => value,
+        Err { error } => -1,
+    }
+}
+
+fn sample() -> String {
+    serialize(sentry::dsn::parse("https://k@o1.ingest.sentry.io/9"), sentry::scope::new("production", "r", "cloud"), sentry::event::stamp("e", "t", "sp", "now"), "sent", "{}")
+}
+
+spec serialize {
+    then std::string::as_str(sample()) == "{\"event_id\":\"e\",\"sent_at\":\"sent\",\"trace\":{\"trace_id\":\"t\",\"environment\":\"production\",\"release\":\"r\",\"public_key\":\"k\",\"org_id\":\"1\"}}\n{\"type\":\"event\",\"content_type\":\"application/json\",\"length\":2}\n{}\n";
+    then declared_length(std::string::as_str(sample())) == 2;
+    then declared_length("nope") == -1;
+}

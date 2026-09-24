@@ -1,0 +1,77 @@
+// jinja::demo — every captured render, reproduced.
+//
+// `examples/jinja_oracle.py` renders the backend's thirty email templates
+// through its own email functions, a hundred times over two languages,
+// and keeps each render's template, context, and output. `render` loads
+// the same templates and renders the same context; the spec holds the
+// hundred outputs to byte equality.
+
+module jinja::demo;
+
+/// The backend's templates, loaded.
+///
+/// # Example
+/// ```tuo
+/// let l = jinja::demo::templates();
+/// ```
+pub fn templates() -> jinja::template::Loader {
+    var l = jinja::template::loader();
+    var i = 0;
+    while i < jinja::fixture::source_count() {
+        jinja::template::add(l, jinja::fixture::source_name(i), jinja::fixture::source(i));
+        i = i + 1;
+    }
+    l
+}
+
+/// Render fixture case `i`.
+///
+/// # Example
+/// ```tuo
+/// let out = jinja::demo::render(0);
+/// ```
+pub fn render(take i: Int) -> String {
+    let ctx = jinja::context::from_json(jinja::fixture::context(i), jinja::fixture::safe(i));
+    jinja::template::render(templates(), jinja::fixture::template(i), ctx)
+}
+
+/// Does render `i` match Jinja2's?
+///
+/// # Example
+/// ```tuo
+/// let same = jinja::demo::agrees(0);
+/// ```
+pub fn agrees(take i: Int) -> Bool {
+    std::string::as_str(render(i)) == jinja::fixture::output(i)
+}
+
+/// The first case in `[from, to)` that differs, or -1.
+///
+/// # Example
+/// ```tuo
+/// let bad = jinja::demo::first_disagreement(0, jinja::fixture::count());
+/// ```
+pub fn first_disagreement(take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to {
+        if !agrees(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+spec "every captured render is reproduced" {
+    then jinja::fixture::count() == 100;
+    then first_disagreement(0, 10) == -1;
+    then first_disagreement(10, 20) == -1;
+    then first_disagreement(20, 30) == -1;
+    then first_disagreement(30, 40) == -1;
+    then first_disagreement(40, 50) == -1;
+    then first_disagreement(50, 60) == -1;
+    then first_disagreement(60, 70) == -1;
+    then first_disagreement(70, 80) == -1;
+    then first_disagreement(80, 90) == -1;
+    then first_disagreement(90, 100) == -1;
+}

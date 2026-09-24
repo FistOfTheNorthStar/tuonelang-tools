@@ -11,8 +11,10 @@
 #                           chains), fetch https:// from Stripe, Sentry, and
 #                           Cloudflare with chains validated against the root
 #                           store, and drive the Redis client against the
-#                           docker compose redis on 127.0.0.1:6380, and run the
-#                           query layer against a throwaway PostgreSQL that
+#                           docker compose redis on 127.0.0.1:6380 and the S3
+#                           client against its MinIO on 127.0.0.1:9000, post to a
+#                           Sentry-shaped loopback receiver, and run
+#                           the query layer against a throwaway PostgreSQL that
 #                           examples/sql-test/server.sh creates and deletes
 #                           (needs initdb, pg_ctl, psql on PATH)
 #
@@ -81,6 +83,22 @@ SQL_SRC=(src/sql/table.tuo src/sql/clause.tuo src/sql/select.tuo src/sql/write.t
          src/dns/resolver.tuo
          src/std_net.tuo src/std_str.tuo src/std_crypto.tuo src/std_ct.tuo src/std_bits.tuo)
 
+S3_SRC=(src/s3/crc32.tuo src/s3/sigv4.tuo src/s3/request.tuo src/s3/fixture.tuo
+        src/s3/demo.tuo src/s3/xml.tuo src/s3/client.tuo
+        "${HTTP_SRC[@]}")
+
+LOG_SRC=(src/log/record.tuo src/log/format.tuo src/log/logger.tuo src/log/fixture.tuo
+         src/log/demo.tuo src/web/json.tuo src/x509/time.tuo src/std_str.tuo)
+SENTRY_SRC=(src/sentry/dsn.tuo src/sentry/scope.tuo src/sentry/event.tuo src/sentry/envelope.tuo
+            src/sentry/fixture.tuo src/sentry/demo.tuo src/sentry/client.tuo
+            src/log/record.tuo src/log/format.tuo src/log/logger.tuo src/log/fixture.tuo
+            src/log/demo.tuo
+            "${WEB_SRC[@]}" "${HTTP_SRC[@]}")
+
+JINJA_SRC=(src/jinja/escape.tuo src/jinja/context.tuo src/jinja/lexer.tuo src/jinja/expr.tuo
+           src/jinja/filters.tuo src/jinja/template.tuo src/jinja/fixture.tuo src/jinja/demo.tuo
+           src/web/json.tuo src/web/coerce.tuo src/std_str.tuo)
+
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
 check() { if [ "$1" -eq 0 ]; then echo "PASS $2"; else echo "FAIL $2"; failed=1; fi }
@@ -128,11 +146,37 @@ step "SQL: front end (check)"
 step "SQL: specs (verify), all 117 captured SQLAlchemy and Alembic statements rebuilt"
 "$TUO" verify "${SQL_SRC[@]}"; check $? "sql verify"
 
+step "S3: front end (check)"
+"$TUO" check "${S3_SRC[@]}" examples/s3.tuo; check $? "s3 check"
+
+# The pure s3 modules and what they stand on; s3::client rides on the HTTP group, whose specs ran above.
+step "S3: specs (verify), all 22 captured boto3 requests rebuilt"
+"$TUO" verify src/s3/crc32.tuo src/s3/sigv4.tuo src/s3/request.tuo src/s3/fixture.tuo src/s3/demo.tuo src/s3/xml.tuo src/http/url.tuo src/http/message.tuo src/http/fixture.tuo src/std_crypto.tuo src/std_ct.tuo src/std_bits.tuo src/std_str.tuo; check $? "s3 verify"
+
+step "Log: front end (check)"
+"$TUO" check "${LOG_SRC[@]}"; check $? "log check"
+
+step "Log: specs (verify), all 7 records formatted as CPython formats them"
+"$TUO" verify "${LOG_SRC[@]}"; check $? "log verify"
+
+step "Sentry: front end (check)"
+"$TUO" check "${SENTRY_SRC[@]}" examples/sentry.tuo; check $? "sentry check"
+
+# The pure sentry modules and what they stand on; sentry::client rides on the HTTP group.
+step "Sentry: specs (verify), all 7 captured envelopes rebuilt"
+"$TUO" verify src/sentry/dsn.tuo src/sentry/scope.tuo src/sentry/event.tuo src/sentry/envelope.tuo src/sentry/fixture.tuo src/sentry/demo.tuo "${LOG_SRC[@]}"; check $? "sentry verify"
+
+step "Jinja: front end (check)"
+"$TUO" check "${JINJA_SRC[@]}"; check $? "jinja check"
+
+step "Jinja: specs (verify), all 100 captured renders reproduced"
+"$TUO" verify "${JINJA_SRC[@]}"; check $? "jinja verify"
+
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
 # to `crates/tuo-stdlib/src/std/` — and src/pg, src/db are tuonelang-db's.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo src/jinja/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.
@@ -263,6 +307,29 @@ if [ "$live" -eq 1 ]; then
   else
     echo "redis oracle exited $rc — that many checks disagreed (is docker compose up?)"
     check 1 "redis"
+  fi
+
+  # The Sentry client against a Sentry-shaped receiver on loopback; live
+  # only because its clock is SNTP's.
+  step "Sentry: live — the client against a loopback receiver, clock from SNTP"
+  "$TUO" run examples/sentry.tuo "${SENTRY_SRC[@]}"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    check 0 "sentry live (all checks agreed)"
+  else
+    echo "sentry oracle exited $rc — that many checks disagreed"
+    check 1 "sentry live"
+  fi
+
+  # The S3 client against shallowflaws's docker compose MinIO on 127.0.0.1:9000.
+  step "S3: live — against MinIO on 127.0.0.1:9000"
+  "$TUO" run examples/s3.tuo "${S3_SRC[@]}"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    check 0 "s3 live (all checks agreed)"
+  else
+    echo "s3 oracle exited $rc — that many checks disagreed (is docker compose up?)"
+    check 1 "s3 live"
   fi
 
   # The query layer against a real server: a cluster created for this run,

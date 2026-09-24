@@ -1,0 +1,100 @@
+// log::demo — every captured record, rebuilt.
+//
+// `examples/sentry_oracle.py` formats seven records with CPython's
+// `logging` under both of the backend's formats. `build` makes the same
+// records and the spec compares the message and the development line
+// byte for byte, and the production line where the backend's unescaped
+// format produces JSON — and shows, for the two records where it does
+// not, what `log::format::production` writes instead.
+
+module log::demo;
+
+fn parse_or(in s: Str, take fallback: Int) -> Int {
+    let parsed = std::str::parse_int(s);
+    match parsed {
+        Ok { value } => value,
+        Err { error } => fallback,
+    }
+}
+
+/// The record of fixture case `i`, at the fixture's time.
+///
+/// # Example
+/// ```tuo
+/// let r = log::demo::build(0);
+/// ```
+pub fn build(take i: Int) -> log::record::Record {
+    var r = log::record::new(log::fixture::logger(i), log::fixture::level(i), log::fixture::template(i), 1790065800123);
+    let d = web::json::parse(log::fixture::args(i));
+    var item = web::json::first_child(d, web::json::root(d));
+    while item >= 0 {
+        if web::json::kind_of(d, item) == web::json::kind_int() {
+            log::record::int(r, parse_or(std::string::as_str(web::json::text_of(d, item)), 0));
+        } else {
+            log::record::text(r, std::string::as_str(web::json::text_of(d, item)));
+        }
+        item = web::json::next_sibling(d, item);
+    }
+    r
+}
+
+/// Does case `i` format as CPython formatted it: the message, the
+/// development line, and — when the backend's unescaped production
+/// format happens to be valid JSON — the production line?
+///
+/// # Example
+/// ```tuo
+/// let same = log::demo::agrees(0);
+/// ```
+pub fn agrees(take i: Int) -> Bool {
+    let r = build(i);
+    if std::string::as_str(log::record::message(r)) != log::fixture::message(i) {
+        return false;
+    }
+    if std::string::as_str(log::format::development(r)) != log::fixture::plain(i) {
+        return false;
+    }
+    let unescaped = log::fixture::json(i);
+    if web::json::parse(unescaped).ok {
+        return std::string::as_str(log::format::production(r)) == unescaped;
+    }
+    true
+}
+
+/// The first case in `[from, to)` that disagrees, or -1.
+///
+/// # Example
+/// ```tuo
+/// let bad = log::demo::first_disagreement(0, log::fixture::count());
+/// ```
+pub fn first_disagreement(take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to {
+        if !agrees(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+fn production_of(in name: Str) -> String {
+    var i = 0;
+    while i < log::fixture::count() {
+        if log::fixture::name(i) == name {
+            return log::format::production(build(i));
+        }
+        i = i + 1;
+    }
+    std::string::empty()
+}
+
+spec "every captured record formats as CPython formatted it" {
+    then log::fixture::count() == 7;
+    then first_disagreement(0, 7) == -1;
+    // The two records the backend's format string turns into invalid JSON.
+    then !web::json::parse(log::fixture::json(5)).ok;
+    then !web::json::parse(log::fixture::json(6)).ok;
+    then std::string::as_str(production_of("info_quote")) == "{\"time\":\"2026-09-22 08:30:00,123\",\"name\":\"app\",\"level\":\"INFO\",\"message\":\"name was \\\"Ada\\\" \\\\ done\"}";
+    then std::string::as_str(production_of("info_newline")) == "{\"time\":\"2026-09-22 08:30:00,123\",\"name\":\"app\",\"level\":\"INFO\",\"message\":\"line one\\nline two\"}";
+}

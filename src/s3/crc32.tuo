@@ -1,0 +1,89 @@
+// s3::crc32 — CRC-32 (IEEE 802.3), as `x-amz-checksum-crc32` carries it.
+//
+// boto3 attaches a CRC-32 of the body to every upload — as a header when
+// the body is sent whole, as a trailer when it is aws-chunked — and S3,
+// R2, and MinIO refuse a body that does not match. The polynomial is the
+// reflected 0xEDB88320, the register starts and ends inverted, and the
+// header value is the big-endian 32-bit checksum in base64. Spec'd
+// against the check value every CRC-32 implementation agrees on
+// (`"123456789"` is `cbf43926`) and the values boto3 sent.
+
+module s3::crc32;
+
+/// The 256-entry lookup table for the reflected polynomial.
+///
+/// # Example
+/// ```tuo
+/// let t = s3::crc32::table();
+/// ```
+pub fn table() -> Array[Int] {
+    var out = std::array::empty();
+    var n = 0;
+    while n < 256 {
+        var c = n;
+        var k = 0;
+        while k < 8 {
+            if c % 2 == 1 {
+                c = 3988292384 ^ (c / 2);
+            } else {
+                c = c / 2;
+            }
+            k = k + 1;
+        }
+        std::array::push(out, c);
+        n = n + 1;
+    }
+    out
+}
+
+/// The CRC-32 of `data`, as an unsigned 32-bit value.
+///
+/// # Example
+/// ```tuo
+/// let c = s3::crc32::of("123456789"); // 0xcbf43926
+/// ```
+pub fn of(in data: Str) -> Int {
+    let t = table();
+    var c = 4294967295;
+    var i = 0;
+    while i < std::str::len(data) {
+        let b = std::str::byte_at(data, i);
+        c = std::array::get(t, (c ^ b) % 256) ^ (c / 256);
+        i = i + 1;
+    }
+    c ^ 4294967295
+}
+
+/// The checksum as `x-amz-checksum-crc32` spells it: four big-endian
+/// bytes, base64.
+///
+/// # Example
+/// ```tuo
+/// let h = s3::crc32::header_value("id,name\n1,Ada\n"); // "tsOTXA=="
+/// ```
+pub fn header_value(in data: Str) -> String {
+    let c = of(data);
+    var bytes = std::array::empty();
+    std::array::push(bytes, (c / 16777216) % 256);
+    std::array::push(bytes, (c / 65536) % 256);
+    std::array::push(bytes, (c / 256) % 256);
+    std::array::push(bytes, c % 256);
+    std::crypto::base64_encode(bytes)
+}
+
+fn header_is(in data: Str, in expected: Str) -> Bool {
+    std::string::as_str(header_value(data)) == expected
+}
+
+spec of {
+    then of("123456789") == 3421780262;
+    then of("") == 0;
+    then of("a") == 3904355907;
+    then of("The quick brown fox jumps over the lazy dog") == 1095738169;
+}
+
+spec header_value {
+    then header_is("id,name\n1,Ada\n", "tsOTXA==");
+    then header_is("", "AAAAAA==");
+    then header_is("<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Object><Key>extraction/7/docs/a.pdf</Key></Object><Object><Key>extraction/7/docs/b &amp; c.pdf</Key></Object></Delete>", "ad3w/g==");
+}

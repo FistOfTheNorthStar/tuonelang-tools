@@ -1,0 +1,312 @@
+// sentry::scope — what every event carries besides itself.
+//
+// sentry-sdk keeps a scope: the environment, release, and server name
+// from `init`, the tags and user a program sets, and the last hundred
+// breadcrumbs. Its logging integration turns every record at INFO or
+// above into a breadcrumb — `type` "log", the logger's name as the
+// `category`, the record's extra fields as `data` — so that an error
+// event arrives with the log lines that led to it. That scope is this
+// struct, and `note` is the integration's breadcrumb.
+//
+// Timestamps are inputs: ISO 8601 with microseconds and a `Z`, which is
+// how the SDK writes them.
+
+module sentry::scope;
+
+/// The scope.
+pub struct Scope {
+    environment: String,
+    release: String,
+    server_name: String,
+    tag_names: Array[String],
+    tag_values: Array[String],
+    user_id: String,
+    crumbs: Array[String],
+}
+
+/// How many breadcrumbs are kept — `max_breadcrumbs`.
+///
+/// # Example
+/// ```tuo
+/// let n = sentry::scope::max_breadcrumbs(); // 100
+/// ```
+pub fn max_breadcrumbs() -> Int {
+    100
+}
+
+/// A scope as `init(environment=…, release=…, server_name=…)` leaves it.
+///
+/// # Example
+/// ```tuo
+/// var s = sentry::scope::new("production", "shallowflaws@2026.09.22", "cloud");
+/// ```
+pub fn new(in environment: Str, in release: Str, in server_name: Str) -> Scope {
+    Scope { environment: std::string::from_str(environment), release: std::string::from_str(release), server_name: std::string::from_str(server_name), tag_names: std::array::empty(), tag_values: std::array::empty(), user_id: std::string::empty(), crumbs: std::array::empty() }
+}
+
+/// `set_tag`; a tag set twice keeps its place and takes the new value.
+///
+/// # Example
+/// ```tuo
+/// sentry::scope::set_tag(s, "job_id", "7");
+/// ```
+pub fn set_tag(mut s: Scope, in name: Str, in value: Str) {
+    var i = 0;
+    while i < std::array::len(s.tag_names) {
+        if std::string::as_str(std::array::get(s.tag_names, i)) == name {
+            std::array::set(s.tag_values, i, std::string::from_str(value));
+            return;
+        }
+        i = i + 1;
+    }
+    std::array::push(s.tag_names, std::string::from_str(name));
+    std::array::push(s.tag_values, std::string::from_str(value));
+}
+
+/// `set_user({"id": …})`.
+///
+/// # Example
+/// ```tuo
+/// sentry::scope::set_user(s, "42");
+/// ```
+pub fn set_user(mut s: Scope, in id: Str) {
+    s.user_id = std::string::from_str(id);
+}
+
+fn keep(mut s: Scope, take crumb: String) {
+    std::array::push(s.crumbs, crumb);
+    if std::array::len(s.crumbs) > max_breadcrumbs() {
+        var kept = std::array::empty();
+        var i = std::array::len(s.crumbs) - max_breadcrumbs();
+        while i < std::array::len(s.crumbs) {
+            std::array::push(kept, std::string::from_str(std::string::as_str(std::array::get(s.crumbs, i))));
+            i = i + 1;
+        }
+        s.crumbs = kept;
+    }
+}
+
+/// `add_breadcrumb(category=…, message=…, level=…, data=…)`; `data` is a
+/// JSON object as text (`{}` for none).
+///
+/// # Example
+/// ```tuo
+/// sentry::scope::add_breadcrumb(s, "auth", "login", "info", "{\"user_id\":42}", timestamp);
+/// ```
+pub fn add_breadcrumb(mut s: Scope, in category: Str, in message: Str, in level: Str, in data: Str, in timestamp: Str) {
+    var out = std::string::from_str("{");
+    web::json::push_key(out, "category");
+    web::json::push_string(out, category);
+    web::json::push_key(out, "message");
+    web::json::push_string(out, message);
+    web::json::push_key(out, "level");
+    web::json::push_string(out, level);
+    web::json::push_key(out, "data");
+    std::string::append(out, data);
+    web::json::push_key(out, "timestamp");
+    web::json::push_string(out, timestamp);
+    web::json::push_key(out, "type");
+    std::string::append(out, "\"default\"}");
+    keep(s, out);
+}
+
+/// Sentry's name for a `logging` level: `critical` is `fatal`.
+///
+/// # Example
+/// ```tuo
+/// let l = sentry::scope::level_name(50); // "fatal"
+/// ```
+pub fn level_name(take level: Int) -> Str {
+    if level >= 50 {
+        "fatal"
+    } else if level >= 40 {
+        "error"
+    } else if level >= 30 {
+        "warning"
+    } else if level >= 20 {
+        "info"
+    } else {
+        "debug"
+    }
+}
+
+/// The logging integration's breadcrumb for a record at INFO or above.
+/// `asctime` is the formatted time the backend's handler adds to every
+/// record, which the integration copies into `data`; empty for none.
+///
+/// # Example
+/// ```tuo
+/// sentry::scope::note(s, r, timestamp, asctime);
+/// ```
+pub fn note(mut s: Scope, in r: log::record::Record, in timestamp: Str, in asctime: Str) {
+    if log::record::level(r) < log::record::info() {
+        return;
+    }
+    var out = std::string::from_str("{");
+    web::json::push_key(out, "type");
+    std::string::append(out, "\"log\"");
+    web::json::push_key(out, "level");
+    web::json::push_string(out, level_name(log::record::level(r)));
+    web::json::push_key(out, "category");
+    web::json::push_string(out, std::string::as_str(log::record::name(r)));
+    web::json::push_key(out, "message");
+    web::json::push_string(out, std::string::as_str(log::record::message(r)));
+    web::json::push_key(out, "timestamp");
+    web::json::push_string(out, timestamp);
+    web::json::push_key(out, "data");
+    std::string::push_byte(out, 123);
+    if std::str::len(asctime) > 0 {
+        web::json::push_key(out, "asctime");
+        web::json::push_string(out, asctime);
+    }
+    std::string::append(out, "}}");
+    keep(s, out);
+}
+
+/// How many breadcrumbs the scope holds.
+///
+/// # Example
+/// ```tuo
+/// let n = sentry::scope::breadcrumb_count(s);
+/// ```
+pub fn breadcrumb_count(in s: Scope) -> Int {
+    std::array::len(s.crumbs)
+}
+
+/// `"breadcrumbs":{"values":[…]}` — the member as the event carries it.
+///
+/// # Example
+/// ```tuo
+/// sentry::scope::push_breadcrumbs(out, s);
+/// ```
+pub fn push_breadcrumbs(mut out: String, in s: Scope) {
+    web::json::push_key(out, "breadcrumbs");
+    std::string::append(out, "{\"values\":[");
+    var i = 0;
+    while i < std::array::len(s.crumbs) {
+        if i > 0 {
+            std::string::push_byte(out, 44);
+        }
+        std::string::append(out, std::string::as_str(std::array::get(s.crumbs, i)));
+        i = i + 1;
+    }
+    std::string::append(out, "]}");
+}
+
+/// `"tags":{…}` if any tag is set.
+///
+/// # Example
+/// ```tuo
+/// sentry::scope::push_tags(out, s);
+/// ```
+pub fn push_tags(mut out: String, in s: Scope) {
+    if std::array::len(s.tag_names) == 0 {
+        return;
+    }
+    web::json::push_key(out, "tags");
+    std::string::push_byte(out, 123);
+    var i = 0;
+    while i < std::array::len(s.tag_names) {
+        web::json::push_key(out, std::string::as_str(std::array::get(s.tag_names, i)));
+        web::json::push_string(out, std::string::as_str(std::array::get(s.tag_values, i)));
+        i = i + 1;
+    }
+    std::string::push_byte(out, 125);
+}
+
+/// `"user":{"id":…}` if a user is set.
+///
+/// # Example
+/// ```tuo
+/// sentry::scope::push_user(out, s);
+/// ```
+pub fn push_user(mut out: String, in s: Scope) {
+    if std::string::len(s.user_id) == 0 {
+        return;
+    }
+    web::json::push_key(out, "user");
+    std::string::push_byte(out, 123);
+    web::json::push_key(out, "id");
+    web::json::push_string(out, std::string::as_str(s.user_id));
+    std::string::push_byte(out, 125);
+}
+
+/// The release, environment, and server name members, in the SDK's order.
+///
+/// # Example
+/// ```tuo
+/// sentry::scope::push_origin(out, s);
+/// ```
+pub fn push_origin(mut out: String, in s: Scope) {
+    if std::string::len(s.release) > 0 {
+        web::json::push_key(out, "release");
+        web::json::push_string(out, std::string::as_str(s.release));
+    }
+    web::json::push_key(out, "environment");
+    web::json::push_string(out, std::string::as_str(s.environment));
+    if std::string::len(s.server_name) > 0 {
+        web::json::push_key(out, "server_name");
+        web::json::push_string(out, std::string::as_str(s.server_name));
+    }
+}
+
+/// The environment.
+///
+/// # Example
+/// ```tuo
+/// let e = sentry::scope::environment(s);
+/// ```
+pub fn environment(in s: Scope) -> String {
+    std::string::from_str(std::string::as_str(s.environment))
+}
+
+/// The release, or empty.
+///
+/// # Example
+/// ```tuo
+/// let r = sentry::scope::release(s);
+/// ```
+pub fn release(in s: Scope) -> String {
+    std::string::from_str(std::string::as_str(s.release))
+}
+
+fn sample() -> Scope {
+    var s = new("production", "r1", "cloud");
+    set_tag(s, "job_id", "6");
+    set_tag(s, "job_id", "7");
+    var r = log::record::new("app.tasks", log::record::warning(), "retrying %d", 0);
+    log::record::int(r, 3);
+    note(s, r, "2026-09-22T08:30:00.123456Z", "2026-09-22 08:30:00,123");
+    note(s, log::record::new("app", log::record::debug(), "quiet", 0), "t", "");
+    add_breadcrumb(s, "auth", "login", "info", "{\"user_id\":42}", "2026-09-22T08:30:00.123456Z");
+    s
+}
+
+fn rendered(in s: Scope) -> String {
+    var out = std::string::from_str("{");
+    push_tags(out, s);
+    push_user(out, s);
+    push_breadcrumbs(out, s);
+    push_origin(out, s);
+    std::string::push_byte(out, 125);
+    out
+}
+
+fn crowded() -> Scope {
+    var s = new("production", "", "");
+    var i = 0;
+    while i < 105 {
+        add_breadcrumb(s, "c", std::string::as_str(std::str::to_string(i)), "info", "{}", "t");
+        i = i + 1;
+    }
+    s
+}
+
+spec note {
+    then breadcrumb_count(sample()) == 2;
+    then std::string::as_str(rendered(sample())) == "{\"tags\":{\"job_id\":\"7\"},\"breadcrumbs\":{\"values\":[{\"type\":\"log\",\"level\":\"warning\",\"category\":\"app.tasks\",\"message\":\"retrying 3\",\"timestamp\":\"2026-09-22T08:30:00.123456Z\",\"data\":{\"asctime\":\"2026-09-22 08:30:00,123\"}},{\"category\":\"auth\",\"message\":\"login\",\"level\":\"info\",\"data\":{\"user_id\":42},\"timestamp\":\"2026-09-22T08:30:00.123456Z\",\"type\":\"default\"}]},\"release\":\"r1\",\"environment\":\"production\",\"server_name\":\"cloud\"}";
+    then breadcrumb_count(crowded()) == 100;
+    then std::str::contains(std::string::as_str(rendered(crowded())), "\"message\":\"5\",") && !std::str::contains(std::string::as_str(rendered(crowded())), "\"message\":\"4\",");
+    then level_name(50) == "fatal";
+    then level_name(10) == "debug";
+}

@@ -1,0 +1,465 @@
+// s3::sigv4 — AWS Signature Version 4, for S3.
+//
+// Every request to S3, R2, or MinIO carries a signature over its method,
+// path, query, a chosen set of headers, and a digest of its body, keyed
+// by a secret that never leaves the client. The construction is
+// documented by AWS and reproduced here from that document, with the two
+// S3 particulars botocore applies: the path is encoded once (no double
+// encoding), and the body digest may be a fixed word instead of a hash
+// (`UNSIGNED-PAYLOAD`, or `STREAMING-UNSIGNED-PAYLOAD-TRAILER` when the
+// checksum rides in a trailer).
+//
+// Pure: the timestamp is an input. `s3::request` supplies it from the
+// caller, and the live client takes it from SNTP. The specs pin the
+// signatures botocore produced for the same inputs with a frozen clock.
+
+module s3::sigv4;
+
+/// A request's signing-relevant parts. `header_names` and
+/// `header_values` are parallel and in any order; `host` is added for you.
+pub struct Signable {
+    method: String,
+    path: String,
+    query_names: Array[String],
+    query_values: Array[String],
+    header_names: Array[String],
+    header_values: Array[String],
+    payload_hash: String,
+}
+
+/// An empty request to fill in.
+///
+/// # Example
+/// ```tuo
+/// var r = s3::sigv4::signable("GET", "/bucket/key");
+/// ```
+pub fn signable(in method: Str, in path: Str) -> Signable {
+    Signable { method: std::string::from_str(method), path: std::string::from_str(path), query_names: std::array::empty(), query_values: std::array::empty(), header_names: std::array::empty(), header_values: std::array::empty(), payload_hash: std::string::from_str(empty_payload_hash()) }
+}
+
+/// The SHA-256 of nothing, which every bodiless request declares.
+///
+/// # Example
+/// ```tuo
+/// let h = s3::sigv4::empty_payload_hash();
+/// ```
+pub fn empty_payload_hash() -> Str {
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+}
+
+/// Add a query parameter, unencoded.
+///
+/// # Example
+/// ```tuo
+/// s3::sigv4::query(r, "prefix", "extraction/7/");
+/// ```
+pub fn query(mut r: Signable, in name: Str, in value: Str) {
+    std::array::push(r.query_names, std::string::from_str(name));
+    std::array::push(r.query_values, std::string::from_str(value));
+}
+
+/// Add a header to sign, by its wire name.
+///
+/// # Example
+/// ```tuo
+/// s3::sigv4::header(r, "Content-Type", "text/csv");
+/// ```
+pub fn header(mut r: Signable, in name: Str, in value: Str) {
+    std::array::push(r.header_names, std::string::from_str(name));
+    std::array::push(r.header_values, std::string::from_str(value));
+}
+
+/// Declare the body's digest: a hex SHA-256, or one of the fixed words.
+///
+/// # Example
+/// ```tuo
+/// s3::sigv4::payload(r, "UNSIGNED-PAYLOAD");
+/// ```
+pub fn payload(mut r: Signable, in hash: Str) {
+    r.payload_hash = std::string::from_str(hash);
+}
+
+fn is_unreserved(take b: Int) -> Bool {
+    (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || b == 45 || b == 46 || b == 95 || b == 126
+}
+
+fn hex_upper(take v: Int) -> Int {
+    if v < 10 {
+        48 + v
+    } else {
+        55 + v
+    }
+}
+
+/// RFC 3986 percent-encoding with `/` kept when `keep_slash`: the form
+/// SigV4 wants for a path (slashes kept) and for a query value (encoded).
+///
+/// # Example
+/// ```tuo
+/// let e = s3::sigv4::encode("a b/c", true); // "a%20b/c"
+/// ```
+pub fn encode(in s: Str, take keep_slash: Bool) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::str::len(s) {
+        let b = std::str::byte_at(s, i);
+        if is_unreserved(b) || (keep_slash && b == 47) {
+            std::string::push_byte(out, b);
+        } else {
+            std::string::push_byte(out, 37);
+            std::string::push_byte(out, hex_upper(b / 16));
+            std::string::push_byte(out, hex_upper(b % 16));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn lowered(in s: Str) -> String {
+    std::str::to_lower(s)
+}
+
+fn less(in a: Str, in b: Str) -> Bool {
+    let n = std::str::len(a);
+    let m = std::str::len(b);
+    var i = 0;
+    while i < n && i < m {
+        let x = std::str::byte_at(a, i);
+        let y = std::str::byte_at(b, i);
+        if x != y {
+            return x < y;
+        }
+        i = i + 1;
+    }
+    n < m
+}
+
+// Indices of `names` in ascending byte order (a stable insertion sort;
+// the lists are short).
+fn sorted_order(in names: Array[String]) -> Array[Int] {
+    var order = std::array::empty();
+    var i = 0;
+    while i < std::array::len(names) {
+        var at = std::array::len(order);
+        while at > 0 && less(std::string::as_str(std::array::get(names, i)), std::string::as_str(std::array::get(names, std::array::get(order, at - 1)))) {
+            at = at - 1;
+        }
+        std::array::push(order, 0);
+        var k = std::array::len(order) - 1;
+        while k > at {
+            std::array::set(order, k, std::array::get(order, k - 1));
+            k = k - 1;
+        }
+        std::array::set(order, at, i);
+        i = i + 1;
+    }
+    order
+}
+
+/// The canonical query string: each name and value encoded, pairs sorted
+/// by name.
+///
+/// # Example
+/// ```tuo
+/// let q = s3::sigv4::canonical_query(r);
+/// ```
+pub fn canonical_query(in r: Signable) -> String {
+    var encoded_names = std::array::empty();
+    var i = 0;
+    while i < std::array::len(r.query_names) {
+        std::array::push(encoded_names, encode(std::string::as_str(std::array::get(r.query_names, i)), false));
+        i = i + 1;
+    }
+    let order = sorted_order(encoded_names);
+    var out = std::string::empty();
+    i = 0;
+    while i < std::array::len(order) {
+        let k = std::array::get(order, i);
+        if i > 0 {
+            std::string::push_byte(out, 38);
+        }
+        std::string::append(out, std::string::as_str(std::array::get(encoded_names, k)));
+        std::string::push_byte(out, 61);
+        std::string::append(out, std::string::as_str(encode(std::string::as_str(std::array::get(r.query_values, k)), false)));
+        i = i + 1;
+    }
+    out
+}
+
+/// The query string as it goes on the wire: the pairs in the order they
+/// were added, encoded, and a bare name for an empty value (`?delete`).
+///
+/// # Example
+/// ```tuo
+/// let q = s3::sigv4::wire_query(r);
+/// ```
+pub fn wire_query(in r: Signable) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::array::len(r.query_names) {
+        if i > 0 {
+            std::string::push_byte(out, 38);
+        }
+        std::string::append(out, std::string::as_str(encode(std::string::as_str(std::array::get(r.query_names, i)), false)));
+        if std::string::len(std::array::get(r.query_values, i)) > 0 {
+            std::string::push_byte(out, 61);
+            std::string::append(out, std::string::as_str(encode(std::string::as_str(std::array::get(r.query_values, i)), false)));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn trimmed(in s: Str) -> Str {
+    std::str::trim(s)
+}
+
+// Lowercased header names, in sorted order, and the values beside them.
+fn canonical_headers(in r: Signable, in host: Str, mut names: Array[String], mut values: Array[String]) {
+    var all_names = std::array::empty();
+    var all_values = std::array::empty();
+    std::array::push(all_names, std::string::from_str("host"));
+    std::array::push(all_values, std::string::from_str(host));
+    var i = 0;
+    while i < std::array::len(r.header_names) {
+        std::array::push(all_names, lowered(std::string::as_str(std::array::get(r.header_names, i))));
+        std::array::push(all_values, std::string::from_str(trimmed(std::string::as_str(std::array::get(r.header_values, i)))));
+        i = i + 1;
+    }
+    let order = sorted_order(all_names);
+    i = 0;
+    while i < std::array::len(order) {
+        let k = std::array::get(order, i);
+        std::array::push(names, std::string::from_str(std::string::as_str(std::array::get(all_names, k))));
+        std::array::push(values, std::string::from_str(std::string::as_str(std::array::get(all_values, k))));
+        i = i + 1;
+    }
+}
+
+/// The `SignedHeaders` list: lowercased names, sorted, `;`-joined, `host`
+/// included.
+///
+/// # Example
+/// ```tuo
+/// let sh = s3::sigv4::signed_headers(r); // "host;x-amz-content-sha256;x-amz-date"
+/// ```
+pub fn signed_headers(in r: Signable) -> String {
+    var names = std::array::empty();
+    var values = std::array::empty();
+    canonical_headers(r, "", names, values);
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::array::len(names) {
+        if i > 0 {
+            std::string::push_byte(out, 59);
+        }
+        std::string::append(out, std::string::as_str(std::array::get(names, i)));
+        i = i + 1;
+    }
+    out
+}
+
+/// The canonical request, as AWS defines it.
+///
+/// # Example
+/// ```tuo
+/// let cr = s3::sigv4::canonical_request(r, "localhost:9000");
+/// ```
+pub fn canonical_request(in r: Signable, in host: Str) -> String {
+    var out = std::string::from_str(std::string::as_str(r.method));
+    std::string::push_byte(out, 10);
+    std::string::append(out, std::string::as_str(r.path));
+    std::string::push_byte(out, 10);
+    std::string::append(out, std::string::as_str(canonical_query(r)));
+    std::string::push_byte(out, 10);
+    var names = std::array::empty();
+    var values = std::array::empty();
+    canonical_headers(r, host, names, values);
+    var i = 0;
+    while i < std::array::len(names) {
+        std::string::append(out, std::string::as_str(std::array::get(names, i)));
+        std::string::push_byte(out, 58);
+        std::string::append(out, std::string::as_str(std::array::get(values, i)));
+        std::string::push_byte(out, 10);
+        i = i + 1;
+    }
+    std::string::push_byte(out, 10);
+    std::string::append(out, std::string::as_str(signed_headers(r)));
+    std::string::push_byte(out, 10);
+    std::string::append(out, std::string::as_str(r.payload_hash));
+    out
+}
+
+/// The credential scope: `date/region/s3/aws4_request`.
+///
+/// # Example
+/// ```tuo
+/// let scope = s3::sigv4::scope("20260922T083000Z", "auto");
+/// ```
+pub fn scope(in timestamp: Str, in region: Str) -> String {
+    var out = std::string::from_str(std::string::as_str(std::string::slice(std::string::from_str(timestamp), 0, 8)));
+    std::string::push_byte(out, 47);
+    std::string::append(out, region);
+    std::string::append(out, "/s3/aws4_request");
+    out
+}
+
+/// The string to sign.
+///
+/// # Example
+/// ```tuo
+/// let sts = s3::sigv4::string_to_sign(cr, "20260922T083000Z", "auto");
+/// ```
+pub fn string_to_sign(in canonical: Str, in timestamp: Str, in region: Str) -> String {
+    var out = std::string::from_str("AWS4-HMAC-SHA256\n");
+    std::string::append(out, timestamp);
+    std::string::push_byte(out, 10);
+    std::string::append(out, std::string::as_str(scope(timestamp, region)));
+    std::string::push_byte(out, 10);
+    std::string::append(out, std::string::as_str(std::crypto::sha256(canonical)));
+    out
+}
+
+fn hmac(in key: Array[Int], in message: Str) -> Array[Int] {
+    std::crypto::hmac_sha256(key, std::crypto::bytes_of_str(message))
+}
+
+/// The signing key: HMAC chained over the date, region, service, and
+/// the terminal string, from `"AWS4" + secret`.
+///
+/// # Example
+/// ```tuo
+/// let k = s3::sigv4::signing_key(secret, "20260922", "auto");
+/// ```
+pub fn signing_key(in secret: Str, in date: Str, in region: Str) -> Array[Int] {
+    var seed = std::string::from_str("AWS4");
+    std::string::append(seed, secret);
+    let k_date = hmac(std::crypto::bytes_of_str(std::string::as_str(seed)), date);
+    let k_region = hmac(k_date, region);
+    let k_service = hmac(k_region, "s3");
+    hmac(k_service, "aws4_request")
+}
+
+/// The signature: hex HMAC of the string to sign under the signing key.
+///
+/// # Example
+/// ```tuo
+/// let sig = s3::sigv4::signature(r, "localhost:9000", secret, "20260922T083000Z", "auto");
+/// ```
+pub fn signature(in r: Signable, in host: Str, in secret: Str, in timestamp: Str, in region: Str) -> String {
+    let key = signing_key(secret, std::string::as_str(std::string::slice(std::string::from_str(timestamp), 0, 8)), region);
+    let sts = string_to_sign(std::string::as_str(canonical_request(r, host)), timestamp, region);
+    std::crypto::to_hex(hmac(key, std::string::as_str(sts)))
+}
+
+/// The `Authorization` header value.
+///
+/// # Example
+/// ```tuo
+/// let a = s3::sigv4::authorization(r, "localhost:9000", access, secret, "20260922T083000Z", "auto");
+/// ```
+pub fn authorization(in r: Signable, in host: Str, in access: Str, in secret: Str, in timestamp: Str, in region: Str) -> String {
+    var out = std::string::from_str("AWS4-HMAC-SHA256 Credential=");
+    std::string::append(out, access);
+    std::string::push_byte(out, 47);
+    std::string::append(out, std::string::as_str(scope(timestamp, region)));
+    std::string::append(out, ", SignedHeaders=");
+    std::string::append(out, std::string::as_str(signed_headers(r)));
+    std::string::append(out, ", Signature=");
+    std::string::append(out, std::string::as_str(signature(r, host, secret, timestamp, region)));
+    out
+}
+
+/// Turn `r` into a presigned request: the `X-Amz-*` parameters are added
+/// to its query, in botocore's order, the payload is `UNSIGNED-PAYLOAD`,
+/// and the signature goes last. The wire query of the result is the URL's.
+///
+/// # Example
+/// ```tuo
+/// s3::sigv4::presign(r, "localhost:9000", access, secret, "20260922T083000Z", "auto", 900);
+/// ```
+pub fn presign(mut r: Signable, in host: Str, in access: Str, in secret: Str, in timestamp: Str, in region: Str, take expires: Int) {
+    var credential = std::string::from_str(access);
+    std::string::push_byte(credential, 47);
+    std::string::append(credential, std::string::as_str(scope(timestamp, region)));
+    query(r, "X-Amz-Algorithm", "AWS4-HMAC-SHA256");
+    query(r, "X-Amz-Credential", std::string::as_str(credential));
+    query(r, "X-Amz-Date", timestamp);
+    query(r, "X-Amz-Expires", std::string::as_str(std::str::to_string(expires)));
+    query(r, "X-Amz-SignedHeaders", std::string::as_str(signed_headers(r)));
+    payload(r, "UNSIGNED-PAYLOAD");
+    let sig = signature(r, host, secret, timestamp, region);
+    query(r, "X-Amz-Signature", std::string::as_str(sig));
+}
+
+fn access() -> Str {
+    "AKIAIOSFODNN7EXAMPLE"
+}
+
+fn secret() -> Str {
+    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+}
+
+fn stamp() -> Str {
+    "20260922T083000Z"
+}
+
+// boto3's HEAD of extraction/7/result.csv, against R2 (see s3_oracle.py).
+fn head_request() -> Signable {
+    var r = signable("HEAD", "/shallowflaws-uploads/extraction/7/result.csv");
+    header(r, "X-Amz-Date", stamp());
+    header(r, "X-Amz-Content-SHA256", empty_payload_hash());
+    r
+}
+
+fn list_request() -> Signable {
+    var r = signable("GET", "/shallowflaws-uploads");
+    query(r, "list-type", "2");
+    query(r, "prefix", "extraction/7/docs/");
+    query(r, "continuation-token", "1/abc+def=");
+    query(r, "max-keys", "50");
+    query(r, "encoding-type", "url");
+    header(r, "X-Amz-Date", stamp());
+    header(r, "X-Amz-Content-SHA256", empty_payload_hash());
+    r
+}
+
+fn presigned_get() -> Signable {
+    var r = signable("GET", "/shallowflaws-uploads/extraction/7/result.csv");
+    query(r, "response-content-type", "text/csv; charset=utf-8");
+    query(r, "response-content-disposition", "attachment; filename=\"result.csv\"");
+    presign(r, "localhost:9000", access(), secret(), stamp(), "auto", 900);
+    r
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+spec encode {
+    then text_is(encode("logo one.png", true), "logo%20one.png");
+    then text_is(encode("extraction/7/docs/", false), "extraction%2F7%2Fdocs%2F");
+    then text_is(encode("1/abc+def=", false), "1%2Fabc%2Bdef%3D");
+    then text_is(encode("a-b_c.d~e", false), "a-b_c.d~e");
+    then text_is(encode("\u{e9}", false), "%C3%A9");
+}
+
+spec canonical_query {
+    then text_is(canonical_query(list_request()), "continuation-token=1%2Fabc%2Bdef%3D&encoding-type=url&list-type=2&max-keys=50&prefix=extraction%2F7%2Fdocs%2F");
+    then text_is(wire_query(list_request()), "list-type=2&prefix=extraction%2F7%2Fdocs%2F&continuation-token=1%2Fabc%2Bdef%3D&max-keys=50&encoding-type=url");
+    then text_is(canonical_query(signable("GET", "/")), "");
+}
+
+spec signed_headers {
+    then text_is(signed_headers(head_request()), "host;x-amz-content-sha256;x-amz-date");
+    then text_is(canonical_request(head_request(), "abc123.r2.cloudflarestorage.com"), "HEAD\n/shallowflaws-uploads/extraction/7/result.csv\n\nhost:abc123.r2.cloudflarestorage.com\nx-amz-content-sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\nx-amz-date:20260922T083000Z\n\nhost;x-amz-content-sha256;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+spec authorization {
+    then text_is(authorization(head_request(), "abc123.r2.cloudflarestorage.com", access(), secret(), stamp(), "auto"), "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260922/auto/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=a9af2bbe8b77dc3aec764c3631459f1daa56912fe8cc334f55253933af37d541");
+    then std::string::len(signature(list_request(), "localhost:9000", secret(), stamp(), "auto")) == 64;
+}
+
+spec presign {
+    then text_is(wire_query(presigned_get()), "response-content-type=text%2Fcsv%3B%20charset%3Dutf-8&response-content-disposition=attachment%3B%20filename%3D%22result.csv%22&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20260922%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20260922T083000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=59d9fa43dff7276dfc6caa246433db25978caf37823a093d7bc9240cf584ac15");
+}
