@@ -95,6 +95,10 @@ SENTRY_SRC=(src/sentry/dsn.tuo src/sentry/scope.tuo src/sentry/event.tuo src/sen
             src/log/demo.tuo
             "${WEB_SRC[@]}" "${HTTP_SRC[@]}")
 
+JINJA_SRC=(src/jinja/escape.tuo src/jinja/context.tuo src/jinja/lexer.tuo src/jinja/expr.tuo
+           src/jinja/filters.tuo src/jinja/template.tuo src/jinja/fixture.tuo src/jinja/demo.tuo
+           src/web/json.tuo src/web/coerce.tuo src/std_str.tuo)
+
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
 check() { if [ "$1" -eq 0 ]; then echo "PASS $2"; else echo "FAIL $2"; failed=1; fi }
@@ -162,11 +166,17 @@ step "Sentry: front end (check)"
 step "Sentry: specs (verify), all 7 captured envelopes rebuilt"
 "$TUO" verify src/sentry/dsn.tuo src/sentry/scope.tuo src/sentry/event.tuo src/sentry/envelope.tuo src/sentry/fixture.tuo src/sentry/demo.tuo "${LOG_SRC[@]}"; check $? "sentry verify"
 
+step "Jinja: front end (check)"
+"$TUO" check "${JINJA_SRC[@]}"; check $? "jinja check"
+
+step "Jinja: specs (verify), all 100 captured renders reproduced"
+"$TUO" verify "${JINJA_SRC[@]}"; check $? "jinja verify"
+
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
 # to `crates/tuo-stdlib/src/std/` — and src/pg, src/db are tuonelang-db's.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo src/jinja/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.

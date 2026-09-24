@@ -135,9 +135,9 @@ Achievable on v0 as it stands, in rough order of value-per-effort.
 |---|---|---|
 | **Redis client** — ✅ done | `redis` | RESP2 over TCP, spec'd against bytes a real server sent; the transport `tuolang-celery` lacked, which still models the broker in memory until its message envelope is written over this client. |
 | **Structured logging + Sentry** — ✅ done | `sentry-sdk` | Needs only JSON + HTTP. Error capture, breadcrumbs, envelope format. Done 2026-09-22 as `log` and `sentry`: pinned to CPython's `logging` output and to 7 envelopes sentry-sdk 2.69 serialized, with the logging integration's breadcrumbs and events. |
-| **JWT / JOSE** | (part of your auth) | HMAC-SHA256 already exists — HS256 is nearly free today. RS256 verification is `rsa::verify` now; signing waits on a constant-time bignum. |
+| **JWT / JOSE** — not needed | (assumed part of your auth) | The backend's tokens are opaque random rows (`secrets.token_urlsafe`), not JWTs; no dependency to replace. HMAC-SHA256 exists should that change. |
 | **S3 client** — ✅ done | `boto3` | You only use Cloudflare R2. SigV4 signing is pure HMAC-SHA256 — already available. A tiny, targeted client beats all of boto3. Done 2026-09-22 as `s3`: the seven calls the backend makes, pinned to 22 requests captured from boto3 with a frozen clock, and a 35-check live oracle against MinIO. |
-| **Template engine** | `jinja2` + `markupsafe` | Parser + renderer; escaping is a correctness property that specs pin beautifully. |
+| **Template engine** — ✅ done | `jinja2` + `markupsafe` | Parser + renderer; escaping is a correctness property that specs pin beautifully. Done 2026-09-24 as `jinja`: the subset the 30 email templates use, pinned to 100 renders by Jinja2 3.1.6 of those very templates. |
 | **Config / env loading** | `pydantic-settings`, `python-dotenv` | Nearly trivial; `.env` parsing + typed struct binding. |
 | **CSV / XLSX reading** | `openpyxl` | XLSX is a zip of XML — needs a deflate decompressor first (worth having anyway). |
 | **Rate limiting** | `slowapi` | Pure algorithm: token bucket / sliding window. Ideal spec target. |
@@ -173,8 +173,9 @@ Be honest about these rather than half-porting them.
 6. ◐ **Router + validation** — the request path is done — and ✅ the
    **query layer**. Tier 1 is complete.
 7. ✅ **S3 client** — the first of Tier 2.
-8. ✅ **Structured logging + Sentry**. **Next:** JWT/JOSE, then the
-   template engine, then config loading.
+8. ✅ **Structured logging + Sentry**.
+9. ✅ **Template engine** (JWT dropped: the backend has no JWTs).
+   **Next:** config and `.env` loading, then rate limiting.
 
 The application itself — shallowflaws's routers, services, and models —
 stays in Python and is **out of scope** here. It is the oracle these

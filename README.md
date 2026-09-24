@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Eleven ports so far:
+Twelve ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -19,6 +19,7 @@ Eleven ports so far:
 | **`s3`** — SigV4 signing, the seven S3 calls the backend makes, presigned URLs, CRC-32 checksums | `boto3` (the R2 half) | 15 specs, 22 requests captured from boto3 1.43 reproduced byte for byte, and a 35-check live oracle against MinIO |
 | **`log`** — `logging`'s records, levels, `%`-formatting, and the backend's two line formats | `logging` (as `app/main.py` configures it) | 4 specs, 7 records formatted as CPython 3.14 formats them |
 | **`sentry`** — DSNs, scope with breadcrumbs and tags, message and error events, the envelope, the logging integration | `sentry-sdk` | 6 specs, 7 envelopes serialized by sentry-sdk 2.69 reproduced byte for byte, and a 12-check loopback oracle |
+| **`jinja`** — the template engine: inheritance, `if`/`elif`/`else`, expressions with filters, autoescaping with `Markup`, Jinja's whitespace rules | `jinja2`, `markupsafe` | 9 specs, and 100 renders of the backend's 30 email templates by Jinja2 3.1.6 reproduced byte for byte |
 | **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
 
 ```bash
@@ -339,6 +340,91 @@ CAs; adding one is one base64 line. And the catalog's own caveat carries
 over: `std::bignum` is variable-time, so the client's X25519 step leaks
 timing on its ephemeral key. Signature *verification* is variable-time
 by design, and there is no signing function in `ec` or `rsa` at all.
+
+---
+
+## `jinja` — the template engine
+
+Every email the backend sends is a Jinja2 template: a child that
+`{% extends %}` a base and fills one `{% block %}`, with `{% if %}`
+branches, `{{ }}` expressions over nested dicts and one custom filter,
+rendered twice — HTML with autoescaping and `Markup` translations, text
+without. This port is that engine: the lexer with the two whitespace
+options the backend turns on, an evaluator for the expressions the
+templates use, and a renderer with inheritance.
+
+```tuo
+var l = jinja::template::loader();
+jinja::template::add(l, "base.html", base_source);
+jinja::template::add(l, "auth/welcome.html", welcome_source);
+var ctx = jinja::context::from_json(context_json, safe_paths);
+let html = jinja::template::render(l, "auth/welcome.html", ctx);
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `jinja::escape` — MarkupSafe's `escape` | ✅ proven |
+| `jinja::context` — the context as JSON, with the paths that are `Markup` | ✅ proven |
+| `jinja::lexer` — text, `{{ }}`, `{% %}`, `{# #}`; `trim_blocks`, `lstrip_blocks`, `-` and `+` | ✅ proven |
+| `jinja::expr` — names with attributes, literals with Python's escapes, comparisons, `not`/`and`/`or`, `a if c else b`, filters; Python's truthiness | ✅ proven |
+| `jinja::filters` — the backend's `currency`, and `safe`, `e`, `upper`, `lower`, `trim`, `length`, `default` | ✅ proven |
+| `jinja::template` — `if`/`elif`/`else` nesting, `extends` and `block` through any depth, `select_autoescape(["html"])`, the dropped trailing newline | ✅ 100 of 100 captured renders reproduced |
+
+### The oracle is Jinja2 rendering the backend's own templates
+
+`examples/jinja_oracle.py` calls every email function in `app/emails` —
+password reset, welcome with and without a verification link, purchases,
+payment failures, analysis started and complete, unread message,
+extraction complete and failed, VIES success and failure — in English
+and Finnish, with names and titles that carry markup, quotes, and
+non-ASCII text, and records what Jinja2 3.1.6 rendered through the
+backend's own environment: the template, the context it was given as
+JSON with the `Markup` paths listed, and the output. The thirty template
+sources go into the fixture as shipped. `jinja::demo` renders the same
+hundred and the spec holds each to byte equality.
+
+```bash
+../shallowflaws/.venv/bin/python examples/jinja_oracle.py   # writes examples/jinja_oracle.json
+python3 examples/jinja_fixture.py && tuo fmt src/jinja/fixture.tuo
+```
+
+### What the specs pin that a comment cannot
+
+**Whitespace is the hard part.** `trim_blocks` drops one newline after a
+block tag or a comment; `lstrip_blocks` drops the blanks from the start
+of a line up to one; neither touches `{{ }}`; `keep_trailing_newline` is
+off, so one final newline of every template source is dropped. The
+difference between `default<p>` and `default\n<p>` is a spec line.
+
+**Escaping is MarkupSafe's**: `&#34;` and `&#39;` for the quotes, and a
+`Markup` value — a translation string with author markup, a
+pre-escaped greeting — passes through untouched, while the name inside
+it was escaped before it got there.
+
+**`{{ x if x else "\u2014" }}`** needs three things at once: the inline
+conditional, Python's `\u` escape in a Jinja string literal, and an
+undefined name printing as nothing. **`{{ amount | currency(currency) }}`**
+is `f"{float(amount):.2f} {currency}"`, so `"12.5"` is `12.50 USD` and
+`"nope"` is `nope EUR`.
+
+**`elif` inside an inactive branch stays inactive**, and a branch already
+taken keeps `else` from firing — the nested spec, and the four
+`tier_reached` renders that first exposed it.
+
+### What is deliberately not here
+
+`for` loops, `set`, `include`, `import`, macros, `with`, `raw`, tests
+(`is defined`), subscripts (`x["k"]`), arithmetic, method calls, the
+rest of the built-in filters, and the sandbox — none of which the
+backend's templates use. An unknown filter leaves its input unchanged
+where Jinja would refuse the template. Rounding in `currency` is
+decimal, not binary: `0.005` is `0.01` here and `0.01` in CPython too,
+but a value that differs in the seventeenth digit could round the other
+way. The backend's own translation interpolation
+(`_interpolate_translations`) stays in Python: the oracle records its
+result as the context.
 
 ---
 
@@ -1002,6 +1088,17 @@ src/web/demo.tuo         the oracle's FastAPI app, reimplemented
 examples/web.tuo         the socket oracle: web::demo behind http::server
 examples/web_oracle.py   the FastAPI app and requests the fixture was captured from
 examples/web_fixture.py  oracle.json to src/web/fixture.tuo
+
+src/jinja/escape.tuo     MarkupSafe's escape
+src/jinja/context.tuo    the context as JSON; the Markup paths
+src/jinja/lexer.tuo      text, output, block, comment; the whitespace rules
+src/jinja/expr.tuo       the expression evaluator
+src/jinja/filters.tuo    currency, and a few built-ins
+src/jinja/template.tuo   the renderer: if/elif/else, extends, block
+src/jinja/fixture.tuo    30 templates and 100 renders by Jinja2 (generated)
+src/jinja/demo.tuo       the same 100, rendered here
+examples/jinja_oracle.py     the backend's email functions, recorded
+examples/jinja_fixture.py    jinja_oracle.json to src/jinja/fixture.tuo
 
 src/log/record.tuo       records, levels, getMessage, params as JSON
 src/log/format.tuo       asctime and the two line formats
