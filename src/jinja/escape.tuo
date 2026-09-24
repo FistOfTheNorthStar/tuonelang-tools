@@ -1,0 +1,44 @@
+// jinja::escape — MarkupSafe's `escape`.
+//
+// Autoescaping turns five characters into entities: `&` `<` `>` `"` `'`,
+// the last two as numeric references (`&#34;`, `&#39;`), which is
+// MarkupSafe's choice and therefore the backend's HTML. A value marked
+// safe (`Markup`) passes through untouched; the port carries that mark
+// as a flag beside the value rather than as a type.
+
+module jinja::escape;
+
+/// `markupsafe.escape` of `text`.
+///
+/// # Example
+/// ```tuo
+/// let e = jinja::escape::html("a <b> & \"c\""); // "a &lt;b&gt; &amp; &#34;c&#34;"
+/// ```
+pub fn html(in text: Str) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::str::len(text) {
+        let b = std::str::byte_at(text, i);
+        if b == 38 {
+            std::string::append(out, "&amp;");
+        } else if b == 60 {
+            std::string::append(out, "&lt;");
+        } else if b == 62 {
+            std::string::append(out, "&gt;");
+        } else if b == 34 {
+            std::string::append(out, "&#34;");
+        } else if b == 39 {
+            std::string::append(out, "&#39;");
+        } else {
+            std::string::push_byte(out, b);
+        }
+        i = i + 1;
+    }
+    out
+}
+
+spec html {
+    then std::string::as_str(html("a <b> & \"c\" 'd'")) == "a &lt;b&gt; &amp; &#34;c&#34; &#39;d&#39;";
+    then std::string::as_str(html("S\u{f6}hne")) == "S\u{f6}hne";
+    then std::string::as_str(html("")) == "";
+}

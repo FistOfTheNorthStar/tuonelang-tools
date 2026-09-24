@@ -1,0 +1,334 @@
+// jinja::template — rendering, with `if` and inheritance.
+//
+// A template is lexed, then walked: text is copied, `{{ }}` is
+// evaluated and printed (escaped when the template's name ends in
+// `.html`, as `select_autoescape(["html"])` decides), and `{% if %}`,
+// `elif`, `else`, `endif` open and close branches. `{% extends %}`
+// makes the template a set of `{% block %}` overrides for its parent:
+// the parent is rendered, and where it declares a block the child's
+// body is rendered instead of its own, if the child has one. A chain of
+// parents works the same way, the nearest child's block winning.
+//
+// Templates come from a `Loader` the caller fills, since a pure module
+// reads no files; the backend's loader is its `templates/` directory.
+
+module jinja::template;
+
+/// Templates by name.
+pub struct Loader {
+    names: Array[String],
+    sources: Array[String],
+}
+
+/// An empty loader.
+///
+/// # Example
+/// ```tuo
+/// var l = jinja::template::loader();
+/// ```
+pub fn loader() -> Loader {
+    Loader { names: std::array::empty(), sources: std::array::empty() }
+}
+
+/// Add a template under the name `{% extends %}` refers to it by.
+///
+/// # Example
+/// ```tuo
+/// jinja::template::add(l, "base.html", source);
+/// ```
+pub fn add(mut l: Loader, in name: Str, in source: Str) {
+    std::array::push(l.names, std::string::from_str(name));
+    std::array::push(l.sources, std::string::from_str(source));
+}
+
+/// The source of a template, or empty for an unknown name.
+///
+/// # Example
+/// ```tuo
+/// let s = jinja::template::source_of(l, "base.html");
+/// ```
+pub fn source_of(in l: Loader, in name: Str) -> String {
+    var i = 0;
+    while i < std::array::len(l.names) {
+        if std::string::as_str(std::array::get(l.names, i)) == name {
+            return std::string::from_str(std::string::as_str(std::array::get(l.sources, i)));
+        }
+        i = i + 1;
+    }
+    std::string::empty()
+}
+
+/// Does `select_autoescape(["html"])` escape this template?
+///
+/// # Example
+/// ```tuo
+/// let yes = jinja::template::autoescapes("auth/welcome.html");
+/// ```
+pub fn autoescapes(in name: Str) -> Bool {
+    std::str::ends_with(name, ".html")
+}
+
+// Block bodies a child supplies for its parents: the tokens of every
+// override, concatenated, with a range per block name.
+struct Overrides {
+    names: Array[String],
+    starts: Array[Int],
+    ends: Array[Int],
+    kinds: Array[Int],
+    texts: Array[String],
+}
+
+fn no_overrides() -> Overrides {
+    Overrides { names: std::array::empty(), starts: std::array::empty(), ends: std::array::empty(), kinds: std::array::empty(), texts: std::array::empty() }
+}
+
+fn override_index(in o: Overrides, in name: Str) -> Int {
+    var i = 0;
+    while i < std::array::len(o.names) {
+        if std::string::as_str(std::array::get(o.names, i)) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+// The first word of a block tag and what follows it.
+fn tag_word(in tag: Str) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::str::len(tag) && std::str::byte_at(tag, i) != 32 && std::str::byte_at(tag, i) != 9 {
+        std::string::push_byte(out, std::str::byte_at(tag, i));
+        i = i + 1;
+    }
+    out
+}
+
+fn tag_rest(in tag: Str) -> String {
+    let word = tag_word(tag);
+    std::string::from_str(std::str::trim(std::str::slice(tag, std::string::len(word), std::str::len(tag))))
+}
+
+// A name inside quotes, or the bare word.
+fn unquoted(in text: Str) -> String {
+    let n = std::str::len(text);
+    if n >= 2 && (std::str::byte_at(text, 0) == 34 || std::str::byte_at(text, 0) == 39) {
+        return std::string::from_str(std::str::slice(text, 1, n - 1));
+    }
+    std::string::from_str(text)
+}
+
+fn is_block_tag(in t: jinja::lexer::Tokens, take i: Int, in word: Str) -> Bool {
+    jinja::lexer::kind(t, i) == jinja::lexer::kind_block() && std::string::as_str(tag_word(std::string::as_str(jinja::lexer::text(t, i)))) == word
+}
+
+// The index of the `endblock` matching the `block` at `i`.
+fn matching_endblock(in t: jinja::lexer::Tokens, take i: Int) -> Int {
+    var depth = 0;
+    var k = i + 1;
+    while k < jinja::lexer::count(t) {
+        if is_block_tag(t, k, "block") {
+            depth = depth + 1;
+        } else if is_block_tag(t, k, "endblock") {
+            if depth == 0 {
+                return k;
+            }
+            depth = depth - 1;
+        }
+        k = k + 1;
+    }
+    jinja::lexer::count(t)
+}
+
+// Copy this template's top-level blocks into the overrides, where the
+// name is not already taken by a nearer child.
+fn collect_blocks(in t: jinja::lexer::Tokens, mut o: Overrides) {
+    var i = 0;
+    while i < jinja::lexer::count(t) {
+        if is_block_tag(t, i, "block") {
+            let name = tag_rest(std::string::as_str(jinja::lexer::text(t, i)));
+            let end = matching_endblock(t, i);
+            if override_index(o, std::string::as_str(name)) < 0 {
+                std::array::push(o.names, name);
+                std::array::push(o.starts, std::array::len(o.kinds));
+                var k = i + 1;
+                while k < end {
+                    std::array::push(o.kinds, jinja::lexer::kind(t, k));
+                    std::array::push(o.texts, jinja::lexer::text(t, k));
+                    k = k + 1;
+                }
+                std::array::push(o.ends, std::array::len(o.kinds));
+            } else {
+                let _ = name;
+            }
+            i = end + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+}
+
+fn all_active(in active: Array[Int]) -> Bool {
+    var i = 0;
+    while i < std::array::len(active) {
+        if std::array::get(active, i) == 0 {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn tokens_of_override(in o: Overrides, take index: Int) -> jinja::lexer::Tokens {
+    var kinds = std::array::empty();
+    var texts = std::array::empty();
+    var k = std::array::get(o.starts, index);
+    while k < std::array::get(o.ends, index) {
+        std::array::push(kinds, std::array::get(o.kinds, k));
+        std::array::push(texts, std::string::from_str(std::string::as_str(std::array::get(o.texts, k))));
+        k = k + 1;
+    }
+    jinja::lexer::Tokens { kinds: kinds, texts: texts }
+}
+
+// Render tokens [from, to) into `out`.
+fn render_tokens(in t: jinja::lexer::Tokens, take from: Int, take to: Int, in ctx: jinja::context::Context, take autoescape: Bool, in o: Overrides, mut out: String) {
+    var taken = std::array::empty();
+    var active = std::array::empty();
+    var i = from;
+    while i < to {
+        let kind = jinja::lexer::kind(t, i);
+        let text = jinja::lexer::text(t, i);
+        if kind == jinja::lexer::kind_text() {
+            if all_active(active) {
+                std::string::append(out, std::string::as_str(text));
+            }
+            i = i + 1;
+        } else if kind == jinja::lexer::kind_output() {
+            if all_active(active) {
+                std::string::append(out, std::string::as_str(jinja::expr::printed(jinja::expr::evaluate(ctx, std::string::as_str(text)), autoescape)));
+            }
+            i = i + 1;
+        } else {
+            let word = tag_word(std::string::as_str(text));
+            let w = std::string::as_str(word);
+            if w == "if" {
+                let holds = all_active(active) && jinja::expr::truthy(jinja::expr::evaluate(ctx, std::string::as_str(tag_rest(std::string::as_str(text)))));
+                std::array::push(taken, if holds {
+                    1
+                } else {
+                    0
+                });
+                std::array::push(active, if holds {
+                    1
+                } else {
+                    0
+                });
+                i = i + 1;
+            } else if w == "elif" || w == "else" {
+                let depth = std::array::len(active) - 1;
+                if depth >= 0 {
+                    // Is the enclosing context active? Test with this level open.
+                    std::array::set(active, depth, 1);
+                    let outer_active = all_active(active);
+                    std::array::set(active, depth, 0);
+                    if std::array::get(taken, depth) == 0 {
+                        let holds = outer_active && (w == "else" || jinja::expr::truthy(jinja::expr::evaluate(ctx, std::string::as_str(tag_rest(std::string::as_str(text))))));
+                        if holds {
+                            std::array::set(taken, depth, 1);
+                            std::array::set(active, depth, 1);
+                        }
+                    }
+                }
+                i = i + 1;
+            } else if w == "endif" {
+                if std::array::len(active) > 0 {
+                    let _ = std::array::pop(active);
+                    let _ = std::array::pop(taken);
+                }
+                i = i + 1;
+            } else if w == "block" {
+                let end = matching_endblock(t, i);
+                if all_active(active) {
+                    let name = tag_rest(std::string::as_str(text));
+                    let found = override_index(o, std::string::as_str(name));
+                    if found >= 0 {
+                        let inner = tokens_of_override(o, found);
+                        render_tokens(inner, 0, jinja::lexer::count(inner), ctx, autoescape, no_overrides(), out);
+                    } else {
+                        render_tokens(t, i + 1, end, ctx, autoescape, o, out);
+                    }
+                }
+                i = end + 1;
+            } else {
+                // `extends`, `endblock`, and anything unknown produce nothing.
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fn render_named(in l: Loader, in name: Str, in ctx: jinja::context::Context, take autoescape: Bool, mut o: Overrides, take depth: Int) -> String {
+    // `keep_trailing_newline` is off: one final newline is dropped.
+    var source = source_of(l, name);
+    let n = std::string::len(source);
+    if n > 0 && std::string::byte_at(source, n - 1) == 10 {
+        source = std::string::slice(source, 0, n - 1);
+    }
+    let t = jinja::lexer::lex(std::string::as_str(source));
+    if depth < 8 && jinja::lexer::count(t) > 0 && is_block_tag(t, 0, "extends") {
+        let parent = unquoted(std::string::as_str(tag_rest(std::string::as_str(jinja::lexer::text(t, 0)))));
+        collect_blocks(t, o);
+        return render_named(l, std::string::as_str(parent), ctx, autoescape, o, depth + 1);
+    }
+    var out = std::string::empty();
+    render_tokens(t, 0, jinja::lexer::count(t), ctx, autoescape, o, out);
+    out
+}
+
+/// Render the template `name` against `ctx`.
+///
+/// # Example
+/// ```tuo
+/// let html = jinja::template::render(l, "auth/welcome.html", ctx);
+/// ```
+pub fn render(in l: Loader, in name: Str, in ctx: jinja::context::Context) -> String {
+    var o = no_overrides();
+    render_named(l, name, ctx, autoescapes(name), o, 0)
+}
+
+fn sample_loader() -> Loader {
+    var l = loader();
+    add(l, "base.html", "<h1>{{ title }}</h1>\n{% block content %}default{% endblock %}\n<p>{{ company }}</p>\n");
+    add(l, "child.html", "{% extends \"base.html\" %}\n{% block content %}\n{% if n > 1 %}\nmany {{ who }}\n{% elif n == 1 %}\none\n{% else %}\nnone\n{% endif %}\n{% endblock %}\n");
+    add(l, "nested.txt", "{% if n > 0 %}a{% if n > 1 %}b{% elif n == 1 %}c{% else %}d{% endif %}e{% elif n == 0 %}z{% else %}neg{% endif %}");
+    add(l, "plain.txt", "{{ who }} & {{ missing }}|{{ n }}");
+    add(l, "grand.html", "{% extends \"child.html\" %}\n{% block content %}deep{% endblock %}\n");
+    l
+}
+
+fn ctx_with(take n: Int) -> jinja::context::Context {
+    var json = std::string::from_str("{\"title\":\"T <x>\",\"company\":\"C & D\",\"who\":\"Ada <b>\",\"n\":");
+    std::str::push_int(json, n);
+    std::string::push_byte(json, 125);
+    jinja::context::from_json(std::string::as_str(json), "company")
+}
+
+fn renders(in name: Str, take n: Int, in expected: Str) -> Bool {
+    std::string::as_str(render(sample_loader(), name, ctx_with(n))) == expected
+}
+
+spec render {
+    // What Jinja2 3.1.6 renders for the same four templates.
+    then renders("child.html", 2, "<h1>T &lt;x&gt;</h1>\nmany Ada &lt;b&gt;\n<p>C & D</p>");
+    then renders("child.html", 1, "<h1>T &lt;x&gt;</h1>\none\n<p>C & D</p>");
+    then renders("child.html", 0, "<h1>T &lt;x&gt;</h1>\nnone\n<p>C & D</p>");
+    then renders("base.html", 0, "<h1>T &lt;x&gt;</h1>\ndefault<p>C & D</p>");
+    then renders("grand.html", 0, "<h1>T &lt;x&gt;</h1>\ndeep<p>C & D</p>");
+    then renders("plain.txt", 3, "Ada <b> & |3");
+    then renders("nested.txt", 2, "abe");
+    then renders("nested.txt", 1, "ace");
+    then renders("nested.txt", 0, "z");
+    then renders("nested.txt", 0 - 1, "neg");
+    then renders("nope.html", 0, "");
+}
