@@ -1,0 +1,588 @@
+// settings::load — `Settings()`: the environment and a `.env` file bound to
+// a schema, as pydantic-settings binds them.
+//
+// pydantic-settings 2.15 builds one input from its sources and hands it to
+// Pydantic. The environment comes first and the `.env` file second, each
+// walked field by field: a field is looked for under each of its names
+// (its aliases in order, or its name), lowercased because the backend's
+// class is `case_sensitive=False`, and found under the first name that is
+// set. A `list[…]` field's text is decoded as JSON right there, and text
+// that is not JSON stops everything with a `SettingsError` naming the field
+// and the source — the environment's error before any of the file's, and
+// the file's even when the environment already gave that field a value.
+// Then Pydantic validates, in field order, with the lax conversions of
+// `web::coerce`: `"yes"` is a bool, `" 2_525 "` an int. Last, because
+// `BaseSettings` forbids extras, every key of the `.env` file that no field
+// is read from is an error of its own — but not one in the environment,
+// which is only ever consulted by name.
+//
+// The environment is data here. tuonelang's runtime has no `getenv` (see
+// docs/RUNTIME-FINDING-2.md), so a caller passes the environment in — from
+// `env` output, argv, or a table — as `tls` takes its time from the caller.
+//
+// WHAT DIFFERS, ON PURPOSE: names are lowercased in ASCII only (Python's
+// `str.lower` also folds `Ü`); a float echoes its source digits tidied
+// (`web::coerce`), and `nan` and `inf` are refused; integers beyond 64
+// bits are refused.
+
+module settings::load;
+
+/// A loaded settings object, or why there is none.
+pub struct Settings {
+    outcome: Int,
+    message: String,
+    errors: web::errors::Errors,
+    names: Array[String],
+    values: Array[String],
+}
+
+/// The outcome of a load that validated.
+///
+/// # Example
+/// ```tuo
+/// let ok = settings::load::outcome_ok(); // 0
+/// ```
+pub fn outcome_ok() -> Int {
+    0
+}
+
+/// The outcome of a load Pydantic refused: a `ValidationError`.
+///
+/// # Example
+/// ```tuo
+/// let k = settings::load::outcome_invalid(); // 1
+/// ```
+pub fn outcome_invalid() -> Int {
+    1
+}
+
+/// The outcome of a load a source refused: a `SettingsError`.
+///
+/// # Example
+/// ```tuo
+/// let k = settings::load::outcome_error(); // 2
+/// ```
+pub fn outcome_error() -> Int {
+    2
+}
+
+// ----------------------------------------------------------------------------
+// Sources.
+// ----------------------------------------------------------------------------
+
+/// One source's variables, lowercased; `has` is 0 for a `.env` key with
+/// no value.
+struct Vars {
+    names: Array[String],
+    values: Array[String],
+    has: Array[Int],
+}
+
+fn put(mut v: Vars, in name: Str, in value: Str, take has: Int) {
+    let lower = web::coerce::lowered(name);
+    var i = 0;
+    while i < std::array::len(v.names) {
+        if std::string::as_str(std::array::get(v.names, i)) == std::string::as_str(lower) {
+            std::array::set(v.values, i, std::string::from_str(value));
+            std::array::set(v.has, i, has);
+            return;
+        }
+        i = i + 1;
+    }
+    std::array::push(v.names, lower);
+    std::array::push(v.values, std::string::from_str(value));
+    std::array::push(v.has, has);
+}
+
+fn env_vars(in env: dotenv::parse::Environ) -> Vars {
+    var v = Vars { names: std::array::empty(), values: std::array::empty(), has: std::array::empty() };
+    var i = 0;
+    while i < std::array::len(env.names) {
+        put(v, std::string::as_str(std::array::get(env.names, i)), std::string::as_str(std::array::get(env.values, i)), 1);
+        i = i + 1;
+    }
+    v
+}
+
+fn file_vars(in text: Str, in env: dotenv::parse::Environ) -> Vars {
+    let d = dotenv::parse::values(text, env, true);
+    var v = Vars { names: std::array::empty(), values: std::array::empty(), has: std::array::empty() };
+    var i = 0;
+    while i < dotenv::parse::count(d) {
+        put(v, std::string::as_str(dotenv::parse::key_at(d, i)), std::string::as_str(dotenv::parse::value_at(d, i)), if dotenv::parse::has_value_at(d, i) {
+            1
+        } else {
+            0
+        });
+        i = i + 1;
+    }
+    v
+}
+
+/// The index in `v` of field `i`'s value: the first of its names that is
+/// set; -1 when none is.
+fn find(in v: Vars, in s: settings::schema::Schema, take i: Int) -> Int {
+    let names = settings::schema::env_names(s, i);
+    var k = 0;
+    while k < std::array::len(names) {
+        var j = 0;
+        while j < std::array::len(v.names) {
+            if std::array::get(v.has, j) == 1 && std::string::as_str(std::array::get(v.names, j)) == std::string::as_str(std::array::get(names, k)) {
+                return j;
+            }
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    -1
+}
+
+/// The first complex field whose text in `v` is not JSON, or -1.
+fn undecodable(in v: Vars, in s: settings::schema::Schema) -> Int {
+    var i = 0;
+    while i < settings::schema::count(s) {
+        if settings::schema::is_complex(std::array::get(s.kinds, i)) {
+            let j = find(v, s, i);
+            if j >= 0 && !web::json::parse(std::string::as_str(std::array::get(v.values, j))).ok {
+                return i;
+            }
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+/// Whether `name` is one a field is read from.
+fn claimed(in s: settings::schema::Schema, in name: Str) -> Bool {
+    var i = 0;
+    while i < settings::schema::count(s) {
+        let names = settings::schema::env_names(s, i);
+        var k = 0;
+        while k < std::array::len(names) {
+            if std::string::as_str(std::array::get(names, k)) == name {
+                return true;
+            }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// ----------------------------------------------------------------------------
+// Validation.
+// ----------------------------------------------------------------------------
+
+fn loc_key(in key: Str) -> String {
+    web::errors::loc_source(key)
+}
+
+fn loc_item(in key: Str, take index: Int) -> String {
+    var out = std::string::from_str("[");
+    web::json::push_string(out, key);
+    std::string::push_byte(out, 44);
+    web::json::push_int(out, index);
+    std::string::push_byte(out, 93);
+    out
+}
+
+fn quoted(in text: Str) -> String {
+    var out = std::string::empty();
+    web::json::push_string(out, text);
+    out
+}
+
+/// Field `i`'s value from `text`, as JSON; empty with an error recorded
+/// when Pydantic refuses it.
+fn scalar(mut e: web::errors::Errors, take kind: Int, in key: Str, in text: Str) -> String {
+    let loc = loc_key(key);
+    let input = quoted(text);
+    if kind == settings::schema::kind_int() {
+        let r = web::coerce::int_from_text(text);
+        if r.ok {
+            var out = std::string::empty();
+            web::json::push_int(out, r.value);
+            return out;
+        }
+        web::errors::add(e, "int_parsing", std::string::as_str(loc), "Input should be a valid integer, unable to parse string as an integer", std::string::as_str(input), "");
+        return std::string::empty();
+    }
+    if kind == settings::schema::kind_float() {
+        let r = web::coerce::float_from_text(text);
+        if r.ok {
+            return std::string::from_str(std::string::as_str(r.text));
+        }
+        web::errors::add(e, "float_parsing", std::string::as_str(loc), "Input should be a valid number, unable to parse string as a number", std::string::as_str(input), "");
+        return std::string::empty();
+    }
+    if kind == settings::schema::kind_bool() {
+        let b = web::coerce::bool_from_text(text);
+        if b == 1 {
+            return std::string::from_str("true");
+        }
+        if b == 0 {
+            return std::string::from_str("false");
+        }
+        web::errors::add(e, "bool_parsing", std::string::as_str(loc), "Input should be a valid boolean, unable to interpret input", std::string::as_str(input), "");
+        return std::string::empty();
+    }
+    input
+}
+
+/// An `int` from a JSON item, as Pydantic takes one from the Python value
+/// `json.loads` made: a bool is 0 or 1, a whole float its value, a string
+/// through the lax door; -1 in `ok` terms is an error recorded.
+fn int_item(mut e: web::errors::Errors, mut out: String, in d: web::json::Doc, take node: Int, in key: Str, take index: Int) {
+    let kind = web::json::kind_of(d, node);
+    let loc = loc_item(key, index);
+    let input = web::json::node_text(d, node);
+    let token = web::json::text_of(d, node);
+    if kind == web::json::kind_true() || kind == web::json::kind_false() {
+        std::string::append(out, if kind == web::json::kind_true() {
+            "1"
+        } else {
+            "0"
+        });
+        return;
+    }
+    if kind == web::json::kind_int() || kind == web::json::kind_string() {
+        let r = web::coerce::int_from_text(std::string::as_str(token));
+        if r.ok {
+            web::json::push_int(out, r.value);
+        } else if kind == web::json::kind_int() {
+            web::errors::add(e, "int_parsing_size", std::string::as_str(loc), "Unable to parse input string as an integer, exceeded maximum size", std::string::as_str(input), "");
+        } else {
+            web::errors::add(e, "int_parsing", std::string::as_str(loc), "Input should be a valid integer, unable to parse string as an integer", std::string::as_str(input), "");
+        }
+        return;
+    }
+    if kind == web::json::kind_float() {
+        let r = web::coerce::int_from_float_token(std::string::as_str(token));
+        if r.ok {
+            web::json::push_int(out, r.value);
+        } else {
+            web::errors::add(e, "int_from_float", std::string::as_str(loc), "Input should be a valid integer, got a number with a fractional part", std::string::as_str(input), "");
+        }
+        return;
+    }
+    web::errors::add(e, "int_type", std::string::as_str(loc), "Input should be a valid integer", std::string::as_str(input), "");
+}
+
+/// A `list[str]` or `list[int]` from its JSON text, as JSON.
+fn list(mut e: web::errors::Errors, take kind: Int, in key: Str, in text: Str) -> String {
+    let d = web::json::parse(text);
+    let root = web::json::root(d);
+    if web::json::kind_of(d, root) != web::json::kind_array() {
+        web::errors::add(e, "list_type", std::string::as_str(loc_key(key)), "Input should be a valid list", std::string::as_str(web::json::node_text(d, root)), "");
+        return std::string::empty();
+    }
+    var out = std::string::from_str("[");
+    var index = 0;
+    var item = web::json::first_child(d, root);
+    while item >= 0 {
+        if index > 0 {
+            std::string::push_byte(out, 44);
+        }
+        if kind == settings::schema::kind_int_list() {
+            int_item(e, out, d, item, key, index);
+        } else if web::json::kind_of(d, item) == web::json::kind_string() {
+            web::json::push_string(out, std::string::as_str(web::json::text_of(d, item)));
+        } else {
+            web::errors::add(e, "string_type", std::string::as_str(loc_item(key, index)), "Input should be a valid string", std::string::as_str(web::json::node_text(d, item)), "");
+        }
+        index = index + 1;
+        item = web::json::next_sibling(d, item);
+    }
+    std::string::push_byte(out, 93);
+    out
+}
+
+fn refused(take outcome: Int, in message: Str) -> Settings {
+    Settings { outcome: outcome, message: std::string::from_str(message), errors: web::errors::none(), names: std::array::empty(), values: std::array::empty() }
+}
+
+fn source_error(in s: settings::schema::Schema, take i: Int, in source: Str) -> Settings {
+    var msg = std::string::from_str("error parsing value for field \"");
+    std::string::append(msg, std::string::as_str(std::array::get(s.names, i)));
+    std::string::append(msg, "\" from source \"");
+    std::string::append(msg, source);
+    std::string::append(msg, "\"");
+    refused(outcome_error(), std::string::as_str(msg))
+}
+
+/// Bind `env` and, when `has_file`, the `.env` text `file` to `s`, as
+/// `Settings(_env_file=...)` does with that process environment.
+///
+/// # Example
+/// ```tuo
+/// let loaded = settings::load::load(s, dotenv::parse::environ(), "DEBUG=false\n", true);
+/// ```
+pub fn load(in s: settings::schema::Schema, in env: dotenv::parse::Environ, in file: Str, take has_file: Bool) -> Settings {
+    let from_env = env_vars(env);
+    var from_file = Vars { names: std::array::empty(), values: std::array::empty(), has: std::array::empty() };
+    if has_file {
+        from_file = file_vars(file, env);
+    }
+    let bad_env = undecodable(from_env, s);
+    if bad_env >= 0 {
+        return source_error(s, bad_env, "EnvSettingsSource");
+    }
+    let bad_file = undecodable(from_file, s);
+    if bad_file >= 0 {
+        return source_error(s, bad_file, "DotEnvSettingsSource");
+    }
+    var errors = web::errors::none();
+    var out = Settings { outcome: outcome_ok(), message: std::string::empty(), errors: web::errors::none(), names: std::array::empty(), values: std::array::empty() };
+    var i = 0;
+    while i < settings::schema::count(s) {
+        let kind = std::array::get(s.kinds, i);
+        let key = settings::schema::key(s, i);
+        var text = std::string::empty();
+        var found = false;
+        let j = find(from_env, s, i);
+        if j >= 0 {
+            text = std::string::from_str(std::string::as_str(std::array::get(from_env.values, j)));
+            found = true;
+        } else {
+            let k = find(from_file, s, i);
+            if k >= 0 {
+                text = std::string::from_str(std::string::as_str(std::array::get(from_file.values, k)));
+                found = true;
+            }
+        }
+        var value = std::string::from_str(std::string::as_str(std::array::get(s.defaults, i)));
+        if found {
+            if settings::schema::is_complex(kind) {
+                value = list(errors, kind, std::string::as_str(key), std::string::as_str(text));
+            } else {
+                value = scalar(errors, kind, std::string::as_str(key), std::string::as_str(text));
+            }
+        }
+        std::array::push(out.names, std::string::from_str(std::string::as_str(std::array::get(s.names, i))));
+        std::array::push(out.values, value);
+        i = i + 1;
+    }
+    var k = 0;
+    while k < std::array::len(from_file.names) {
+        let name = std::string::from_str(std::string::as_str(std::array::get(from_file.names, k)));
+        let value = std::string::from_str(std::string::as_str(std::array::get(from_file.values, k)));
+        if std::array::get(from_file.has, k) == 1 && std::string::len(value) > 0 && !claimed(s, std::string::as_str(name)) {
+            web::errors::add(errors, "extra_forbidden", std::string::as_str(loc_key(std::string::as_str(name))), "Extra inputs are not permitted", std::string::as_str(quoted(std::string::as_str(value))), "");
+        }
+        k = k + 1;
+    }
+    if web::errors::count(errors) > 0 {
+        var bad = refused(outcome_invalid(), "");
+        bad.errors = errors;
+        return bad;
+    }
+    out
+}
+
+/// `load` with the `.env` file read from `path`; a missing file is no
+/// file, as pydantic-settings skips one.
+///
+/// EFFECT: reads the file, so no spec; `examples/settings.tuo` runs it.
+///
+/// # Example
+/// ```tuo
+/// // let loaded = settings::load::load_path(s, env, ".env");
+/// ```
+pub fn load_path(in s: settings::schema::Schema, in env: dotenv::parse::Environ, in path: Str) -> Settings {
+    match std::fs::read(path) {
+        Ok { value } => load(s, env, std::string::as_str(value), true),
+        Err { error } => load(s, env, "", false),
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Reading a loaded object.
+// ----------------------------------------------------------------------------
+
+/// Whether the load validated.
+///
+/// # Example
+/// ```tuo
+/// let fine = settings::load::ok(loaded);
+/// ```
+pub fn ok(in l: Settings) -> Bool {
+    l.outcome == outcome_ok()
+}
+
+/// What went wrong, as the caller would see it: the `SettingsError`
+/// message, or the validation errors as FastAPI renders them.
+///
+/// # Example
+/// ```tuo
+/// let why = settings::load::problem(loaded);
+/// ```
+pub fn problem(in l: Settings) -> String {
+    if l.outcome == outcome_invalid() {
+        return web::errors::render(l.errors);
+    }
+    std::string::from_str(std::string::as_str(l.message))
+}
+
+/// `model_dump(mode="json")` as compact JSON, fields in declaration order.
+///
+/// # Example
+/// ```tuo
+/// let j = settings::load::dump(loaded);
+/// ```
+pub fn dump(in l: Settings) -> String {
+    var out = std::string::from_str("{");
+    var i = 0;
+    while i < std::array::len(l.names) {
+        web::json::push_key(out, std::string::as_str(std::array::get(l.names, i)));
+        std::string::append(out, std::string::as_str(std::array::get(l.values, i)));
+        i = i + 1;
+    }
+    std::string::push_byte(out, 125);
+    out
+}
+
+/// Field `name`'s value as JSON text; empty for no such field.
+///
+/// # Example
+/// ```tuo
+/// let j = settings::load::json_of(loaded, "cors_origins");
+/// ```
+pub fn json_of(in l: Settings, in name: Str) -> String {
+    var i = 0;
+    while i < std::array::len(l.names) {
+        if std::string::as_str(std::array::get(l.names, i)) == name {
+            return std::string::from_str(std::string::as_str(std::array::get(l.values, i)));
+        }
+        i = i + 1;
+    }
+    std::string::empty()
+}
+
+/// Whether field `name` is `None`.
+///
+/// # Example
+/// ```tuo
+/// let unset = settings::load::is_none(loaded, "sentry_dsn");
+/// ```
+pub fn is_none(in l: Settings, in name: Str) -> Bool {
+    std::string::as_str(json_of(l, name)) == "null"
+}
+
+/// A `str` field's value; empty when it is `None`.
+///
+/// # Example
+/// ```tuo
+/// let url = settings::load::text(loaded, "frontend_url");
+/// ```
+pub fn text(in l: Settings, in name: Str) -> String {
+    let d = web::json::parse(std::string::as_str(json_of(l, name)));
+    web::json::text_of(d, web::json::root(d))
+}
+
+/// An `int` field's value; 0 when it is `None`.
+///
+/// # Example
+/// ```tuo
+/// let port = settings::load::int(loaded, "smtp_port");
+/// ```
+pub fn int(in l: Settings, in name: Str) -> Int {
+    let r = web::coerce::int_from_text(std::string::as_str(json_of(l, name)));
+    r.value
+}
+
+/// A `float` field's value; 0.0 when it is `None`.
+///
+/// # Example
+/// ```tuo
+/// let w = settings::load::float(loaded, "weight_commercial");
+/// ```
+pub fn float(in l: Settings, in name: Str) -> Float {
+    let r = web::coerce::float_from_text(std::string::as_str(json_of(l, name)));
+    r.value
+}
+
+/// A `bool` field's value.
+///
+/// # Example
+/// ```tuo
+/// let debug = settings::load::flag(loaded, "debug");
+/// ```
+pub fn flag(in l: Settings, in name: Str) -> Bool {
+    std::string::as_str(json_of(l, name)) == "true"
+}
+
+/// How many items a list field holds.
+///
+/// # Example
+/// ```tuo
+/// let n = settings::load::item_count(loaded, "cors_origins");
+/// ```
+pub fn item_count(in l: Settings, in name: Str) -> Int {
+    let d = web::json::parse(std::string::as_str(json_of(l, name)));
+    web::json::child_count(d, web::json::root(d))
+}
+
+/// Item `index` of a list field, as text (`"https://a.example"`, `"403"`).
+///
+/// # Example
+/// ```tuo
+/// let origin = settings::load::item(loaded, "cors_origins", 0);
+/// ```
+pub fn item(in l: Settings, in name: Str, take index: Int) -> String {
+    let d = web::json::parse(std::string::as_str(json_of(l, name)));
+    web::json::text_of(d, web::json::child_at(d, web::json::root(d), index))
+}
+
+// ----------------------------------------------------------------------------
+// Specs: a three-field class, with what pydantic-settings did for each case.
+// ----------------------------------------------------------------------------
+
+fn sample() -> settings::schema::Schema {
+    var s = settings::schema::new();
+    settings::schema::field(s, "debug", settings::schema::kind_bool(), false, "true");
+    settings::schema::field(s, "smtp_port", settings::schema::kind_int(), false, "1025");
+    settings::schema::alias(s, "SMTP_PORT");
+    settings::schema::field(s, "secret_key", settings::schema::kind_str(), false, "\"k\"");
+    settings::schema::alias(s, "SECRET_KEY");
+    settings::schema::alias(s, "JWT_SECRET");
+    settings::schema::field(s, "origins", settings::schema::kind_str_list(), false, "[]");
+    settings::schema::field(s, "dsn", settings::schema::kind_str(), true, "null");
+    s
+}
+
+fn loaded(in env_lines: Str, in file: Str, take has_file: Bool) -> Settings {
+    load(sample(), dotenv::parse::environ_from_lines(env_lines), file, has_file)
+}
+
+fn dumps_as(in env_lines: Str, in file: Str, in expected: Str) -> Bool {
+    let l = loaded(env_lines, file, true);
+    ok(l) && std::string::as_str(dump(l)) == expected
+}
+
+fn refuses_as(in env_lines: Str, in file: Str, in expected: Str) -> Bool {
+    let l = loaded(env_lines, file, true);
+    !ok(l) && std::string::as_str(problem(l)) == expected
+}
+
+spec load {
+    then dumps_as("", "", "{\"debug\":true,\"smtp_port\":1025,\"secret_key\":\"k\",\"origins\":[],\"dsn\":null}");
+    then dumps_as("Debug=no\nsmtp_port= 2_5 \nJWT_SECRET=j\nORIGINS=[\"a\"]\n", "", "{\"debug\":false,\"smtp_port\":25,\"secret_key\":\"j\",\"origins\":[\"a\"],\"dsn\":null}");
+    then dumps_as("JWT_SECRET=env", "SECRET_KEY=file\nDSN=x\n", "{\"debug\":true,\"smtp_port\":1025,\"secret_key\":\"env\",\"origins\":[],\"dsn\":\"x\"}");
+    then refuses_as("ORIGINS=a", "", "error parsing value for field \"origins\" from source \"EnvSettingsSource\"");
+    then refuses_as("ORIGINS=[]", "ORIGINS=\n", "error parsing value for field \"origins\" from source \"DotEnvSettingsSource\"");
+    then refuses_as("DEBUG=maybe", "EXTRA=1\nEMPTY=\nBARE\n", "{\"detail\":[{\"type\":\"bool_parsing\",\"loc\":[\"debug\"],\"msg\":\"Input should be a valid boolean, unable to interpret input\",\"input\":\"maybe\"},{\"type\":\"extra_forbidden\",\"loc\":[\"extra\"],\"msg\":\"Extra inputs are not permitted\",\"input\":\"1\"}]}");
+    then refuses_as("SMTP_PORT=x\nORIGINS=[1]", "", "{\"detail\":[{\"type\":\"int_parsing\",\"loc\":[\"SMTP_PORT\"],\"msg\":\"Input should be a valid integer, unable to parse string as an integer\",\"input\":\"x\"},{\"type\":\"string_type\",\"loc\":[\"origins\",0],\"msg\":\"Input should be a valid string\",\"input\":1}]}");
+    then ok(loaded("EXTRA=1", "", false));
+}
+
+spec "a loaded object reads back" {
+    let l = loaded("SMTP_PORT=2525\nORIGINS=[\"a\",\"b\"]\nDSN=h\"q", "", false);
+    then int(l, "smtp_port") == 2525;
+    then flag(l, "debug");
+    then std::string::as_str(text(l, "dsn")) == "h\"q";
+    then std::string::as_str(text(l, "secret_key")) == "k";
+    then item_count(l, "origins") == 2;
+    then std::string::as_str(item(l, "origins", 1)) == "b";
+    then !is_none(l, "dsn");
+    then is_none(loaded("", "", false), "dsn");
+}

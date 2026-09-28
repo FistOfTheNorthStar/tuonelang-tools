@@ -1,0 +1,269 @@
+// settings::schema — a `BaseSettings` class as data.
+//
+// A pydantic-settings class is a list of fields, each with a type, a
+// default, and optionally validation aliases — a single `validation_alias`
+// or an `AliasChoices` of several, tried in order. A `Schema` is built with
+// ordinary calls, aliases applying to the field most recently added —
+//
+//     var s = settings::schema::new();
+//     settings::schema::field(s, "debug", settings::schema::kind_bool(), false, "true");
+//     settings::schema::field(s, "secret_key", settings::schema::kind_str(), false, "\"change-me\"");
+//     settings::schema::alias(s, "SECRET_KEY");
+//     settings::schema::alias(s, "JWT_SECRET");
+//
+// — and `settings::load` binds the environment and a `.env` file to it.
+// The default is JSON text, which is what `model_dump(mode="json")` shows
+// for it and what a loaded field falls back to.
+//
+// WHAT IS HERE: `str`, `int`, `float`, `bool`, `list[str]`, `list[int]`,
+// each plain or `Optional`, every field defaulted. WHAT IS NOT: required
+// fields, nested models and `env_nested_delimiter`, `env_prefix`,
+// `case_sensitive=True`, enums, secrets directories — the configuration
+// the backend's `Settings` does not use.
+
+module settings::schema;
+
+/// The kind of a `str` field.
+///
+/// # Example
+/// ```tuo
+/// let k = settings::schema::kind_str(); // 0
+/// ```
+pub fn kind_str() -> Int {
+    0
+}
+
+/// The kind of an `int` field.
+///
+/// # Example
+/// ```tuo
+/// let k = settings::schema::kind_int(); // 1
+/// ```
+pub fn kind_int() -> Int {
+    1
+}
+
+/// The kind of a `float` field.
+///
+/// # Example
+/// ```tuo
+/// let k = settings::schema::kind_float(); // 2
+/// ```
+pub fn kind_float() -> Int {
+    2
+}
+
+/// The kind of a `bool` field.
+///
+/// # Example
+/// ```tuo
+/// let k = settings::schema::kind_bool(); // 3
+/// ```
+pub fn kind_bool() -> Int {
+    3
+}
+
+/// The kind of a `list[str]` field, which pydantic-settings reads as JSON.
+///
+/// # Example
+/// ```tuo
+/// let k = settings::schema::kind_str_list(); // 4
+/// ```
+pub fn kind_str_list() -> Int {
+    4
+}
+
+/// The kind of a `list[int]` field, which pydantic-settings reads as JSON.
+///
+/// # Example
+/// ```tuo
+/// let k = settings::schema::kind_int_list(); // 5
+/// ```
+pub fn kind_int_list() -> Int {
+    5
+}
+
+/// The kind named as the fixture names it — `str`, `int`, `float`,
+/// `bool`, `list_str`, `list_int` — or -1.
+///
+/// # Example
+/// ```tuo
+/// let k = settings::schema::kind_named("list_int"); // 5
+/// ```
+pub fn kind_named(in name: Str) -> Int {
+    if name == "str" {
+        return kind_str();
+    }
+    if name == "int" {
+        return kind_int();
+    }
+    if name == "float" {
+        return kind_float();
+    }
+    if name == "bool" {
+        return kind_bool();
+    }
+    if name == "list_str" {
+        return kind_str_list();
+    }
+    if name == "list_int" {
+        return kind_int_list();
+    }
+    -1
+}
+
+/// Whether a kind is one pydantic-settings decodes as JSON first.
+///
+/// # Example
+/// ```tuo
+/// let c = settings::schema::is_complex(settings::schema::kind_str_list()); // true
+/// ```
+pub fn is_complex(take kind: Int) -> Bool {
+    kind == kind_str_list() || kind == kind_int_list()
+}
+
+/// The fields, in declaration order. A field's aliases are
+/// `aliases[alias_starts[i] .. alias_starts[i] + alias_counts[i]]`.
+pub struct Schema {
+    names: Array[String],
+    kinds: Array[Int],
+    optional: Array[Int],
+    defaults: Array[String],
+    alias_starts: Array[Int],
+    alias_counts: Array[Int],
+    aliases: Array[String],
+}
+
+/// A settings class with no fields.
+///
+/// # Example
+/// ```tuo
+/// var s = settings::schema::new();
+/// ```
+pub fn new() -> Schema {
+    Schema { names: std::array::empty(), kinds: std::array::empty(), optional: std::array::empty(), defaults: std::array::empty(), alias_starts: std::array::empty(), alias_counts: std::array::empty(), aliases: std::array::empty() }
+}
+
+/// Add a field. `optional` is `Optional[…]`; `default` is JSON text
+/// (`"null"`, `"30"`, `"\"HS256\""`, `"[403,429]"`).
+///
+/// # Example
+/// ```tuo
+/// settings::schema::field(s, "smtp_port", settings::schema::kind_int(), false, "1025");
+/// ```
+pub fn field(mut s: Schema, in name: Str, take kind: Int, take optional: Bool, in default: Str) {
+    std::array::push(s.names, std::string::from_str(name));
+    std::array::push(s.kinds, kind);
+    std::array::push(s.optional, if optional {
+        1
+    } else {
+        0
+    });
+    std::array::push(s.defaults, std::string::from_str(default));
+    std::array::push(s.alias_starts, std::array::len(s.aliases));
+    std::array::push(s.alias_counts, 0);
+}
+
+/// Give the most recent field a validation alias; called again, the
+/// aliases are an `AliasChoices`, the first one found winning.
+///
+/// # Example
+/// ```tuo
+/// settings::schema::alias(s, "SMTP_PORT");
+/// ```
+pub fn alias(mut s: Schema, in name: Str) {
+    let last = std::array::len(s.names) - 1;
+    std::array::push(s.aliases, std::string::from_str(name));
+    std::array::set(s.alias_counts, last, std::array::get(s.alias_counts, last) + 1);
+}
+
+/// How many fields there are.
+///
+/// # Example
+/// ```tuo
+/// let n = settings::schema::count(s);
+/// ```
+pub fn count(in s: Schema) -> Int {
+    std::array::len(s.names)
+}
+
+/// The index of the field called `name`, or -1.
+///
+/// # Example
+/// ```tuo
+/// let i = settings::schema::index_of(s, "debug");
+/// ```
+pub fn index_of(in s: Schema, in name: Str) -> Int {
+    var i = 0;
+    while i < count(s) {
+        if std::string::as_str(std::array::get(s.names, i)) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+/// The key a field's value is validated under, and so its error `loc`:
+/// the first alias, or the field's name.
+///
+/// # Example
+/// ```tuo
+/// let k = settings::schema::key(s, 0);
+/// ```
+pub fn key(in s: Schema, take i: Int) -> String {
+    if std::array::get(s.alias_counts, i) > 0 {
+        return std::string::from_str(std::string::as_str(std::array::get(s.aliases, std::array::get(s.alias_starts, i))));
+    }
+    std::string::from_str(std::string::as_str(std::array::get(s.names, i)))
+}
+
+/// The environment names field `i` is read from, lowercased as
+/// `case_sensitive=False` compares them: its aliases in order, or its
+/// name.
+///
+/// # Example
+/// ```tuo
+/// let names = settings::schema::env_names(s, 0);
+/// ```
+pub fn env_names(in s: Schema, take i: Int) -> Array[String] {
+    var out = std::array::empty();
+    let n = std::array::get(s.alias_counts, i);
+    if n == 0 {
+        std::array::push(out, web::coerce::lowered(std::string::as_str(std::array::get(s.names, i))));
+        return out;
+    }
+    let start = std::array::get(s.alias_starts, i);
+    var k = 0;
+    while k < n {
+        std::array::push(out, web::coerce::lowered(std::string::as_str(std::array::get(s.aliases, start + k))));
+        k = k + 1;
+    }
+    out
+}
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+spec "a schema records fields, aliases, and keys" {
+    var s = new();
+    field(s, "debug", kind_bool(), false, "true");
+    field(s, "secret_key", kind_str(), false, "\"k\"");
+    alias(s, "SECRET_KEY");
+    alias(s, "JWT_SECRET");
+    field(s, "smtp_user", kind_str(), true, "null");
+    then count(s) == 3;
+    then index_of(s, "smtp_user") == 2;
+    then index_of(s, "nope") == -1;
+    then text_is(key(s, 0), "debug");
+    then text_is(key(s, 1), "SECRET_KEY");
+    let names = env_names(s, 1);
+    then std::array::len(names) == 2;
+    then text_is(std::array::get(names, 1), "jwt_secret");
+    then std::array::len(env_names(s, 2)) == 1;
+    then kind_named("list_int") == kind_int_list();
+    then kind_named("dict") == -1;
+    then is_complex(kind_str_list());
+    then !is_complex(kind_float());
+}

@@ -1,0 +1,67 @@
+// dotenv::demo — every captured `.env` text, read again.
+//
+// `examples/settings_oracle.py` hands python-dotenv a corpus of `.env`
+// texts and the backend's three example files, and keeps `dotenv_values`
+// and the lines it warned about. `agrees` reads the same text with the
+// same environment; the spec holds every case to equality.
+
+module dotenv::demo;
+
+/// The lines `dotenv::parse` warned about in `text`, comma-separated.
+///
+/// # Example
+/// ```tuo
+/// let l = dotenv::demo::lines("A=1\nB='x");
+/// ```
+pub fn lines(in text: Str) -> String {
+    let found = dotenv::parse::error_lines(dotenv::parse::bindings(text));
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::array::len(found) {
+        if i > 0 {
+            std::string::push_byte(out, 44);
+        }
+        web::json::push_int(out, std::array::get(found, i));
+        i = i + 1;
+    }
+    out
+}
+
+/// Does case `i` read as python-dotenv read it?
+///
+/// # Example
+/// ```tuo
+/// let same = dotenv::demo::agrees(0);
+/// ```
+pub fn agrees(take i: Int) -> Bool {
+    let env = dotenv::parse::environ_from_lines(dotenv::fixture::expand_env());
+    let v = dotenv::parse::values(dotenv::fixture::text(i), env, true);
+    std::string::as_str(dotenv::parse::to_json(v)) == dotenv::fixture::values(i) && std::string::as_str(lines(dotenv::fixture::text(i))) == dotenv::fixture::error_lines(i)
+}
+
+/// The first case in `[from, to)` that differs, or -1.
+///
+/// # Example
+/// ```tuo
+/// let bad = dotenv::demo::first_disagreement(0, dotenv::fixture::count());
+/// ```
+pub fn first_disagreement(take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to {
+        if !agrees(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+spec "every captured .env text reads as python-dotenv read it" {
+    then dotenv::fixture::count() == 29;
+    then first_disagreement(0, 10) == -1;
+    then first_disagreement(10, 20) == -1;
+    then first_disagreement(20, 26) == -1;
+    then first_disagreement(26, 27) == -1;
+    then first_disagreement(27, 28) == -1;
+    then first_disagreement(28, 29) == -1;
+}
