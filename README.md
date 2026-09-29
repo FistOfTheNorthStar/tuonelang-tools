@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Fourteen ports so far:
+Fifteen ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -21,17 +21,19 @@ Fourteen ports so far:
 | **`sentry`** — DSNs, scope with breadcrumbs and tags, message and error events, the envelope, the logging integration | `sentry-sdk` | 6 specs, 7 envelopes serialized by sentry-sdk 2.69 reproduced byte for byte, and a 12-check loopback oracle |
 | **`dotenv`** — `.env` files read as python-dotenv reads them: quoting, escapes, `export`, comments, broken statements and the lines they are reported on, `${VAR:-default}` | `python-dotenv` | 6 specs, and 29 `.env` texts — among them the backend's three example files — read as python-dotenv 1.2.3 read them |
 | **`settings`** — a `BaseSettings` class as data, bound to the environment and a `.env` file: aliases, `AliasChoices`, JSON lists, lax conversion, forbidden extras | `pydantic-settings` | 4 specs, and 33 instantiations of the backend's own 93-field `Settings` by pydantic-settings 2.15 reproduced byte for byte — dumps, errors, and messages |
+| **`ratelimit`** — `limits`' grammar, keys, and fixed window in memory and in Redis; slowapi's check, 429, and headers | `slowapi`, `limits` | 21 specs, 63 strings, 9 storage scripts, 16 Redis exchanges, and 103 requests through slowapi and FastAPI reproduced byte for byte, and a 14-check live oracle |
 | **`jinja`** — the template engine: inheritance, `if`/`elif`/`else`, expressions with filters, autoescaping with `Markup`, Jinja's whitespace rules | `jinja2`, `markupsafe` | 9 specs, and 100 renders of the backend's 30 email templates by Jinja2 3.1.6 reproduced byte for byte |
 | **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
 
 ```bash
-./run-tests.sh          # front end, the specs, formatting, the native Argon2, X.509, and
-                        # settings oracles, and the HTTP, web, and TLS loopback oracles
-                        # (no network)
+./run-tests.sh          # front end, the specs, formatting, the native Argon2, X.509,
+                        # settings, and rate-limit oracles, and the HTTP, web, and TLS
+                        # loopback oracles (no network)
 ./run-tests.sh --live   # also resolve real names over UDP, fetch from public HTTP servers,
                         # complete TLS 1.3 handshakes with three openssl s_server instances,
                         # fetch https:// from Stripe, Sentry, and Cloudflare, and drive the
-                        # Redis client against shallowflaws's docker compose redis on 6380,
+                        # Redis client and the rate limiter against shallowflaws's
+                        # docker compose redis on 6380,
                         # and the S3 client against its MinIO on 9000, post to a
                         # Sentry-shaped loopback receiver, and run the query layer
                         # against a throwaway PostgreSQL
@@ -144,7 +146,8 @@ not use them.
 `shallowflaws` reaches Redis through two libraries. Celery's transport is
 lists — `LPUSH` to publish, `BRPOP` to consume — plus sets and hashes for
 bindings and unacknowledged deliveries, and `SET ... EX` / `GET` for task
-results. slowapi's rate limiter is `INCR` and `EXPIRE`. This port is a
+results. slowapi's rate limiter is a Lua script run by `EVALSHA`, plus
+`GET`, `TTL`, and `DEL` (the conversation is in [`ratelimit`](#ratelimit--slowapi-and-the-limits-library-under-it)). This port is a
 RESP2 client with exactly those commands as typed builders, a parser for
 the `redis://` URLs the backend is configured by, and an effect boundary
 that reads each reply one socket read at a time under the parser's
@@ -343,6 +346,140 @@ CAs; adding one is one base64 line. And the catalog's own caveat carries
 over: `std::bignum` is variable-time, so the client's X25519 step leaks
 timing on its ephemeral key. Signature *verification* is variable-time
 by design, and there is no signing function in `ec` or `rsa` at all.
+
+---
+
+## `ratelimit` — slowapi, and the `limits` library under it
+
+The backend limits its auth and upload endpoints with slowapi:
+`@limiter.limit("5/minute")` on the two logins and `change_password`,
+`3/hour` on password resets, `5/hour` on email verification, `30/minute`
+on document extraction — fixed windows, keyed by the client address,
+stored in Redis. This port is both layers. `limits` parses the strings,
+names the keys, and keeps the windows, in memory or in Redis. slowapi
+decides which limits a request checks, in what order, under which key,
+and what the 429 and the headers say. The application's own 429 handler,
+which reads the window stats for its `Retry-After`, stays in Python. The
+stats it reads are here.
+
+```tuo
+let now = 1790000000000; // milliseconds since the epoch: the caller's clock
+var l = ratelimit::limiter::new();
+let _ = ratelimit::limiter::limit(l, "app.api.routers.job_applicant.auth.login_job_applicant", "5/minute");
+let fd = ratelimit::client::open("redis://127.0.0.1:6380/0", 5000);
+let d = ratelimit::client::check(fd, l, "app.api.routers.job_applicant.auth.login_job_applicant", "POST", "/api/v1/job_applicant/auth/login", "203.0.113.7", 5000);
+if d.exceeded {
+    let st = ratelimit::client::view_stats(fd, d, now, 5000);
+    let raw = ratelimit::limiter::exceeded_response(l, d, st, now);
+}
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `ratelimit::item` — `parse_many`'s grammar, with Python's Unicode `\s` and case-blind `[a-z]`; `repr`, `key_for`, expiry; the fixed window's arithmetic | ✅ 63 of 63 captured strings alike |
+| `ratelimit::memory` — `MemoryStorage` and the fixed window on it | ✅ 9 of 9 captured scripts alike |
+| `ratelimit::redis` — `RedisStorage` as a resumable conversation: `EVALSHA` of `incr_expire.lua`, `NOSCRIPT` then `SCRIPT LOAD`, `GET`/`TTL`, `DEL`, `PING` | ✅ 16 of 16 captured calls byte for byte |
+| `ratelimit::limiter` — slowapi's plan and evaluation, `view_rate_limit`, the default 429, the `X-RateLimit-*` headers | ✅ proven through `demo` |
+| `ratelimit::demo` — the oracle's four FastAPI applications on `web::route` | ✅ 103 of 103 captured requests reproduced |
+| `ratelimit::client` — the conversation and the check over a socket | ✅ 14 live checks against the compose Redis |
+
+### The oracle is limits and slowapi themselves
+
+`examples/ratelimit_oracle.py` runs in the backend's virtualenv (limits
+5.8.0, slowapi 0.1.10, redis-py 6.4, FastAPI 0.141) with `time.time`
+frozen. It hands `parse_many` 63 strings, drives nine scripts of hits,
+tests, stats, and clears through `MemoryStorage`, and drives the same
+strategy on `RedisStorage` against a throwaway `redis-server` behind a
+recording proxy, keeping every byte each way. Last, it puts slowapi in
+front of four FastAPI applications — the backend's routes and limit
+strings, one using every other knob of `limit` and `shared_limit` with
+headers on, one keyed by endpoint, one disabled — and sends 103 requests
+from chosen client addresses. For each one it records the status, the
+body, the headers, and `request.state.view_rate_limit` with its window
+stats.
+
+```bash
+../shallowflaws/.venv/bin/python examples/ratelimit_oracle.py   # needs redis-server on PATH
+python3 examples/ratelimit_fixture.py && tuo fmt src/ratelimit/fixture.tuo
+```
+
+The specs replay all of it. `examples/ratelimit.tuo` replays it again
+as native code, and `examples/ratelimit_live.tuo` runs the fixed window
+and slowapi's check against the compose Redis in database 15, under
+nonce keys.
+
+### What the specs pin that a comment cannot
+
+**The scope is the path, not the endpoint.** slowapi's default
+`key_style="url"` puts `request.url.path` in the key, so `/jobs/1` and
+`/jobs/2` are separate buckets, and the applicant and employer logins
+never share one. Only `key_style="endpoint"` keys by `module.function`.
+
+**A window starts at its first hit and a failed hit still counts.**
+`incr` opens the window when the count equals what was just added, so a
+hit of cost zero opens one and the next real hit reopens it later. Past
+the limit the counter keeps climbing until the window closes. The window
+closes at exactly its reset: a hit one millisecond earlier fails, and
+one at the reset opens a new window.
+
+**Limits are spent in order, and the first failure stops the rest.**
+`2/second;5/minute` spends the per-minute limit only on requests the
+per-second one let through. The limit slowapi reports is the first one
+with the shortest *granularity*, not the shortest window, or else the one
+that failed. Two stacked decorators append the three `X-RateLimit-*`
+headers twice to a success, and once to the 429.
+
+**Redis is asked for the script by digest first.** A server that has not
+seen `incr_expire.lua` answers `NOSCRIPT`, and redis-py loads the script
+and asks again. The first captured hit is that three-command exchange.
+The live check confirms the server computes the same SHA-1
+(`628bd136…`) the port sends.
+
+**A missing key's `TTL` is `-2`, and it is a number.** The window stats
+of an empty window read `GET` → null and `TTL` → `-2`, and `limits` makes
+the reset "now". Writing that replay surfaced a bug in this repo's
+`redis::resp`. It used `-2` internally for "not a number", so it
+refused the integer reply `:-2`. It is fixed, with specs for `:-2`,
+`:-1`, and the malformed `$-2`.
+
+**The grammar has a typo, and it is honoured.** `limits`' pattern
+writes `(:?` where it means `(?:`, so a separator may be preceded by a
+`:`: `5/minute:;10/hour` is two limits. `5/minute:` alone is refused.
+
+### A finding in the backend
+
+The backend keys every limit by `get_remote_address`, which is the
+socket peer. In production that peer is Caddy.
+`docker-compose.prod.yml` runs it as a separate container that
+proxies to `api:8000`. Gunicorn's `UvicornWorker` honours
+`X-Forwarded-For` only from `FORWARDED_ALLOW_IPS`, which defaults to
+`127.0.0.1,::1`, and nothing tracked sets it. So every user's requests
+count against one bucket per endpoint. The whole site gets five login
+attempts a minute, and three password-reset requests an hour. Run
+through uvicorn 0.53's own `ProxyHeadersMiddleware`, two clients behind
+a `172.18.0.5` peer both key as `172.18.0.5`, and the same header from
+`127.0.0.1` keys as the client. The fix is in deployment:
+`FORWARDED_ALLOW_IPS` set to the proxy network (`*` is safe while `api`
+is only `expose`d), or `forwarded_allow_ips` in `gunicorn.conf.py`. This
+repo does not change the backend.
+
+### What is deliberately not here
+
+The fixed window is the only strategy; the backend names it, and the
+moving and sliding windows are other Lua scripts on the same machinery.
+Also missing: slowapi's middleware and with it `default_limits` and
+`application_limits`, dynamic limits, `exempt_when`, callable costs,
+the in-memory fallback, `swallow_errors`, `http-date` `Retry-After`, the
+`RATELIMIT_*` settings it reads from a `.env`, and `Limiter.reset`.
+Handlers are named by string, since v0 cannot hold function values.
+Amounts and multiples beyond `Int`, and windows beyond 2^40 seconds, are
+refused where Python would accept them. Times are whole milliseconds,
+passed in because the runtime has no wall clock. The float slowapi
+prints in `X-RateLimit-Reset` and truncates for `Retry-After` comes out
+the same for every time from 2004 to 2038, one binade of `float`, as
+22,022 sampled pairs confirm.
 
 ---
 
@@ -1230,6 +1367,18 @@ examples/settings.tuo    the native oracle: every case, and a .env read from dis
 examples/settings-test/  the .env that oracle reads
 examples/settings_oracle.py  python-dotenv and the backend's Settings, recorded
 examples/settings_fixture.py settings_oracle.json to the two fixtures
+
+src/ratelimit/item.tuo   limits: parse_many, repr, key_for, the fixed window's arithmetic
+src/ratelimit/memory.tuo MemoryStorage and the fixed window on it
+src/ratelimit/redis.tuo  RedisStorage as a conversation: EVALSHA, NOSCRIPT, GET/TTL, DEL
+src/ratelimit/limiter.tuo slowapi: the plan, the check, view_rate_limit, the 429, headers
+src/ratelimit/fixture.tuo 63 strings, 9 scripts, 16 Redis calls, 103 requests (generated)
+src/ratelimit/demo.tuo   the oracle's four FastAPI applications, reimplemented
+src/ratelimit/client.tuo the effect boundary: the conversation and the check over a socket
+examples/ratelimit.tuo   the native oracle: every captured case (no network)
+examples/ratelimit_live.tuo  the live oracle (needs the docker compose redis on 6380)
+examples/ratelimit_oracle.py limits and slowapi with a frozen clock, recorded
+examples/ratelimit_fixture.py ratelimit_oracle.json to src/ratelimit/fixture.tuo
 
 src/log/record.tuo       records, levels, getMessage, params as JSON
 src/log/format.tuo       asctime and the two line formats

@@ -2,8 +2,8 @@
 # run-tests.sh — the validation suite for tuonelang-python-tools.
 #
 #   ./run-tests.sh          front end, specs, formatting, the native Argon2,
-#                           X.509, and settings oracles, and the HTTP, web, and TLS
-#                           loopback oracles (no network)
+#                           X.509, settings, and rate-limit oracles, and the HTTP,
+#                           web, and TLS loopback oracles (no network)
 #   ./run-tests.sh --live   also resolve real names against a public DNS
 #                           server, fetch from public HTTP servers, complete
 #                           TLS 1.3 handshakes with three openssl s_server
@@ -11,7 +11,8 @@
 #                           chains), fetch https:// from Stripe, Sentry, and
 #                           Cloudflare with chains validated against the root
 #                           store, and drive the Redis client against the
-#                           docker compose redis on 127.0.0.1:6380 and the S3
+#                           docker compose redis on 127.0.0.1:6380 (and the
+#                           rate limiter's fixed window on it) and the S3
 #                           client against its MinIO on 127.0.0.1:9000, post to a
 #                           Sentry-shaped loopback receiver, and run
 #                           the query layer against a throwaway PostgreSQL that
@@ -103,6 +104,14 @@ SETTINGS_SRC=(src/dotenv/parse.tuo src/dotenv/fixture.tuo src/dotenv/demo.tuo
               src/settings/schema.tuo src/settings/load.tuo src/settings/fixture.tuo src/settings/demo.tuo
               src/web/json.tuo src/web/coerce.tuo src/web/errors.tuo src/std_fs.tuo src/std_str.tuo)
 
+# The rate limiter's Redis half rides on the redis client; its demo on web.
+RATELIMIT_SRC=(src/ratelimit/item.tuo src/ratelimit/memory.tuo src/ratelimit/redis.tuo
+               src/ratelimit/limiter.tuo src/ratelimit/fixture.tuo src/ratelimit/demo.tuo
+               src/ratelimit/client.tuo
+               src/redis/resp.tuo src/redis/command.tuo src/redis/url.tuo src/redis/client.tuo
+               "${WEB_SRC[@]}" src/http/message.tuo src/http/fixture.tuo src/http/url.tuo
+               src/std_str.tuo src/std_bits.tuo src/std_net.tuo)
+
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
 check() { if [ "$1" -eq 0 ]; then echo "PASS $2"; else echo "FAIL $2"; failed=1; fi }
@@ -182,11 +191,17 @@ step "Dotenv and settings: front end (check)"
 step "Dotenv and settings: specs (verify), all 29 .env texts and 33 Settings() reproduced"
 "$TUO" verify "${SETTINGS_SRC[@]}"; check $? "settings verify"
 
+step "Rate limiting: front end (check)"
+"$TUO" check "${RATELIMIT_SRC[@]}" examples/ratelimit.tuo examples/ratelimit_live.tuo; check $? "ratelimit check"
+
+step "Rate limiting: specs (verify), all 63 strings, 9 scripts, 16 Redis calls, and 103 requests reproduced"
+"$TUO" verify "${RATELIMIT_SRC[@]}"; check $? "ratelimit verify"
+
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
 # to `crates/tuo-stdlib/src/std/` — and src/pg, src/db are tuonelang-db's.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo src/jinja/*.tuo src/dotenv/*.tuo src/settings/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo src/jinja/*.tuo src/dotenv/*.tuo src/settings/*.tuo src/ratelimit/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.
@@ -223,6 +238,17 @@ if [ "$rc" -eq 0 ]; then
 else
   echo "settings oracle exited $rc — that many checks disagreed"
   check 1 "settings oracle"
+fi
+
+# Every captured limits and slowapi case again, as native code.
+step "Rate limiting: native oracle (every captured case)"
+"$TUO" run examples/ratelimit.tuo "${RATELIMIT_SRC[@]}"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  check 0 "ratelimit oracle (all checks agreed)"
+else
+  echo "ratelimit oracle exited $rc — that many checks disagreed"
+  check 1 "ratelimit oracle"
 fi
 
 # The HTTP server and client prove each other over loopback, in one process.
@@ -330,6 +356,17 @@ if [ "$live" -eq 1 ]; then
     check 1 "redis"
   fi
 
+  # The fixed window on shallowflaws's docker compose redis, database 15.
+  step "Rate limiting: live — the fixed window on 127.0.0.1:6380"
+  "$TUO" run examples/ratelimit_live.tuo "${RATELIMIT_SRC[@]}"
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
+    check 0 "ratelimit live (all checks agreed)"
+  else
+    echo "ratelimit live exited $rc — that many checks disagreed (is docker compose up?)"
+    check 1 "ratelimit live"
+  fi
+
   # The Sentry client against a Sentry-shaped receiver on loopback; live
   # only because its clock is SNTP's.
   step "Sentry: live — the client against a loopback receiver, clock from SNTP"
@@ -377,7 +414,7 @@ if [ "$live" -eq 1 ]; then
     echo "initdb, pg_ctl, or psql not found — skipped"
   fi
 else
-  printf '\n(skipping live DNS, HTTP, TLS, Redis, and SQL checks; pass --live to run them)\n'
+  printf '\n(skipping live DNS, HTTP, TLS, Redis, rate-limit, and SQL checks; pass --live to run them)\n'
 fi
 
 printf '\n'
