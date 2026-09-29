@@ -21,8 +21,8 @@ Seventeen ports so far:
 | **`sentry`** — DSNs, scope with breadcrumbs and tags, message and error events, the envelope, the logging integration | `sentry-sdk` | 6 specs, 7 envelopes serialized by sentry-sdk 2.69 reproduced byte for byte, and a 12-check loopback oracle |
 | **`dotenv`** — `.env` files read as python-dotenv reads them: quoting, escapes, `export`, comments, broken statements and the lines they are reported on, `${VAR:-default}` | `python-dotenv` | 6 specs, and 29 `.env` texts — among them the backend's three example files — read as python-dotenv 1.2.3 read them |
 | **`settings`** — a `BaseSettings` class as data, bound to the environment and a `.env` file: aliases, `AliasChoices`, JSON lists, lax conversion, forbidden extras | `pydantic-settings` | 4 specs, and 33 instantiations of the backend's own 93-field `Settings` by pydantic-settings 2.15 reproduced byte for byte — dumps, errors, and messages |
-| **`inflate`** — deflate and the zlib wrapper, with every zlib error | `zlib` (as `zipfile` and openpyxl use it) | 19 specs, and 82 streams — zlib's own, hand-built corners, and one per error — decompressed as zlib 1.2.12 decompresses them |
-| **`zip`** — archives read as `zipfile` reads them: the end record and ZIP64, names, extra fields, every check `zf.read` makes | `zipfile` | 8 specs, and 49 archives from zipfile, Info-ZIP, `ditto`, and a byte-level builder opened and read alike, exceptions and all |
+| **`inflate`** — deflate and the zlib wrapper, with every zlib error | `zlib` (as `zipfile` and openpyxl use it) | 20 specs, and 82 streams — zlib's own, hand-built corners, and one per error — decompressed as zlib 1.2.12 decompresses them |
+| **`zip`** — archives read as `zipfile` reads them: the end record and ZIP64, names, extra fields, every check `zf.read` makes | `zipfile` | 8 specs, and 54 archives from zipfile, Info-ZIP, `ditto`, and a byte-level builder opened and read alike, exceptions and all |
 | **`ratelimit`** — `limits`' grammar, keys, and fixed window in memory and in Redis; slowapi's check, 429, and headers | `slowapi`, `limits` | 21 specs, 63 strings, 9 storage scripts, 16 Redis exchanges, and 103 requests through slowapi and FastAPI reproduced byte for byte, and a 14-check live oracle |
 | **`jinja`** — the template engine: inheritance, `if`/`elif`/`else`, expressions with filters, autoescaping with `Markup`, Jinja's whitespace rules | `jinja2`, `markupsafe` | 9 specs, and 100 renders of the backend's 30 email templates by Jinja2 3.1.6 reproduced byte for byte |
 | **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
@@ -379,10 +379,10 @@ if a.ok {
 | Layer | State |
 |---|---|
 | `inflate::huffman` — canonical codes, with `inflate_table`'s rules for what is over-subscribed or incomplete | ✅ proven |
-| `inflate::raw` — stored, fixed, and dynamic blocks; every zlib data error, in zlib's order; truncation as `Z_BUF_ERROR` | ✅ 82 of 82 captured streams alike |
+| `inflate::raw` — stored, fixed, and dynamic blocks; every zlib data error, in zlib's order; truncation as `Z_BUF_ERROR`; bounded output, as `max_length` bounds it | ✅ 82 of 82 captured streams alike |
 | `inflate::zlib` — `zlib.decompress(data, wbits)`: the RFC 1950 header, Adler-32, `Z_NEED_DICT`; `crc32` | ✅ proven |
 | `zip::text` — UTF-8 with CPython's `UnicodeDecodeError` text, cp437, `repr` of `str` and `bytes` | ✅ proven |
-| `zip::archive` — the end record and ZIP64, the central directory, name decoding and extra fields, `zf.read` with every check zipfile makes | ✅ 49 of 49 captured archives alike |
+| `zip::archive` — the end record and ZIP64, the central directory, name decoding and extra fields, `zf.read` with every check zipfile makes | ✅ 54 of 54 captured archives alike |
 
 ### The oracle is zlib and zipfile themselves
 
@@ -392,7 +392,7 @@ streams written bit by bit for what zlib's compressor never emits (the
 longest match at the farthest distance, a lone distance code, a stored
 block of length zero, every code-length repeat); and one malformed
 stream per error inflate reports. It records the output's length,
-CRC-32, and bytes, or the message. Then it writes 49 archives. zipfile
+CRC-32, and bytes, or the message. Then it writes 54 archives. zipfile
 writes some, Info-ZIP `zip` and macOS `ditto` others, and a
 field-by-field builder the rest: cp437 names, Unicode path fields, a NUL
 in a name, and one malformed archive per exception zipfile raises. The
@@ -404,7 +404,7 @@ every entry and every `zf.read`.
 python3 examples/zip_fixture.py && tuo fmt src/inflate/fixture.tuo src/zip/fixture.tuo
 ```
 
-The specs replay the 75 streams held inline and all 49 archives.
+The specs replay the 75 streams held inline and all 54 archives.
 `examples/inflate.tuo` and `examples/zip.tuo` replay everything natively,
 including the seven streams too large to hold inline, which live in
 `examples/zip-test/inflate/`.
@@ -430,6 +430,16 @@ or cp437 by flag bit 11. `filename` is that cut at the first NUL, or the
 Unicode path extra field's name when its CRC matches the raw bytes. The
 local header must agree with `orig_filename`, and `zf.read` looks up by
 `filename`, the last entry of a name winning.
+
+**An archive can claim a small file and expand to a huge one.** zipfile
+inflates in chunks of 2 GiB of output and stops after the chunk that
+reaches the entry's stated size, so an error later in that chunk is still
+reported. The port decodes just as far, but keeps only the stated size
+plus a 32 KiB window for copies to reach back into. A 64 MB bomb stating
+10 bytes reads in 0.3 s at a 45 MB peak, where decoding it whole peaked at
+137 MB and grew with the bomb. ZIP64 fields are read saturating: a crafted
+0xFFFFFFFFFFFFFFFF is refused with zipfile's own error instead of
+overflowing `Int`, which traps.
 
 **A wrong central-directory offset can be survived.** zipfile finds the
 directory by where the end record sits and treats the difference as a
@@ -1479,8 +1489,8 @@ src/inflate/fixture.tuo  82 streams and what zlib made of them (generated)
 src/inflate/demo.tuo     the same 82, decompressed here; hex
 src/zip/text.tuo         UTF-8 with CPython's errors, cp437, repr of str and bytes
 src/zip/archive.tuo      zipfile: the end record, ZIP64, the directory, zf.read
-src/zip/fixture.tuo      49 archives as zipfile opened and read them (generated)
-src/zip/demo.tuo         the same 49, opened and read here
+src/zip/fixture.tuo      54 archives as zipfile opened and read them (generated)
+src/zip/demo.tuo         the same 54, opened and read here
 examples/inflate.tuo     the native oracle: every stream, the large ones from files
 examples/zip.tuo         the native oracle: every archive
 examples/zip-test/inflate/  the seven captured streams too large to hold inline

@@ -40,7 +40,8 @@
 // and Zstandard members (zipfile reads them; this port reports
 // `NotImplementedError` with a message of its own), multi-disk archives,
 // `metadata_encoding`, and Windows' backslash-to-slash name rewriting.
-// ZIP64 values past 2^63 are out of `Int`'s range.
+// ZIP64 fields saturate (`wide`): an entry reports 2^60 for any size or
+// offset from there up, and 2^60 + 1 past 2^63.
 
 module zip::archive;
 
@@ -72,6 +73,7 @@ pub struct Archive {
     comment: String,
     entries: Array[Entry],
     start_dir: Int,
+    concat: Int,
 }
 
 /// What `zf.read(name)` returned or raised.
@@ -94,8 +96,30 @@ fn u32(in s: Str, take at: Int) -> Int {
     u16(s, at) + u16(s, at + 2) * 65536
 }
 
+/// Where 64-bit fields saturate: `Int` is a trapping signed 64-bit
+/// integer, and a crafted ZIP64 field of 0xFFFFFFFFFFFFFFFF must refuse
+/// cleanly rather than overflow. A value from 2^60 up to 2^63 reads as
+/// 2^60 — no archive a program can hold is that large, so every
+/// comparison zipfile makes comes out the same — and a value of 2^63 or
+/// more, which CPython cannot even seek to, as 2^60 + 1.
+///
+/// # Example
+/// ```tuo
+/// let cap = zip::archive::wide(); // 1152921504606846976
+/// ```
+pub fn wide() -> Int {
+    1152921504606846976
+}
+
 fn u64(in s: Str, take at: Int) -> Int {
-    u32(s, at) + u32(s, at + 4) * 4294967296
+    let high = u32(s, at + 4);
+    if high >= 2147483648 {
+        return wide() + 1;
+    }
+    if high >= 268435456 {
+        return wide();
+    }
+    u32(s, at) + high * 4294967296
 }
 
 /// `PK` and the two bytes `third`, `fourth` at `at`.
@@ -125,7 +149,7 @@ fn slice(in s: Str, take from: Int, take to: Int) -> String {
 }
 
 fn refused(in kind: Str, in message: Str) -> Archive {
-    Archive { ok: false, error_type: std::string::from_str(kind), error: std::string::from_str(message), comment: std::string::empty(), entries: std::array::empty(), start_dir: 0 }
+    Archive { ok: false, error_type: std::string::from_str(kind), error: std::string::from_str(message), comment: std::string::empty(), entries: std::array::empty(), start_dir: 0, concat: 0 }
 }
 
 fn bad(in message: Str) -> Archive {
@@ -400,7 +424,7 @@ pub fn open(in data: Str) -> Archive {
         std::array::set(entries, k, e);
         i = i - 1;
     }
-    Archive { ok: true, error_type: std::string::empty(), error: std::string::empty(), comment: std::string::from_str(std::string::as_str(end.comment)), entries: entries, start_dir: start_dir }
+    Archive { ok: true, error_type: std::string::empty(), error: std::string::empty(), comment: std::string::from_str(std::string::as_str(end.comment)), entries: entries, start_dir: start_dir, concat: concat }
 }
 
 /// How many entries `a` holds: `len(zf.infolist())`.
@@ -476,6 +500,9 @@ pub fn read_entry(in a: Archive, in data: Str, take index: Int, in name: Str) ->
     let e = std::array::get(a.entries, index);
     let n = std::str::len(data);
     let at = e.header_offset;
+    if at - a.concat > wide() {
+        return failed_read("ValueError", "cannot fit 'int' into an offset-sized integer");
+    }
     if at < 0 {
         return failed_read("OSError", "[Errno 22] Invalid argument");
     }
@@ -523,21 +550,32 @@ pub fn read_entry(in a: Archive, in data: Str, take index: Int, in name: Str) ->
     let compressed = slice(data, start, start + e.compress_size);
     let complete = std::string::len(compressed) == e.compress_size;
     var out = std::string::empty();
+    var produced = 0;
     var finished = complete;
     if e.compress_type == 0 {
-        out = std::string::from_str(std::string::as_str(compressed));
+        out = slice(std::string::as_str(compressed), 0, e.file_size);
+        produced = std::string::len(compressed);
     } else {
-        let got = inflate::raw::decompress(std::string::as_str(compressed), 0);
+        // zipfile inflates in chunks of up to 2^31 - 1 bytes of output and
+        // stops after the chunk that reaches the entry's size, so an error
+        // in a stream that runs on past its size is still seen within that
+        // chunk. Only the size's worth is kept; the rest costs a window.
+        let chunk = 2147483647;
+        var stop = chunk;
+        if e.file_size > 0 {
+            stop = (e.file_size + chunk - 1) / chunk * chunk;
+        }
+        let got = inflate::raw::decompress_bounded(std::string::as_str(compressed), 0, e.file_size, stop);
         if got.status == inflate::raw::status_data_error() {
             return failed_read("error", std::string::as_str(inflate::raw::error_text(got)));
         }
-        if got.status == 0 {
+        if got.status == 0 && !got.paused {
             finished = true;
         }
+        produced = got.total;
         out = got.data;
     }
-    if std::string::len(out) >= e.file_size {
-        out = slice(std::string::as_str(out), 0, e.file_size);
+    if produced >= e.file_size {
         finished = true;
     }
     if !finished {

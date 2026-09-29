@@ -653,6 +653,30 @@ def archives():
     items.append(("stored_shorter_than_size", Raw().add(b"a.txt", b"abc", usize=10).bytes()))
     items.append(("deflated_size_smaller", Raw().add(b"a.txt", d, method=8, usize=100, crc=zlib.crc32(d[:100])).bytes()))
     items.append(("zero_size_with_data", Raw().add(b"a.txt", b"abc", usize=0, crc=0).bytes()))
+
+    # A stream that goes on past the entry's stated size and breaks there:
+    # zipfile inflates in chunks of 2 GiB of output, so it still sees it.
+    w = Bits(); w.put(0, 1); w.put(0, 2); w.align(); w.put(800, 16); w.put(0xFFFF ^ 800, 16)
+    for b in d:
+        w.byte(b)
+    w.put(1, 1); w.put(3, 2)
+    items.append(("deflate_error_after_stated_size",
+                  Raw().add(b"a.txt", d[:100], method=8, payload=w.data(), usize=100).bytes()))
+
+    # ZIP64 fields at the top of their range, where a 64-bit signed
+    # integer would overflow.
+    huge = 0xFFFFFFFFFFFFFFFF
+    arch = bytearray(with_zip64_end(Raw().add(b"a.txt", b"a").bytes()))
+    loc = arch.rfind(b"PK\x06\x07")
+    arch[loc + 8:loc + 16] = struct.pack("<Q", huge)
+    items.append(("zip64_locator_offset_huge", bytes(arch)))
+    z64sizes = struct.pack("<HHQQ", 1, 16, huge, huge)
+    items.append(("zip64_extra_sizes_huge", Raw().add(b"a.txt", b"a", usize=0xFFFFFFFF, csize=0xFFFFFFFF,
+                                                       cd_extra=z64sizes).bytes()))
+    z64off = struct.pack("<HHQ", 1, 8, huge)
+    items.append(("zip64_extra_offset_huge", Raw().add(b"a.txt", b"a", offset=0xFFFFFFFF, cd_extra=z64off).bytes()))
+    z64size = struct.pack("<HHQ", 1, 8, 1 << 62)
+    items.append(("zip64_extra_file_size_large", Raw().add(b"a.txt", b"abc", usize=0xFFFFFFFF, cd_extra=z64size).bytes()))
     return items
 
 

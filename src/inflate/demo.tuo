@@ -127,6 +127,61 @@ pub fn inline_agree(take from: Int, take to: Int) -> Bool {
     true
 }
 
+/// The fixture index of the stream named `name`, or -1.
+///
+/// # Example
+/// ```tuo
+/// let i = inflate::demo::named("runs_40000_level9");
+/// ```
+pub fn named(in name: Str) -> Int {
+    var i = 0;
+    while i < inflate::fixture::count() {
+        if inflate::fixture::name(i) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// Whether decoding `input` keeping only `keep` bytes keeps exactly the
+/// first `keep` bytes of the whole output, and counts all of it — the
+/// window standing in for what was not kept.
+///
+/// # Example
+/// ```tuo
+/// let same = inflate::demo::bounded_agrees(input, 10);
+/// ```
+pub fn bounded_agrees(in input: Str, take keep: Int) -> Bool {
+    let whole = inflate::raw::decompress(input, 0);
+    let part = inflate::raw::decompress_bounded(input, 0, keep, inflate::raw::unbounded());
+    var n = keep;
+    if n > std::string::len(whole.data) {
+        n = std::string::len(whole.data);
+    }
+    part.status == whole.status && part.total == std::string::len(whole.data) && !part.paused && std::string::as_str(part.data) == std::str::slice(std::string::as_str(whole.data), 0, n)
+}
+
+fn inline_input(in name: Str) -> String {
+    from_hex(inflate::fixture::input_hex(named(name)))
+}
+
+fn pauses_at(in name: Str, take stop: Int) -> Bool {
+    let input = inline_input(name);
+    let got = inflate::raw::decompress_bounded(std::string::as_str(input), 0, 5, stop);
+    got.paused && got.total == stop && got.status == 0 && std::string::len(got.data) == 5
+}
+
+spec "bounded decoding keeps the prefix, counts the whole, and pauses" {
+    then bounded_agrees(std::string::as_str(inline_input("runs_40000_level9")), 10);
+    then bounded_agrees(std::string::as_str(inline_input("text_1000_level6")), 0);
+    then bounded_agrees(std::string::as_str(inline_input("overlapping_copy")), 3);
+    then bounded_agrees(std::string::as_str(inline_input("text_1000_level6")), 5000);
+    then pauses_at("text_1000_level6", 600);
+    // Reaching `stop` exactly at the end of the stream is not a pause.
+    then !inflate::raw::decompress_bounded(std::string::as_str(inline_input("text_1000_level6")), 0, 5, 1000).paused;
+}
+
 spec from_hex {
     then std::string::as_str(from_hex("4869")) == "Hi";
     then std::string::as_str(to_hex(std::string::as_str(from_hex("00ff7f")))) == "00ff7f";

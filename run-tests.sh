@@ -207,7 +207,7 @@ step "Rate limiting: specs (verify), all 63 strings, 9 scripts, 16 Redis calls, 
 step "Inflate and zip: front end (check)"
 "$TUO" check "${ZIP_SRC[@]}" examples/inflate.tuo examples/zip.tuo; check $? "inflate+zip check"
 
-step "Inflate and zip: specs (verify), 75 captured streams and all 49 captured archives reproduced"
+step "Inflate and zip: specs (verify), 75 captured streams and all 54 captured archives reproduced"
 "$TUO" verify "${ZIP_SRC[@]}"; check $? "inflate+zip verify"
 
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog

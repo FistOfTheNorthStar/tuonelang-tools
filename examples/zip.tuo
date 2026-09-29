@@ -1,7 +1,7 @@
 // examples/zip — every captured archive, opened and read natively.
 //
 // The specs replay the archives a few at a time; this program replays all
-// 49 as native code and prints what differs.
+// 54 as native code and prints what differs.
 //
 //     tuo run examples/zip.tuo src/zip/*.tuo src/inflate/*.tuo src/std_fs.tuo src/std_str.tuo
 //

@@ -3,7 +3,7 @@
 // The specs decompress the streams the fixture holds inline, a few at a
 // time within the sandbox's fuel. This program decompresses all 82 as
 // native code, reading the seven largest from examples/zip-test/inflate/,
-// and prints what differs.
+// and prints what differs; then decodes the largest with bounded output.
 //
 //     tuo run examples/inflate.tuo src/inflate/*.tuo src/std_fs.tuo src/std_str.tuo
 //
@@ -65,5 +65,10 @@ fn main() -> Int {
         }
         i = i + 1;
     }
+    // A 100 KB stream decoded keeping 1000 bytes: the window is trimmed
+    // twice on the way, and the copies must still reach back correctly.
+    let big = input_of(inflate::demo::named("text_100000_level6"));
+    failed = failed + report("bounded: 100000 bytes decoded keeping 1000, the tail trimmed along the way", inflate::demo::bounded_agrees(std::string::as_str(big), 1000));
+    failed = failed + report("bounded: keeping 70000, past two trims", inflate::demo::bounded_agrees(std::string::as_str(big), 70000));
     failed
 }

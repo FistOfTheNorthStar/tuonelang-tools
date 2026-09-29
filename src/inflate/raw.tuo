@@ -43,21 +43,65 @@ module inflate::raw;
 
 /// A decoded stream, or why it could not be. `status` is 0, zlib's `-3`
 /// (`Z_DATA_ERROR`) with `message`, or `-5` (`Z_BUF_ERROR`, truncated).
-/// `data` is everything decoded before a failure — what zlib had already
-/// written when it stopped. `end` is the byte offset just past the stream.
+/// `data` is what was decoded before a failure — what zlib had already
+/// written when it stopped — up to the `keep` bytes asked for; `total`
+/// counts all of it. `paused` is a bounded decode that reached its `stop`
+/// with the stream unfinished. `end` is the byte offset just past the
+/// stream.
 pub struct Inflated {
     status: Int,
     message: String,
     data: String,
+    total: Int,
+    paused: Bool,
     end: Int,
 }
 
-/// The reader: a bit position into the input, and a failure once met.
+/// Where decoded bytes go. The first `keep` are kept; past them only a
+/// tail of the most recent output survives — at least the 32 KiB copies
+/// may reach back into, trimmed back to that whenever it doubles — so a
+/// stream that expands far beyond what its caller wants costs a window of
+/// memory, not its whole output. `tail_start` is where the tail begins in
+/// the output. Decoding pauses once `total` reaches `stop`.
+struct Sink {
+    data: String,
+    keep: Int,
+    stop: Int,
+    total: Int,
+    tail: String,
+    tail_start: Int,
+    tailing: Bool,
+}
+
+fn window() -> Int {
+    32768
+}
+
+/// Start the tail from the last 32 KiB of what was kept. Called once,
+/// when decoding first runs past `keep`.
+fn start_tail(mut s: Sink) {
+    var from = s.keep - window();
+    if from < 0 {
+        from = 0;
+    }
+    s.tail = std::string::from_str(std::str::slice(std::string::as_str(s.data), from, s.keep));
+    s.tail_start = from;
+    s.tailing = true;
+}
+
+// Every byte goes to the sink the same way — kept while under `keep`,
+// else onto the tail — written out in place at each of the three sites
+// rather than as a helper, because the reference interpreter copies a
+// struct argument, sink and buffer, on every call.
+
+/// The reader: a bit position into the input, a failure once met, and
+/// whether the block being read reached its end.
 struct Reader {
     pos: Int,
     limit: Int,
     status: Int,
     message: String,
+    block_done: Bool,
 }
 
 /// Success.
@@ -201,7 +245,7 @@ fn tables() -> Tables {
 // Blocks.
 // ----------------------------------------------------------------------------
 
-fn stored(mut r: Reader, in src: Str, mut out: String) {
+fn stored(mut r: Reader, in src: Str, mut out: Sink) {
     r.pos = (r.pos + 7) / 8 * 8;
     let len = bits(r, src, 16);
     let nlen = bits(r, src, 16);
@@ -220,18 +264,51 @@ fn stored(mut r: Reader, in src: Str, mut out: String) {
         avail = r.limit / 8 - at;
     }
     var i = 0;
-    while i < avail {
-        std::string::push_byte(out, std::str::byte_at(src, at + i));
+    while i < avail && out.total < out.stop {
+        let byte = std::str::byte_at(src, at + i);
+        if out.total < out.keep {
+            std::string::push_byte(out.data, byte);
+        } else {
+            if !out.tailing {
+                start_tail(out);
+            }
+            std::string::push_byte(out.tail, byte);
+            let held = std::string::len(out.tail);
+            if held > 2 * window() {
+                out.tail = std::string::from_str(std::str::slice(std::string::as_str(out.tail), held - window(), held));
+                out.tail_start = out.tail_start + held - window();
+            }
+        }
+        out.total = out.total + 1;
         i = i + 1;
     }
-    r.pos = (at + avail) * 8;
+    r.pos = (at + i) * 8;
+    if i < avail {
+        return;
+    }
     if avail < len {
         truncate(r);
+        return;
     }
+    r.block_done = true;
 }
 
-fn codes(mut r: Reader, in src: Str, mut out: String, in t: Tables, in lit: inflate::huffman::Code, in dist: inflate::huffman::Code) {
+fn codes(mut r: Reader, in src: Str, mut out: Sink, in t: Tables, in lit: inflate::huffman::Code, in dist: inflate::huffman::Code) {
     while true {
+        if out.total >= out.stop {
+            // Out of room: zlib still decodes the next code, so a block
+            // that ends right here ends, and a bad code here is still bad.
+            let next = decode(r, src, lit);
+            if failed(r) {
+                return;
+            }
+            if next == 256 {
+                r.block_done = true;
+            } else if next < 0 || next > 285 {
+                refuse(r, "invalid literal/length code");
+            }
+            return;
+        }
         let sym = decode(r, src, lit);
         if failed(r) {
             return;
@@ -241,8 +318,22 @@ fn codes(mut r: Reader, in src: Str, mut out: String, in t: Tables, in lit: infl
             return;
         }
         if sym < 256 {
-            std::string::push_byte(out, sym);
+            if out.total < out.keep {
+                std::string::push_byte(out.data, sym);
+            } else {
+                if !out.tailing {
+                    start_tail(out);
+                }
+                std::string::push_byte(out.tail, sym);
+                let held = std::string::len(out.tail);
+                if held > 2 * window() {
+                    out.tail = std::string::from_str(std::str::slice(std::string::as_str(out.tail), held - window(), held));
+                    out.tail_start = out.tail_start + held - window();
+                }
+            }
+            out.total = out.total + 1;
         } else if sym == 256 {
+            r.block_done = true;
             return;
         } else {
             let li = sym - 257;
@@ -259,21 +350,44 @@ fn codes(mut r: Reader, in src: Str, mut out: String, in t: Tables, in lit: infl
             if failed(r) {
                 return;
             }
-            let have = std::string::len(out);
-            if d > have {
+            if d > out.total {
                 refuse(r, "invalid distance too far back");
                 return;
             }
             var i = 0;
-            while i < len {
-                std::string::push_byte(out, std::string::byte_at(out, have - d + i));
+            // The byte `d` back: in the kept output, or in the window
+            // once decoding has run past what is kept. Read in place — a
+            // helper taking the sink would copy it per byte in the
+            // reference interpreter.
+            while i < len && out.total < out.stop {
+                let pos = out.total - d;
+                var b = 0;
+                if out.tailing {
+                    b = std::string::byte_at(out.tail, pos - out.tail_start);
+                } else {
+                    b = std::string::byte_at(out.data, pos);
+                }
+                if out.total < out.keep {
+                    std::string::push_byte(out.data, b);
+                } else {
+                    if !out.tailing {
+                        start_tail(out);
+                    }
+                    std::string::push_byte(out.tail, b);
+                    let held = std::string::len(out.tail);
+                    if held > 2 * window() {
+                        out.tail = std::string::from_str(std::str::slice(std::string::as_str(out.tail), held - window(), held));
+                        out.tail_start = out.tail_start + held - window();
+                    }
+                }
+                out.total = out.total + 1;
                 i = i + 1;
             }
         }
     }
 }
 
-fn dynamic(mut r: Reader, in src: Str, mut out: String, in t: Tables) {
+fn dynamic(mut r: Reader, in src: Str, mut out: Sink, in t: Tables) {
     let nlen = bits(r, src, 5) + 257;
     let ndist = bits(r, src, 5) + 1;
     let ncode = bits(r, src, 4) + 4;
@@ -372,11 +486,34 @@ fn dynamic(mut r: Reader, in src: Str, mut out: String, in t: Tables) {
 /// let got = inflate::raw::decompress(stream, 0);
 /// ```
 pub fn decompress(in src: Str, take from: Int) -> Inflated {
-    var r = Reader { pos: from * 8, limit: std::str::len(src) * 8, status: 0, message: std::string::empty() };
-    var out = std::string::empty();
+    decompress_bounded(src, from, unbounded(), unbounded())
+}
+
+/// No bound: more output than any program holds.
+///
+/// # Example
+/// ```tuo
+/// let n = inflate::raw::unbounded(); // 2^62
+/// ```
+pub fn unbounded() -> Int {
+    4611686018427387904
+}
+
+/// Decode as `decompress` does, keeping only the first `keep` bytes and
+/// pausing once `stop` bytes have been produced — `decompressobj`'s
+/// `max_length`, as zipfile uses it.
+///
+/// # Example
+/// ```tuo
+/// let got = inflate::raw::decompress_bounded(stream, 0, 100, 2147483647);
+/// ```
+pub fn decompress_bounded(in src: Str, take from: Int, take keep: Int, take stop: Int) -> Inflated {
+    var r = Reader { pos: from * 8, limit: std::str::len(src) * 8, status: 0, message: std::string::empty(), block_done: false };
+    var out = Sink { data: std::string::empty(), keep: keep, stop: stop, total: 0, tail: std::string::empty(), tail_start: 0, tailing: false };
     let t = tables();
     var last = false;
-    while !last && !failed(r) {
+    while !last && !failed(r) && out.total < out.stop {
+        r.block_done = false;
         last = bits(r, src, 1) == 1;
         let kind = bits(r, src, 2);
         if !failed(r) {
@@ -392,9 +529,11 @@ pub fn decompress(in src: Str, take from: Int) -> Inflated {
         }
     }
     if failed(r) {
-        return Inflated { status: r.status, message: r.message, data: out, end: r.pos / 8 };
+        return Inflated { status: r.status, message: r.message, data: out.data, total: out.total, paused: false, end: r.pos / 8 };
     }
-    Inflated { status: 0, message: std::string::empty(), data: out, end: (r.pos + 7) / 8 }
+    // Stopped at `stop` with blocks still to come, or in the middle of one.
+    let paused = !(last && r.block_done);
+    Inflated { status: 0, message: std::string::empty(), data: out.data, total: out.total, paused: paused, end: (r.pos + 7) / 8 }
 }
 
 /// The `zlib.error` text CPython raises for a failed stream:

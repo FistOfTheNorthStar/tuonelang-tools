@@ -26,7 +26,7 @@ SHA-256/HMAC/PBKDF2, `std::bignum`, `std::json`, `std::fs`, `std::sync`,
 | this repo, `tls` | `ssl` (client side) | TLS 1.3 client on the catalog's stack; RFC 8448 reproduced; handshakes with `std::tls` and OpenSSL; `https://` to Stripe, Sentry, Cloudflare |
 | this repo, `web` | `fastapi`, `pydantic`, `starlette` (the request path) | routing, models as data, lax validation, the 422 body; 107 captured FastAPI responses reproduced byte for byte |
 | this repo, `dotenv` + `settings` | `python-dotenv`, `pydantic-settings` | `.env` parsing with interpolation; `BaseSettings` as data; 29 `.env` texts and 33 instantiations of the backend's `Settings` reproduced |
-| this repo, `inflate` + `zip` | `zlib` (decompression), `zipfile` (reading) | deflate with zlib's errors; archives read as zipfile reads them; 82 streams and 49 archives reproduced |
+| this repo, `inflate` + `zip` | `zlib` (decompression), `zipfile` (reading) | deflate with zlib's errors; archives read as zipfile reads them; 82 streams and 54 archives reproduced; bounded memory on archives that expand past their stated size |
 | this repo, `ratelimit` | `slowapi`, `limits` | the grammar, keys, and fixed window in memory and Redis; slowapi's check and 429; 63 strings, 16 Redis exchanges, and 103 slowapi responses reproduced |
 | this repo, `x509` + `ec` + `rsa` | the trust half of `ssl`, `certifi` | X.509 parsing and chain validation, a root store, ECDSA P-256/P-384, RSA v1.5/PSS; 380 specs; real chains validated |
 

@@ -1,6 +1,6 @@
 // zip::demo — the captured archives, opened and read again.
 //
-// `examples/zip_oracle.py` opened 49 archives with `zipfile.ZipFile` and
+// `examples/zip_oracle.py` opened 54 archives with `zipfile.ZipFile` and
 // read every member; `zip::fixture` holds what it reported. The specs open
 // each archive with `zip::archive::open`, compare the outcome, the archive
 // comment, and every entry's fields, then read every name zipfile read and
