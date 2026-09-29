@@ -18,11 +18,65 @@
 module inflate::huffman;
 
 /// A code: `counts[n]` codes of length `n` (1 to 15), `symbols` in
-/// canonical order, and the longest length (0 for no codes).
+/// canonical order, the longest length (0 for no codes), and `fast`: for
+/// each of the 512 ways the next nine bits of input can fall, `(symbol + 1)
+/// * 16 + length` when they begin with a code of at most nine bits, else 0.
 pub struct Code {
     counts: Array[Int],
     symbols: Array[Int],
     longest: Int,
+    fast: Array[Int],
+}
+
+/// How many bits `fast` looks up at once.
+///
+/// # Example
+/// ```tuo
+/// let n = inflate::huffman::fast_bits(); // 9
+/// ```
+pub fn fast_bits() -> Int {
+    9
+}
+
+/// The lookup table for a code: every code of at most `fast_bits` bits,
+/// bit-reversed (the stream carries codes most significant bit first, and
+/// bits are read least significant first), under every way the bits after
+/// it can fall.
+fn fast_table(in counts: Array[Int], in symbols: Array[Int], take longest: Int) -> Array[Int] {
+    var table = std::array::empty();
+    var i = 0;
+    while i < 512 {
+        std::array::push(table, 0);
+        i = i + 1;
+    }
+    var code = 0;
+    var index = 0;
+    var len = 1;
+    while len <= fast_bits() && len <= longest {
+        let count = std::array::get(counts, len);
+        var k = 0;
+        while k < count {
+            let sym = std::array::get(symbols, index + k);
+            let c = code + k;
+            var rev = 0;
+            var b = 0;
+            while b < len {
+                rev = rev * 2 + (c >> b) % 2;
+                b = b + 1;
+            }
+            let step = 1 << len;
+            var at = rev;
+            while at < 512 {
+                std::array::set(table, at, (sym + 1) * 16 + len);
+                at = at + step;
+            }
+            k = k + 1;
+        }
+        index = index + count;
+        code = (code + count) * 2;
+        len = len + 1;
+    }
+    table
 }
 
 /// The code-length code, which may not be incomplete.
@@ -142,7 +196,8 @@ pub fn build(in lengths: Array[Int], take from: Int, take n: Int) -> Code {
         }
         i = i + 1;
     }
-    Code { counts: counts, symbols: symbols, longest: longest }
+    let fast = fast_table(counts, symbols, longest);
+    Code { counts: counts, symbols: symbols, longest: longest, fast: fast }
 }
 
 /// The fixed literal/length code of RFC 1951 §3.2.6, all 288 symbols.
@@ -249,6 +304,22 @@ spec build {
     then std::array::get(build(lengths_of("33333244"), 0, 8).counts, 3) == 5;
     then fixed_literals().longest == 9;
     then fixed_distances().longest == 5;
+}
+
+spec fast_table {
+    // F is 00 (two bits, 0 reversed is 0): every ninth-bit pattern ending
+    // in 00 — indices 0, 4, 8, … — names F with length 2.
+    then std::array::get(build(lengths_of("33333244"), 0, 8).fast, 0) == 6 * 16 + 2;
+    then std::array::get(build(lengths_of("33333244"), 0, 8).fast, 508) == 6 * 16 + 2;
+    // A is 010: read least significant first that is 0, 1, 0 — index 2.
+    then std::array::get(build(lengths_of("33333244"), 0, 8).fast, 2) == 1 * 16 + 3;
+    // G is 1110, reversed 0111 = 7.
+    then std::array::get(build(lengths_of("33333244"), 0, 8).fast, 7) == 7 * 16 + 4;
+    // A lone one-bit code leaves the other pattern unassigned.
+    then std::array::get(build(lengths_of("1"), 0, 1).fast, 1) == 0;
+    then std::array::get(build(lengths_of("1"), 0, 1).fast, 0) == 1 * 16 + 1;
+    // Fixed literal 0 is 00110000 (eight bits).
+    then std::array::get(fixed_literals().fast, 12) == 1 * 16 + 8;
 }
 
 spec step {

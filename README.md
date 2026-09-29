@@ -378,7 +378,7 @@ if a.ok {
 
 | Layer | State |
 |---|---|
-| `inflate::huffman` — canonical codes, with `inflate_table`'s rules for what is over-subscribed or incomplete | ✅ proven |
+| `inflate::huffman` — canonical codes, with `inflate_table`'s rules for what is over-subscribed or incomplete; a nine-bit lookup table per code | ✅ proven |
 | `inflate::raw` — stored, fixed, and dynamic blocks; every zlib data error, in zlib's order; truncation as `Z_BUF_ERROR`; bounded output, as `max_length` bounds it | ✅ 82 of 82 captured streams alike |
 | `inflate::zlib` — `zlib.decompress(data, wbits)`: the RFC 1950 header, Adler-32, `Z_NEED_DICT`; `crc32` | ✅ proven |
 | `zip::text` — UTF-8 with CPython's `UnicodeDecodeError` text, cp437, `repr` of `str` and `bytes` | ✅ proven |
@@ -437,7 +437,11 @@ reaches the entry's stated size, so an error later in that chunk is still
 reported. The port decodes just as far, but keeps only the stated size
 plus a 32 KiB window for copies to reach back into. A 64 MB bomb stating
 10 bytes reads in 0.3 s at a 45 MB peak, where decoding it whole peaked at
-137 MB and grew with the bomb. ZIP64 fields are read saturating: a crafted
+137 MB and grew with the bomb. Decoding runs at about 140 MB/s natively —
+codes of up to nine bits resolve in one table lookup, bits come three
+bytes at a time — against zlib's 2 GB/s, so the 2 GiB zipfile reads
+through costs some fifteen seconds; the remaining cost is appending the
+output a byte at a time. ZIP64 fields are read saturating: a crafted
 0xFFFFFFFFFFFFFFFF is refused with zipfile's own error instead of
 overflowing `Int`, which traps.
 

@@ -162,21 +162,34 @@ fn bit(mut r: Reader, in src: Str) -> Int {
     v
 }
 
-/// `n` bits, least significant first; 0 once the input has run out.
+/// The three bytes from the one holding bit `pos`, little-endian, zeros
+/// past the end: enough for any `n` of up to 16 bits at `pos`.
+fn window_at(in src: Str, take pos: Int) -> Int {
+    let at = pos / 8;
+    let n = std::str::len(src);
+    var w = 0;
+    if at < n {
+        w = std::str::byte_at(src, at);
+    }
+    if at + 1 < n {
+        w = w + (std::str::byte_at(src, at + 1) << 8);
+    }
+    if at + 2 < n {
+        w = w + (std::str::byte_at(src, at + 2) << 16);
+    }
+    w >> (pos % 8)
+}
+
+/// `n` bits (at most 16), least significant first; 0 once the input has
+/// run out.
 fn bits(mut r: Reader, in src: Str, take n: Int) -> Int {
     if r.pos + n > r.limit {
         r.pos = r.limit;
         truncate(r);
         return 0;
     }
-    var v = 0;
-    var i = 0;
-    var weight = 1;
-    while i < n {
-        v = v + bit(r, src) * weight;
-        weight = weight * 2;
-        i = i + 1;
-    }
+    let v = window_at(src, r.pos) % (1 << n);
+    r.pos = r.pos + n;
     v
 }
 
@@ -185,6 +198,17 @@ fn decode(mut r: Reader, in src: Str, in c: inflate::huffman::Code) -> Int {
     if c.longest == 0 {
         let _ = bit(r, src);
         return inflate::huffman::no_symbol();
+    }
+    // Most codes are nine bits or fewer: one lookup when nine bits are
+    // there to look at. Everything else — longer codes, patterns an
+    // incomplete code leaves unassigned, the last bits of the input — takes
+    // the bit-at-a-time path below, which decides exactly as zlib does.
+    if r.pos + inflate::huffman::fast_bits() <= r.limit {
+        let e = std::array::get(c.fast, window_at(src, r.pos) % 512);
+        if e != 0 {
+            r.pos = r.pos + e % 16;
+            return e / 16 - 1;
+        }
     }
     var code = 0;
     var first = 0;
@@ -511,6 +535,8 @@ pub fn decompress_bounded(in src: Str, take from: Int, take keep: Int, take stop
     var r = Reader { pos: from * 8, limit: std::str::len(src) * 8, status: 0, message: std::string::empty(), block_done: false };
     var out = Sink { data: std::string::empty(), keep: keep, stop: stop, total: 0, tail: std::string::empty(), tail_start: 0, tailing: false };
     let t = tables();
+    let fixed_lit = inflate::huffman::fixed_literals();
+    let fixed_dist = inflate::huffman::fixed_distances();
     var last = false;
     while !last && !failed(r) && out.total < out.stop {
         r.block_done = false;
@@ -520,7 +546,7 @@ pub fn decompress_bounded(in src: Str, take from: Int, take keep: Int, take stop
             if kind == 0 {
                 stored(r, src, out);
             } else if kind == 1 {
-                codes(r, src, out, t, inflate::huffman::fixed_literals(), inflate::huffman::fixed_distances());
+                codes(r, src, out, t, fixed_lit, fixed_dist);
             } else if kind == 2 {
                 dynamic(r, src, out, t);
             } else {
