@@ -1,0 +1,756 @@
+// dotenv::parse — a `.env` file, read the way python-dotenv reads it.
+//
+// python-dotenv 1.2.3 parses with a handful of regular expressions applied
+// one after another from a cursor: optional leading whitespace (newlines
+// included), an optional `export `, a key (bare or single-quoted), an
+// optional `=` and value (single-quoted, double-quoted, or bare up to the
+// end of the line with a ` #` comment cut off), an optional comment, and
+// the end of the line. A statement that does not fit is skipped to the
+// end of its line and reported by line number — the line where the
+// previous statement ended, since that is where python-dotenv sets its
+// mark. This module is those expressions, written out as scans with the
+// same greed: a quoted value runs across newlines to its closing quote,
+// so an unterminated one swallows every line up to the next quote of its
+// kind, exactly as python-dotenv does.
+//
+// Whitespace is Python's `\s` on text: ASCII space, tab, the line breaks,
+// \x0b, \x0c, \x1c–\x1f, and the Unicode spaces (U+0085, U+00A0, U+1680,
+// U+2000–U+200A, U+2028, U+2029, U+202F, U+205F, U+3000) in UTF-8.
+// Positions are bytes, which is safe because no multi-byte sequence has a
+// byte a delimiter could be mistaken for.
+//
+// `values` then gives `dotenv_values`: the keys in first-seen order, each
+// with its last value, and `${NAME}` / `${NAME:-default}` expanded against
+// the values before it and the process environment, the file winning.
+
+module dotenv::parse;
+
+/// Statements, in file order, duplicates included: what `parse_stream`
+/// yields that has a key. `has_value` is 0 for a key with no `=`
+/// (python-dotenv's `None`).
+pub struct Bindings {
+    keys: Array[String],
+    values: Array[String],
+    has_value: Array[Int],
+    error_lines: Array[Int],
+}
+
+/// A process environment: names and values, in order.
+pub struct Environ {
+    names: Array[String],
+    values: Array[String],
+}
+
+/// An empty environment.
+///
+/// # Example
+/// ```tuo
+/// var e = dotenv::parse::environ();
+/// ```
+pub fn environ() -> Environ {
+    Environ { names: std::array::empty(), values: std::array::empty() }
+}
+
+/// Set `name` in `e`, replacing an earlier value of the same name.
+///
+/// # Example
+/// ```tuo
+/// dotenv::parse::set(e, "HOME", "/home/ada");
+/// ```
+pub fn set(mut e: Environ, in name: Str, in value: Str) {
+    var i = 0;
+    while i < std::array::len(e.names) {
+        if std::string::as_str(std::array::get(e.names, i)) == name {
+            std::array::set(e.values, i, std::string::from_str(value));
+            return;
+        }
+        i = i + 1;
+    }
+    std::array::push(e.names, std::string::from_str(name));
+    std::array::push(e.values, std::string::from_str(value));
+}
+
+/// An environment from `NAME=value` lines, the shape `env` prints; a
+/// line without `=` is skipped.
+///
+/// # Example
+/// ```tuo
+/// let e = dotenv::parse::environ_from_lines("HOME=/home/ada\nLANG=C\n");
+/// ```
+pub fn environ_from_lines(in text: Str) -> Environ {
+    var e = environ();
+    let n = std::str::len(text);
+    var start = 0;
+    var i = 0;
+    while i <= n {
+        if i == n || std::str::byte_at(text, i) == 10 {
+            var eq = start;
+            while eq < i && std::str::byte_at(text, eq) != 61 {
+                eq = eq + 1;
+            }
+            if eq < i && eq > start {
+                set(e, std::str::slice(text, start, eq), std::str::slice(text, eq + 1, i));
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    e
+}
+
+// ----------------------------------------------------------------------------
+// Characters.
+// ----------------------------------------------------------------------------
+
+/// The length in bytes of the whitespace character at `i`, or 0.
+fn space_len(in s: Str, take i: Int) -> Int {
+    let n = std::str::len(s);
+    if i >= n {
+        return 0;
+    }
+    let b = std::str::byte_at(s, i);
+    if b == 32 || (b >= 9 && b <= 13) || (b >= 28 && b <= 31) {
+        return 1;
+    }
+    if b == 194 && i + 1 < n {
+        let c = std::str::byte_at(s, i + 1);
+        if c == 133 || c == 160 {
+            return 2;
+        }
+        return 0;
+    }
+    if b < 225 || b > 227 || i + 2 >= n {
+        return 0;
+    }
+    let c = std::str::byte_at(s, i + 1);
+    let d = std::str::byte_at(s, i + 2);
+    if b == 225 && c == 154 && d == 128 {
+        return 3;
+    }
+    if b == 226 && c == 128 && ((d >= 128 && d <= 138) || d == 168 || d == 169 || d == 175) {
+        return 3;
+    }
+    if b == 226 && c == 129 && d == 159 {
+        return 3;
+    }
+    if b == 227 && c == 128 && d == 128 {
+        return 3;
+    }
+    0
+}
+
+/// Like `space_len`, but a line break is not blank: `[^\S\r\n]`.
+fn blank_len(in s: Str, take i: Int) -> Int {
+    if i < std::str::len(s) && (std::str::byte_at(s, i) == 10 || std::str::byte_at(s, i) == 13) {
+        return 0;
+    }
+    space_len(s, i)
+}
+
+fn skip_spaces(in s: Str, take from: Int) -> Int {
+    var i = from;
+    var step = space_len(s, i);
+    while step > 0 {
+        i = i + step;
+        step = space_len(s, i);
+    }
+    i
+}
+
+fn skip_blanks(in s: Str, take from: Int) -> Int {
+    var i = from;
+    var step = blank_len(s, i);
+    while step > 0 {
+        i = i + step;
+        step = blank_len(s, i);
+    }
+    i
+}
+
+fn is_break(take b: Int) -> Bool {
+    b == 10 || b == 13
+}
+
+/// The end of the line starting at `from`: the first CR or LF, or the end.
+fn line_end(in s: Str, take from: Int) -> Int {
+    var i = from;
+    while i < std::str::len(s) && !is_break(std::str::byte_at(s, i)) {
+        i = i + 1;
+    }
+    i
+}
+
+/// How many line breaks `(\r\n|\n|\r)` finds in `s[from..to]`.
+fn breaks(in s: Str, take from: Int, take to: Int) -> Int {
+    var count = 0;
+    var i = from;
+    while i < to {
+        let b = std::str::byte_at(s, i);
+        if b == 13 && i + 1 < to && std::str::byte_at(s, i + 1) == 10 {
+            count = count + 1;
+            i = i + 2;
+        } else {
+            if is_break(b) {
+                count = count + 1;
+            }
+            i = i + 1;
+        }
+    }
+    count
+}
+
+// ----------------------------------------------------------------------------
+// The reader: a cursor and the line it is on, advanced one match at a time
+// so the line count is python-dotenv's.
+// ----------------------------------------------------------------------------
+
+struct Reader {
+    at: Int,
+    line: Int,
+}
+
+fn advance(mut r: Reader, in s: Str, take to: Int) {
+    r.line = r.line + breaks(s, r.at, to);
+    r.at = to;
+}
+
+/// Where a quoted value that opens at `open` closes, or -1: the regex
+/// `Q((?:\\.|[^Q\\])*)Q` with DOTALL, for the quote byte `q`.
+fn quoted_end(in s: Str, take open: Int, take q: Int) -> Int {
+    let n = std::str::len(s);
+    var i = open + 1;
+    while i < n {
+        let b = std::str::byte_at(s, i);
+        if b == q {
+            return i;
+        }
+        if b == 92 {
+            if i + 1 >= n {
+                return -1;
+            }
+            i = i + 2;
+        } else {
+            i = i + 1;
+        }
+    }
+    -1
+}
+
+/// The escapes python-dotenv decodes: in single quotes `\\` and `\'`; in
+/// double quotes those, `\"`, and `\a \b \f \n \r \t \v`. Anything else
+/// after a backslash stays as written.
+fn unescape(in raw: Str, take double: Bool) -> String {
+    var out = std::string::empty();
+    let n = std::str::len(raw);
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(raw, i);
+        var decoded = -1;
+        if b == 92 && i + 1 < n {
+            let c = std::str::byte_at(raw, i + 1);
+            if c == 92 || c == 39 {
+                decoded = c;
+            } else if double {
+                if c == 34 {
+                    decoded = 34;
+                } else if c == 97 {
+                    decoded = 7;
+                } else if c == 98 {
+                    decoded = 8;
+                } else if c == 102 {
+                    decoded = 12;
+                } else if c == 110 {
+                    decoded = 10;
+                } else if c == 114 {
+                    decoded = 13;
+                } else if c == 116 {
+                    decoded = 9;
+                } else if c == 118 {
+                    decoded = 11;
+                }
+            }
+        }
+        if decoded >= 0 {
+            std::string::push_byte(out, decoded);
+            i = i + 2;
+        } else {
+            std::string::push_byte(out, b);
+            i = i + 1;
+        }
+    }
+    out
+}
+
+/// A bare value: the rest of the line, cut at the first whitespace run
+/// followed by `#`, then right-stripped of whitespace.
+fn bare_value(in s: Str, take from: Int, take to: Int) -> String {
+    var cut = to;
+    var i = from;
+    while i < to && cut == to {
+        let step = space_len(s, i);
+        if step > 0 {
+            let after = skip_spaces(s, i);
+            if after < to && std::str::byte_at(s, after) == 35 {
+                cut = i;
+            }
+            i = after;
+        } else {
+            i = i + 1;
+        }
+    }
+    // Right-strip: keep up to the end of the last non-space character.
+    var keep = from;
+    i = from;
+    while i < cut {
+        let step = space_len(s, i);
+        if step > 0 {
+            i = i + step;
+        } else {
+            i = i + 1;
+            keep = i;
+        }
+    }
+    std::string::from_str(std::str::slice(s, from, keep))
+}
+
+fn push_binding(mut out: Bindings, in key: Str, in value: Str, take has_value: Bool) {
+    std::array::push(out.keys, std::string::from_str(key));
+    std::array::push(out.values, std::string::from_str(value));
+    std::array::push(out.has_value, if has_value {
+        1
+    } else {
+        0
+    });
+}
+
+/// Skip a statement that did not parse: `[^\r\n]*(?:\r|\n|\r\n)?` from
+/// where the failing match began, and record the mark's line.
+fn fail(mut out: Bindings, mut r: Reader, in s: Str, take mark_line: Int) {
+    var to = line_end(s, r.at);
+    if to < std::str::len(s) {
+        to = to + 1;
+    }
+    advance(r, s, to);
+    std::array::push(out.error_lines, mark_line);
+}
+
+/// Read one statement at the reader; false when there was nothing left.
+fn binding(mut out: Bindings, mut r: Reader, in s: Str) -> Bool {
+    let n = std::str::len(s);
+    let mark_line = r.line;
+    advance(r, s, skip_spaces(s, r.at));
+    if r.at >= n {
+        return false;
+    }
+    // `(?:export[^\S\r\n]+)?`
+    if r.at + 6 < n && std::str::slice(s, r.at, r.at + 6) == "export" && blank_len(s, r.at + 6) > 0 {
+        advance(r, s, skip_blanks(s, r.at + 6));
+    }
+    // The key: none for a comment, `'([^']+)'`, or `([^=\#\s]+)`.
+    var has_key = true;
+    var key = std::string::empty();
+    let first = if r.at < n {
+        std::str::byte_at(s, r.at)
+    } else {
+        -1
+    };
+    if first == 35 {
+        has_key = false;
+    } else if first == 39 {
+        var close = r.at + 1;
+        while close < n && std::str::byte_at(s, close) != 39 {
+            close = close + 1;
+        }
+        if close >= n || close == r.at + 1 {
+            fail(out, r, s, mark_line);
+            return true;
+        }
+        key = std::string::from_str(std::str::slice(s, r.at + 1, close));
+        advance(r, s, close + 1);
+    } else {
+        var end = r.at;
+        while end < n && std::str::byte_at(s, end) != 61 && std::str::byte_at(s, end) != 35 && space_len(s, end) == 0 {
+            end = end + 1;
+        }
+        if end == r.at {
+            fail(out, r, s, mark_line);
+            return true;
+        }
+        key = std::string::from_str(std::str::slice(s, r.at, end));
+        advance(r, s, end);
+    }
+    advance(r, s, skip_blanks(s, r.at));
+    // The value, when there is an `=`.
+    var has_value = false;
+    var value = std::string::empty();
+    if r.at < n && std::str::byte_at(s, r.at) == 61 {
+        advance(r, s, skip_blanks(s, r.at + 1));
+        has_value = true;
+        let c = if r.at < n {
+            std::str::byte_at(s, r.at)
+        } else {
+            -1
+        };
+        if c == 39 || c == 34 {
+            let close = quoted_end(s, r.at, c);
+            if close < 0 {
+                fail(out, r, s, mark_line);
+                return true;
+            }
+            value = unescape(std::str::slice(s, r.at + 1, close), c == 34);
+            advance(r, s, close + 1);
+        } else if c >= 0 && !is_break(c) {
+            let end = line_end(s, r.at);
+            value = bare_value(s, r.at, end);
+            advance(r, s, end);
+        }
+    }
+    // `(?:[^\S\r\n]*#[^\r\n]*)?`
+    let after = skip_blanks(s, r.at);
+    if after < n && std::str::byte_at(s, after) == 35 {
+        advance(r, s, line_end(s, after));
+    }
+    // `[^\S\r\n]*(?:\r\n|\n|\r|$)`
+    let eol = skip_blanks(s, r.at);
+    if eol < n {
+        let b = std::str::byte_at(s, eol);
+        if !is_break(b) {
+            fail(out, r, s, mark_line);
+            return true;
+        }
+        if b == 13 && eol + 1 < n && std::str::byte_at(s, eol + 1) == 10 {
+            advance(r, s, eol + 2);
+        } else {
+            advance(r, s, eol + 1);
+        }
+    } else {
+        advance(r, s, eol);
+    }
+    if has_key {
+        push_binding(out, std::string::as_str(key), std::string::as_str(value), has_value);
+    }
+    true
+}
+
+/// Every statement of `text`, in order, with the lines that did not
+/// parse. A leading byte-order mark is dropped.
+///
+/// # Example
+/// ```tuo
+/// let b = dotenv::parse::bindings("export A=1\nB='two'\n");
+/// ```
+pub fn bindings(in text: Str) -> Bindings {
+    var out = Bindings { keys: std::array::empty(), values: std::array::empty(), has_value: std::array::empty(), error_lines: std::array::empty() };
+    var start = 0;
+    if std::str::len(text) >= 3 && std::str::byte_at(text, 0) == 239 && std::str::byte_at(text, 1) == 187 && std::str::byte_at(text, 2) == 191 {
+        start = 3;
+    }
+    let s = std::str::slice(text, start, std::str::len(text));
+    var r = Reader { at: 0, line: 1 };
+    var more = true;
+    while more {
+        more = binding(out, r, s);
+    }
+    out
+}
+
+/// How many statements with a key there were.
+///
+/// # Example
+/// ```tuo
+/// let n = dotenv::parse::binding_count(b);
+/// ```
+pub fn binding_count(in b: Bindings) -> Int {
+    std::array::len(b.keys)
+}
+
+/// The lines python-dotenv would warn it could not parse, one per
+/// statement, in order.
+///
+/// # Example
+/// ```tuo
+/// let n = std::array::len(dotenv::parse::error_lines(b));
+/// ```
+pub fn error_lines(in b: Bindings) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < std::array::len(b.error_lines) {
+        std::array::push(out, std::array::get(b.error_lines, i));
+        i = i + 1;
+    }
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Values: `dotenv_values`, with interpolation.
+// ----------------------------------------------------------------------------
+
+/// A `.env` file's values: keys in first-seen order, each with its last
+/// value; `has_value` 0 is python-dotenv's `None`.
+pub struct Values {
+    keys: Array[String],
+    values: Array[String],
+    has_value: Array[Int],
+    error_lines: Array[Int],
+}
+
+fn index_in(in names: Array[String], in name: Str) -> Int {
+    var i = 0;
+    while i < std::array::len(names) {
+        if std::string::as_str(std::array::get(names, i)) == name {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+/// What `${name}` resolves to: the file's value so far (a key with no
+/// value is empty, not the default), else the environment's, else the
+/// default.
+fn lookup(in v: Values, in env: Environ, in name: Str, in default: Str) -> String {
+    let k = index_in(v.keys, name);
+    if k >= 0 {
+        return std::string::from_str(std::string::as_str(std::array::get(v.values, k)));
+    }
+    let e = index_in(env.names, name);
+    if e >= 0 {
+        return std::string::from_str(std::string::as_str(std::array::get(env.values, e)));
+    }
+    std::string::from_str(default)
+}
+
+/// `value` with every `${NAME}` and `${NAME:-default}` replaced, as
+/// python-dotenv's `\$\{([^}:]*)(?::-([^}]*))?\}` finds them: left to
+/// right, not nested, and anything else — `$NAME`, `${A:=b}`, an
+/// unclosed `${` — left as written.
+fn expand(in value: Str, in v: Values, in env: Environ) -> String {
+    var out = std::string::empty();
+    let n = std::str::len(value);
+    var i = 0;
+    while i < n {
+        var matched = false;
+        if i + 1 < n && std::str::byte_at(value, i) == 36 && std::str::byte_at(value, i + 1) == 123 {
+            var j = i + 2;
+            while j < n && std::str::byte_at(value, j) != 125 && std::str::byte_at(value, j) != 58 {
+                j = j + 1;
+            }
+            if j < n && std::str::byte_at(value, j) == 125 {
+                std::string::append(out, std::string::as_str(lookup(v, env, std::str::slice(value, i + 2, j), "")));
+                i = j + 1;
+                matched = true;
+            } else if j + 1 < n && std::str::byte_at(value, j) == 58 && std::str::byte_at(value, j + 1) == 45 {
+                var k = j + 2;
+                while k < n && std::str::byte_at(value, k) != 125 {
+                    k = k + 1;
+                }
+                if k < n {
+                    std::string::append(out, std::string::as_str(lookup(v, env, std::str::slice(value, i + 2, j), std::str::slice(value, j + 2, k))));
+                    i = k + 1;
+                    matched = true;
+                }
+            }
+        }
+        if !matched {
+            std::string::push_byte(out, std::str::byte_at(value, i));
+            i = i + 1;
+        }
+    }
+    out
+}
+
+/// `dotenv_values` of `text`: parsed, and with `interpolate` on each
+/// value expanded against the ones before it and `env`, the file's own
+/// values winning, as `dotenv_values` does by default.
+///
+/// # Example
+/// ```tuo
+/// let v = dotenv::parse::values("A=1\nB=${A}2\n", dotenv::parse::environ(), true);
+/// ```
+pub fn values(in text: Str, in env: Environ, take interpolate: Bool) -> Values {
+    let b = bindings(text);
+    var v = Values { keys: std::array::empty(), values: std::array::empty(), has_value: std::array::empty(), error_lines: error_lines(b) };
+    var i = 0;
+    while i < std::array::len(b.keys) {
+        let key = std::string::as_str(std::array::get(b.keys, i));
+        let has = std::array::get(b.has_value, i);
+        var value = std::string::from_str(std::string::as_str(std::array::get(b.values, i)));
+        if interpolate && has == 1 {
+            value = expand(std::string::as_str(value), v, env);
+        }
+        let k = index_in(v.keys, key);
+        if k >= 0 {
+            std::array::set(v.values, k, value);
+            std::array::set(v.has_value, k, has);
+        } else {
+            std::array::push(v.keys, std::string::from_str(key));
+            std::array::push(v.values, value);
+            std::array::push(v.has_value, has);
+        }
+        i = i + 1;
+    }
+    v
+}
+
+/// How many keys there are.
+///
+/// # Example
+/// ```tuo
+/// let n = dotenv::parse::count(v);
+/// ```
+pub fn count(in v: Values) -> Int {
+    std::array::len(v.keys)
+}
+
+/// Key `i`.
+///
+/// # Example
+/// ```tuo
+/// let k = dotenv::parse::key_at(v, 0);
+/// ```
+pub fn key_at(in v: Values, take i: Int) -> String {
+    std::string::from_str(std::string::as_str(std::array::get(v.keys, i)))
+}
+
+/// Whether key `i` had a value (`A=` has an empty one; a bare `A` none).
+///
+/// # Example
+/// ```tuo
+/// let has = dotenv::parse::has_value_at(v, 0);
+/// ```
+pub fn has_value_at(in v: Values, take i: Int) -> Bool {
+    std::array::get(v.has_value, i) == 1
+}
+
+/// The value of key `i`; empty when it has none.
+///
+/// # Example
+/// ```tuo
+/// let value = dotenv::parse::value_at(v, 0);
+/// ```
+pub fn value_at(in v: Values, take i: Int) -> String {
+    std::string::from_str(std::string::as_str(std::array::get(v.values, i)))
+}
+
+/// The value of `key`, if the file set one.
+///
+/// # Example
+/// ```tuo
+/// let url = dotenv::parse::get(v, "DATABASE_URL");
+/// ```
+pub fn get(in v: Values, in key: Str) -> Option[String] {
+    let k = index_in(v.keys, key);
+    if k < 0 || std::array::get(v.has_value, k) == 0 {
+        return None;
+    }
+    Some { value: value_at(v, k) }
+}
+
+/// The values as `[["KEY","value"],["BARE",null]]` — `dotenv_values`'
+/// items in JSON, which is how the fixture records them.
+///
+/// # Example
+/// ```tuo
+/// let j = dotenv::parse::to_json(v);
+/// ```
+pub fn to_json(in v: Values) -> String {
+    var out = std::string::from_str("[");
+    var i = 0;
+    while i < count(v) {
+        if i > 0 {
+            std::string::push_byte(out, 44);
+        }
+        std::string::push_byte(out, 91);
+        web::json::push_string(out, std::string::as_str(std::array::get(v.keys, i)));
+        std::string::push_byte(out, 44);
+        if has_value_at(v, i) {
+            web::json::push_string(out, std::string::as_str(std::array::get(v.values, i)));
+        } else {
+            std::string::append(out, "null");
+        }
+        std::string::push_byte(out, 93);
+        i = i + 1;
+    }
+    std::string::push_byte(out, 93);
+    out
+}
+
+fn json_of(in text: Str) -> String {
+    to_json(values(text, environ(), true))
+}
+
+fn json_is(in text: Str, in expected: Str) -> Bool {
+    std::string::as_str(json_of(text)) == expected
+}
+
+fn lines_of(in text: Str) -> String {
+    let lines = error_lines(bindings(text));
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::array::len(lines) {
+        if i > 0 {
+            std::string::push_byte(out, 44);
+        }
+        web::json::push_int(out, std::array::get(lines, i));
+        i = i + 1;
+    }
+    out
+}
+
+fn lines_are(in text: Str, in expected: Str) -> Bool {
+    std::string::as_str(lines_of(text)) == expected
+}
+
+spec space_len {
+    then space_len(" ", 0) == 1;
+    then space_len("\u{1f}", 0) == 1;
+    then space_len("\u{a0}", 0) == 2;
+    then space_len("\u{85}", 0) == 2;
+    then space_len("\u{e9}", 0) == 0;
+    then space_len("\u{2003}", 0) == 3;
+    then space_len("\u{3000}", 0) == 3;
+    then space_len("\u{2010}", 0) == 0;
+    then blank_len("\n", 0) == 0;
+    then blank_len("\t", 0) == 1;
+}
+
+spec breaks {
+    then breaks("a\r\nb\nc\rd", 0, 8) == 3;
+    then breaks("\r", 0, 1) == 1;
+    then breaks("\r\n", 0, 1) == 1;
+    then breaks("x", 0, 1) == 0;
+}
+
+spec bindings {
+    then json_is("A=1\nB=two words\nC=trailing   \n", "[[\"A\",\"1\"],[\"B\",\"two words\"],[\"C\",\"trailing\"]]");
+    then json_is("export A=1\nexportC=3\n", "[[\"A\",\"1\"],[\"exportC\",\"3\"]]");
+    then json_is("A=1 # c\nB=1#c\nC= #c\n", "[[\"A\",\"1\"],[\"B\",\"1#c\"],[\"C\",\"#c\"]]");
+    then json_is("A='a\\'b'\nB=\"x\\ty\\q\"\n", "[[\"A\",\"a'b\"],[\"B\",\"x\\ty\\\\q\"]]");
+    then json_is("A\nB=\nC # c\n", "[[\"A\",null],[\"B\",\"\"],[\"C\",null]]");
+    then json_is("A=\"x\ny\"\n", "[[\"A\",\"x\\ny\"]]");
+    then json_is("\u{feff}A=1", "[[\"A\",\"1\"]]");
+    then json_is("A=1\nA=2\nB=3\nA=4\n", "[[\"A\",\"4\"],[\"B\",\"3\"]]");
+    then json_is("", "[]");
+}
+
+spec error_lines {
+    then lines_are("A=1\nB='open", "2");
+    then lines_are("A=1\n\n\n  B='x\nC=2\n", "2");
+    then lines_are("=x\n'bad\nC=\"x\" y\n", "1,2,3");
+    then lines_are("A=1\n", "");
+}
+
+spec values {
+    then json_is("A=a\nB=${A}-${NONE:-d}-${NONE}\n", "[[\"A\",\"a\"],[\"B\",\"a-d-\"]]");
+    then json_is("A='${X:-q}'\nB=$A\nC=${A\n", "[[\"A\",\"q\"],[\"B\",\"$A\"],[\"C\",\"${A\"]]");
+    then json_is("N\nA=${N:-d}\n", "[[\"N\",null],[\"A\",\"\"]]");
+    then json_is("X=${Y}\nY=y\nZ=${Y}\n", "[[\"X\",\"\"],[\"Y\",\"y\"],[\"Z\",\"y\"]]");
+    var e = environ();
+    set(e, "HOME", "/h");
+    set(e, "A", "env");
+    then std::string::as_str(to_json(values("A=file\nB=${HOME}${A}\n", e, true))) == "[[\"A\",\"file\"],[\"B\",\"/hfile\"]]";
+    then std::string::as_str(to_json(values("B=${HOME}\n", e, false))) == "[[\"B\",\"${HOME}\"]]";
+    let parsed = environ_from_lines("A=1\nnoeq\nB=x=y\n");
+    then std::array::len(parsed.names) == 2;
+    then std::string::as_str(std::array::get(parsed.values, 1)) == "x=y";
+}

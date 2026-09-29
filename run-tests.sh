@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # run-tests.sh — the validation suite for tuonelang-python-tools.
 #
-#   ./run-tests.sh          front end, specs, formatting, the native Argon2
-#                           and X.509 oracles, and the HTTP, web, and TLS
+#   ./run-tests.sh          front end, specs, formatting, the native Argon2,
+#                           X.509, and settings oracles, and the HTTP, web, and TLS
 #                           loopback oracles (no network)
 #   ./run-tests.sh --live   also resolve real names against a public DNS
 #                           server, fetch from public HTTP servers, complete
@@ -99,6 +99,10 @@ JINJA_SRC=(src/jinja/escape.tuo src/jinja/context.tuo src/jinja/lexer.tuo src/ji
            src/jinja/filters.tuo src/jinja/template.tuo src/jinja/fixture.tuo src/jinja/demo.tuo
            src/web/json.tuo src/web/coerce.tuo src/std_str.tuo)
 
+SETTINGS_SRC=(src/dotenv/parse.tuo src/dotenv/fixture.tuo src/dotenv/demo.tuo
+              src/settings/schema.tuo src/settings/load.tuo src/settings/fixture.tuo src/settings/demo.tuo
+              src/web/json.tuo src/web/coerce.tuo src/web/errors.tuo src/std_fs.tuo src/std_str.tuo)
+
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
 check() { if [ "$1" -eq 0 ]; then echo "PASS $2"; else echo "FAIL $2"; failed=1; fi }
@@ -172,11 +176,17 @@ step "Jinja: front end (check)"
 step "Jinja: specs (verify), all 100 captured renders reproduced"
 "$TUO" verify "${JINJA_SRC[@]}"; check $? "jinja verify"
 
+step "Dotenv and settings: front end (check)"
+"$TUO" check "${SETTINGS_SRC[@]}" examples/settings.tuo; check $? "settings check"
+
+step "Dotenv and settings: specs (verify), all 29 .env texts and 33 Settings() reproduced"
+"$TUO" verify "${SETTINGS_SRC[@]}"; check $? "settings verify"
+
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
 # to `crates/tuo-stdlib/src/std/` — and src/pg, src/db are tuonelang-db's.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo src/jinja/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo src/jinja/*.tuo src/dotenv/*.tuo src/settings/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.
@@ -202,6 +212,17 @@ if [ "$rc" -eq 0 ]; then
 else
   echo "x509 oracle exited $rc — that many checks disagreed"
   check 1 "x509 oracle"
+fi
+
+# Every dotenv and settings case in one native run, and a .env read from disk.
+step "Settings: native oracle (every case, and load_path on a real file)"
+"$TUO" run examples/settings.tuo "${SETTINGS_SRC[@]}"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  check 0 "settings oracle (all checks agreed)"
+else
+  echo "settings oracle exited $rc — that many checks disagreed"
+  check 1 "settings oracle"
 fi
 
 # The HTTP server and client prove each other over loopback, in one process.

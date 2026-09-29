@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Twelve ports so far:
+Fourteen ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -19,12 +19,15 @@ Twelve ports so far:
 | **`s3`** — SigV4 signing, the seven S3 calls the backend makes, presigned URLs, CRC-32 checksums | `boto3` (the R2 half) | 15 specs, 22 requests captured from boto3 1.43 reproduced byte for byte, and a 35-check live oracle against MinIO |
 | **`log`** — `logging`'s records, levels, `%`-formatting, and the backend's two line formats | `logging` (as `app/main.py` configures it) | 4 specs, 7 records formatted as CPython 3.14 formats them |
 | **`sentry`** — DSNs, scope with breadcrumbs and tags, message and error events, the envelope, the logging integration | `sentry-sdk` | 6 specs, 7 envelopes serialized by sentry-sdk 2.69 reproduced byte for byte, and a 12-check loopback oracle |
+| **`dotenv`** — `.env` files read as python-dotenv reads them: quoting, escapes, `export`, comments, broken statements and the lines they are reported on, `${VAR:-default}` | `python-dotenv` | 6 specs, and 29 `.env` texts — among them the backend's three example files — read as python-dotenv 1.2.3 read them |
+| **`settings`** — a `BaseSettings` class as data, bound to the environment and a `.env` file: aliases, `AliasChoices`, JSON lists, lax conversion, forbidden extras | `pydantic-settings` | 4 specs, and 33 instantiations of the backend's own 93-field `Settings` by pydantic-settings 2.15 reproduced byte for byte — dumps, errors, and messages |
 | **`jinja`** — the template engine: inheritance, `if`/`elif`/`else`, expressions with filters, autoescaping with `Markup`, Jinja's whitespace rules | `jinja2`, `markupsafe` | 9 specs, and 100 renders of the backend's 30 email templates by Jinja2 3.1.6 reproduced byte for byte |
 | **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
 
 ```bash
-./run-tests.sh          # front end, the specs, formatting, the native Argon2 and X.509
-                        # oracles, and the HTTP, web, and TLS loopback oracles (no network)
+./run-tests.sh          # front end, the specs, formatting, the native Argon2, X.509, and
+                        # settings oracles, and the HTTP, web, and TLS loopback oracles
+                        # (no network)
 ./run-tests.sh --live   # also resolve real names over UDP, fetch from public HTTP servers,
                         # complete TLS 1.3 handshakes with three openssl s_server instances,
                         # fetch https:// from Stripe, Sentry, and Cloudflare, and drive the
@@ -340,6 +343,122 @@ CAs; adding one is one base64 line. And the catalog's own caveat carries
 over: `std::bignum` is variable-time, so the client's X25519 step leaks
 timing on its ephemeral key. Signature *verification* is variable-time
 by design, and there is no signing function in `ec` or `rsa` at all.
+
+---
+
+## `dotenv` and `settings` — configuration
+
+The backend's configuration is one pydantic-settings class, `Settings`:
+93 fields, each read from the environment or from `.env`, some under an
+alias or a choice of two, three of them JSON lists. These ports are the
+two libraries under it — python-dotenv's parser, and pydantic-settings'
+sources and binding — with the class itself left as data: the oracle
+reads its declaration out of `model_fields`, so nothing of the
+application is written out by hand.
+
+```tuo
+var s = settings::schema::new();
+settings::schema::field(s, "debug", settings::schema::kind_bool(), false, "true");
+settings::schema::field(s, "secret_key", settings::schema::kind_str(), false, "\"change-me\"");
+settings::schema::alias(s, "SECRET_KEY");
+settings::schema::alias(s, "JWT_SECRET");
+var env = dotenv::parse::environ();
+dotenv::parse::set(env, "DEBUG", "no");
+let loaded = settings::load::load_path(s, env, ".env");
+if settings::load::ok(loaded) {
+    let debug = settings::load::flag(loaded, "debug");
+}
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `dotenv::parse` — python-dotenv's grammar as scans: `export`, bare and single-quoted keys, the three kinds of value and their escapes, comments, CR/LF/CRLF, the BOM, Python's Unicode `\s`; broken statements skipped and reported by line; `dotenv_values` with `${NAME}` and `${NAME:-default}` | ✅ 29 of 29 captured texts read alike |
+| `settings::schema` — fields with kinds, `Optional`, JSON defaults, a validation alias or `AliasChoices` | ✅ proven |
+| `settings::load` — the environment, then the file, by lowercased name and alias; JSON for list fields and the `SettingsError` when it is not; Pydantic's lax conversions; extras from the file forbidden; `load_path` for a file on disk | ✅ 33 of 33 captured instantiations reproduced |
+
+### The oracle is the backend's own `Settings`
+
+`examples/settings_oracle.py` gives python-dotenv 1.2.3 a corpus of
+hostile `.env` texts and the backend's three tracked example files, and
+records `dotenv_values` and the lines it warns about. Then it
+instantiates the backend's `Settings` 33 times, each time with the
+process environment replaced wholesale and, for most cases, a `.env`
+file. For each one it records the `model_dump`, the validation errors
+as FastAPI renders them, or the `SettingsError` message. It imports
+`app.config` from an empty directory with an empty environment, so the
+developer's own `.env`, which holds secrets, is never read.
+
+```bash
+../shallowflaws/.venv/bin/python examples/settings_oracle.py   # writes examples/settings_oracle.json
+python3 examples/settings_fixture.py && tuo fmt src/dotenv/fixture.tuo src/settings/fixture.tuo
+```
+
+The specs replay every case three at a time, within the sandbox's fuel.
+`examples/settings.tuo` replays them all natively, then reads
+`examples/settings-test/production.env` from disk through `load_path`.
+
+### What the specs pin that a comment cannot
+
+**A quoted value runs to its closing quote, across lines.** An
+unterminated `A="…` takes everything up to the next `"` in the file, so
+one bad line can swallow the rest of the file. The parser has to be
+equally greedy to lose the same keys. The warning then names the line
+where the *previous* statement ended, which is where python-dotenv sets
+its mark.
+
+**`${…}` is expanded even inside single quotes.** The file's own values
+win over the environment. A key with no `=` expands to nothing, not to
+its `:-` default. `$NAME`, `${A:=b}` and an unclosed `${` are left as
+written.
+
+**The environment wins, whichever alias it used.** With
+`AliasChoices("SECRET_KEY", "JWT_SECRET")`, `JWT_SECRET` in the
+environment beats `SECRET_KEY` in the file. The error `loc` is the first
+alias as declared (`SMTP_PORT`), or the field's name (`debug`).
+
+**`SettingsError` comes before validation.** A list field whose text is
+not JSON (`CORS_ORIGINS=https://a`, or empty) stops the load with the
+field and the source named. The file's bad JSON stops it even when the
+environment already supplied that field.
+
+**Only the file can have extras.** `BaseSettings` forbids them, and
+pydantic-settings adds every non-empty `.env` key that no field is read
+from. So `R2_ENDPOINT_OVERRIDE`, the field's *name* behind its alias
+`R2_ENDPOINT_URL`, is an error in `.env` and silently ignored in the
+environment.
+
+### A finding in the backend
+
+All three of the backend's tracked example files, `.env.example`,
+`.env.analysis.example` and `.env.crawler.example`, set `CELERY_QUEUES`,
+`CELERY_CONCURRENCY` and `CELERY_HOSTNAME`. `Settings` declares none of
+them, so copying any example to `.env` makes `Settings()` fail with
+three `extra_forbidden` errors before the app starts. The fixture
+records this for all three. The live `.env` files don't set those keys,
+which is why nothing is broken today. `scripts/worker-entrypoint.sh`
+reads them from the process environment, where pydantic-settings
+ignores extras, so they belong in the worker's environment rather than
+in `.env`. `example_cloud_fixed` is `.env.example` with those three
+lines moved to the environment, and it loads. This repo does not change
+the backend; the fix is one line in `model_config`
+(`extra="ignore"`) or three lines moved out of the examples.
+
+### What is deliberately not here
+
+The process environment is an argument. tuonelang's runtime has no
+`getenv` ([docs/RUNTIME-FINDING-2.md](docs/RUNTIME-FINDING-2.md)), so
+callers pass it as data: pairs, or `NAME=value` lines via
+`dotenv::parse::environ_from_lines`. Also missing: required fields,
+nested models and `env_nested_delimiter`, `env_prefix`,
+`case_sensitive=True`, secrets directories, `env_parse_none_str`, and
+enums, none of which the backend's class uses. Names are lowercased in
+ASCII only. Floats follow `web::coerce`: `nan` and `inf` are refused,
+and the printed text is the input's digits tidied up rather than
+CPython's `repr`, which could differ past fifteen significant digits.
+The `Settings` properties that build URLs (`database_url_complete` and
+the like) are application code and stay in Python.
 
 ---
 
@@ -1100,6 +1219,18 @@ src/jinja/demo.tuo       the same 100, rendered here
 examples/jinja_oracle.py     the backend's email functions, recorded
 examples/jinja_fixture.py    jinja_oracle.json to src/jinja/fixture.tuo
 
+src/dotenv/parse.tuo     python-dotenv's grammar; dotenv_values with ${…}
+src/dotenv/fixture.tuo   29 .env texts as python-dotenv read them (generated)
+src/dotenv/demo.tuo      the same 29, read here
+src/settings/schema.tuo  a BaseSettings class as data: kinds, defaults, aliases
+src/settings/load.tuo    the sources, lax binding, extras; load_path
+src/settings/fixture.tuo the backend's 93 fields and 33 instantiations (generated)
+src/settings/demo.tuo    the same 33, loaded here
+examples/settings.tuo    the native oracle: every case, and a .env read from disk
+examples/settings-test/  the .env that oracle reads
+examples/settings_oracle.py  python-dotenv and the backend's Settings, recorded
+examples/settings_fixture.py settings_oracle.json to the two fixtures
+
 src/log/record.tuo       records, levels, getMessage, params as JSON
 src/log/format.tuo       asctime and the two line formats
 src/log/logger.tuo       the root threshold, emit to a descriptor, a journal
@@ -1172,12 +1303,14 @@ docs/COMPILER-FINDING.md the && / || temporary native codegen refused (fixed ups
 docs/COMPILER-FINDING-2.md a local shadowing a module path drops the function silently
 
 docs/RUNTIME-FINDING.md  the udp_bind finding, and its resolution
+docs/RUNTIME-FINDING-2.md there is no getenv; the environment is an argument
 ```
 
 `src/std_bits.tuo`, `src/std_str.tuo`, `src/std_net.tuo`, `src/std_crypto.tuo`,
 `src/std_ct.tuo`, `src/std_sync.tuo`, and — for the TLS client — `std_tls`,
 `std_hkdf`, `std_chacha`, `std_x25519`, `std_ed25519`, `std_der`,
-`std_sha512`, and `std_bignum` are **verbatim copies** of the catalog modules in
+`std_sha512`, and `std_bignum`, and — for `settings::load::load_path` —
+`std_fs` are **verbatim copies** of the catalog modules in
 `crates/tuo-stdlib/src/std/`, vendored because v0 has no registry and passed
 as compiler inputs — exactly as `examples/postgres-auth` documents. They are
 byte-identical; edit the catalog, not these, and they are excluded from

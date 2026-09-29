@@ -1,0 +1,137 @@
+// settings::demo — the backend's `Settings`, instantiated again.
+//
+// `examples/settings_oracle.py` reads the declaration of every field of
+// the backend's `Settings` from `model_fields` and instantiates it under
+// 33 environments and `.env` files. `schema` declares the same fields from
+// the fixture, `load` binds each case, and the spec holds the outcome and
+// the output — the dump, the errors, or the message — to byte equality.
+
+module settings::demo;
+
+/// The backend's `Settings`, declared from the fixture.
+///
+/// # Example
+/// ```tuo
+/// let s = settings::demo::schema();
+/// ```
+pub fn schema() -> settings::schema::Schema {
+    var s = settings::schema::new();
+    var i = 0;
+    while i < settings::fixture::field_count() {
+        let kind = settings::schema::kind_named(settings::fixture::field_kind(i));
+        settings::schema::field(s, settings::fixture::field_name(i), kind, settings::fixture::field_optional(i), settings::fixture::field_default(i));
+        let aliases = settings::fixture::field_aliases(i);
+        if std::str::len(aliases) > 0 {
+            let parts = std::str::split(aliases, "\n");
+            var k = 0;
+            while k < std::array::len(parts) {
+                settings::schema::alias(s, std::string::as_str(std::array::get(parts, k)));
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+    s
+}
+
+/// The environment of case `i`.
+///
+/// # Example
+/// ```tuo
+/// let e = settings::demo::environ(0);
+/// ```
+pub fn environ(take i: Int) -> dotenv::parse::Environ {
+    var e = dotenv::parse::environ();
+    let d = web::json::parse(settings::fixture::env(i));
+    var pair = web::json::first_child(d, web::json::root(d));
+    while pair >= 0 {
+        let name = web::json::text_of(d, web::json::child_at(d, pair, 0));
+        let value = web::json::text_of(d, web::json::child_at(d, pair, 1));
+        dotenv::parse::set(e, std::string::as_str(name), std::string::as_str(value));
+        pair = web::json::next_sibling(d, pair);
+    }
+    e
+}
+
+/// Case `i`, loaded.
+///
+/// # Example
+/// ```tuo
+/// let l = settings::demo::load(0);
+/// ```
+pub fn load(take i: Int) -> settings::load::Settings {
+    settings::load::load(schema(), environ(i), settings::fixture::dotenv(i), settings::fixture::has_dotenv(i))
+}
+
+/// What case `i` produced, in the fixture's terms: its outcome and output.
+///
+/// # Example
+/// ```tuo
+/// let out = settings::demo::output(0);
+/// ```
+pub fn output(take i: Int) -> String {
+    let l = load(i);
+    if settings::load::ok(l) {
+        return settings::load::dump(l);
+    }
+    settings::load::problem(l)
+}
+
+fn outcome_name(in l: settings::load::Settings) -> Str {
+    if l.outcome == settings::load::outcome_ok() {
+        "ok"
+    } else if l.outcome == settings::load::outcome_invalid() {
+        "invalid"
+    } else {
+        "error"
+    }
+}
+
+/// Does case `i` come out as it did from pydantic-settings?
+///
+/// # Example
+/// ```tuo
+/// let same = settings::demo::agrees(0);
+/// ```
+pub fn agrees(take i: Int) -> Bool {
+    let l = load(i);
+    let out = if settings::load::ok(l) {
+        settings::load::dump(l)
+    } else {
+        settings::load::problem(l)
+    };
+    outcome_name(l) == settings::fixture::outcome(i) && std::string::as_str(out) == settings::fixture::output(i)
+}
+
+/// The first case in `[from, to)` that differs, or -1.
+///
+/// # Example
+/// ```tuo
+/// let bad = settings::demo::first_disagreement(0, settings::fixture::count());
+/// ```
+pub fn first_disagreement(take from: Int, take to: Int) -> Int {
+    var i = from;
+    while i < to {
+        if !agrees(i) {
+            return i;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+spec "every captured instantiation is reproduced" {
+    then settings::fixture::count() == 33;
+    then settings::fixture::field_count() == 93;
+    then first_disagreement(0, 3) == -1;
+    then first_disagreement(3, 6) == -1;
+    then first_disagreement(6, 9) == -1;
+    then first_disagreement(9, 12) == -1;
+    then first_disagreement(12, 15) == -1;
+    then first_disagreement(15, 18) == -1;
+    then first_disagreement(18, 21) == -1;
+    then first_disagreement(21, 24) == -1;
+    then first_disagreement(24, 27) == -1;
+    then first_disagreement(27, 30) == -1;
+    then first_disagreement(30, 33) == -1;
+}

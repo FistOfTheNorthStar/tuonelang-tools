@@ -1,0 +1,81 @@
+// examples/settings — the dotenv and settings fixtures replayed natively,
+// and a `.env` file read from disk.
+//
+// The specs replay the same cases a few at a time, because binding the
+// backend's 93 fields is a good share of the sandbox's instruction fuel.
+// This program replays all of them in one go and prints what differs,
+// then loads examples/settings-test/production.env through
+// `settings::load::load_path` — the one effectful door — with an
+// environment given as data, since the runtime has no `getenv`.
+//
+//     tuo run examples/settings.tuo src/settings/*.tuo src/dotenv/*.tuo src/web/json.tuo src/web/coerce.tuo src/web/errors.tuo src/std_fs.tuo src/std_str.tuo
+//
+// No network. One line per check; exit is the failure count.
+
+module settings_check;
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn show(in label: Str, in text: Str) {
+    var line = std::string::from_str("      ");
+    std::str::push(line, label);
+    std::str::push(line, ": ");
+    std::str::push(line, text);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+}
+
+fn main() -> Int {
+    var failed = 0;
+    var i = 0;
+    while i < dotenv::fixture::count() {
+        var label = std::string::from_str("dotenv ");
+        std::str::push(label, dotenv::fixture::name(i));
+        failed = failed + report(std::string::as_str(label), dotenv::demo::agrees(i));
+        i = i + 1;
+    }
+    let s = settings::demo::schema();
+    i = 0;
+    while i < settings::fixture::count() {
+        var label = std::string::from_str("settings ");
+        std::str::push(label, settings::fixture::name(i));
+        let same = settings::demo::agrees(i);
+        failed = failed + report(std::string::as_str(label), same);
+        if !same {
+            show("got ", std::string::as_str(settings::demo::output(i)));
+            show("want", settings::fixture::output(i));
+        }
+        i = i + 1;
+    }
+
+    var env = dotenv::parse::environ();
+    dotenv::parse::set(env, "DOMAIN", "rekryon.example");
+    dotenv::parse::set(env, "Smtp_Port", "2525");
+    let l = settings::load::load_path(s, env, "examples/settings-test/production.env");
+    failed = failed + report("production.env loads", settings::load::ok(l));
+    failed = failed + report("  ENVIRONMENT from the file", std::string::as_str(settings::load::text(l, "environment")) == "production");
+    failed = failed + report("  DEBUG=false", !settings::load::flag(l, "debug"));
+    failed = failed + report("  ${DOMAIN} expanded from the environment", std::string::as_str(settings::load::text(l, "frontend_url")) == "https://rekryon.example");
+    failed = failed + report("  CORS_ORIGINS decoded as JSON", settings::load::item_count(l, "cors_origins") == 2 && std::string::as_str(settings::load::item(l, "cors_origins", 1)) == "https://www.rekryon.example");
+    failed = failed + report("  the environment beats the file (Smtp_Port)", settings::load::int(l, "smtp_port") == 2525);
+    failed = failed + report("  PROXY_FALLBACK_STATUSES", std::string::as_str(settings::load::json_of(l, "proxy_fallback_statuses")) == "[403,429]");
+    failed = failed + report("  unset Optional is None", settings::load::is_none(l, "sentry_dsn"));
+    let missing = settings::load::load_path(s, dotenv::parse::environ(), "examples/settings-test/absent.env");
+    failed = failed + report("a missing .env is no .env", settings::load::ok(missing) && std::string::as_str(settings::load::text(missing, "environment")) == "development");
+    failed
+}
