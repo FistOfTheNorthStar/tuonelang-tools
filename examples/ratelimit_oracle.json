@@ -1,0 +1,4720 @@
+{
+ "versions": {
+  "limits": "5.8.0",
+  "slowapi": "0.1.10",
+  "redis-py": "6.4.0",
+  "redis-server": "8.0.2",
+  "python": "3.14.7"
+ },
+ "t0": 1790000000000,
+ "parse": [
+  {
+   "text": "5/minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "3/hour",
+   "ok": true,
+   "items": [
+    {
+     "amount": 3,
+     "multiples": 1,
+     "granularity": "hour",
+     "repr": "3 per 1 hour",
+     "expiry": 3600,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/3/1/hour"
+    }
+   ]
+  },
+  {
+   "text": "30/minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 30,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "30 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/30/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "5/hour",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "hour",
+     "repr": "5 per 1 hour",
+     "expiry": 3600,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/hour"
+    }
+   ]
+  },
+  {
+   "text": "1/second",
+   "ok": true,
+   "items": [
+    {
+     "amount": 1,
+     "multiples": 1,
+     "granularity": "second",
+     "repr": "1 per 1 second",
+     "expiry": 1,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/1/1/second"
+    }
+   ]
+  },
+  {
+   "text": "2/seconds",
+   "ok": true,
+   "items": [
+    {
+     "amount": 2,
+     "multiples": 1,
+     "granularity": "second",
+     "repr": "2 per 1 second",
+     "expiry": 1,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/2/1/second"
+    }
+   ]
+  },
+  {
+   "text": "10/day",
+   "ok": true,
+   "items": [
+    {
+     "amount": 10,
+     "multiples": 1,
+     "granularity": "day",
+     "repr": "10 per 1 day",
+     "expiry": 86400,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/10/1/day"
+    }
+   ]
+  },
+  {
+   "text": "10/days",
+   "ok": true,
+   "items": [
+    {
+     "amount": 10,
+     "multiples": 1,
+     "granularity": "day",
+     "repr": "10 per 1 day",
+     "expiry": 86400,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/10/1/day"
+    }
+   ]
+  },
+  {
+   "text": "1/month",
+   "ok": true,
+   "items": [
+    {
+     "amount": 1,
+     "multiples": 1,
+     "granularity": "month",
+     "repr": "1 per 1 month",
+     "expiry": 2592000,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/1/1/month"
+    }
+   ]
+  },
+  {
+   "text": "12/months",
+   "ok": true,
+   "items": [
+    {
+     "amount": 12,
+     "multiples": 1,
+     "granularity": "month",
+     "repr": "12 per 1 month",
+     "expiry": 2592000,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/12/1/month"
+    }
+   ]
+  },
+  {
+   "text": "1/year",
+   "ok": true,
+   "items": [
+    {
+     "amount": 1,
+     "multiples": 1,
+     "granularity": "year",
+     "repr": "1 per 1 year",
+     "expiry": 31104000,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/1/1/year"
+    }
+   ]
+  },
+  {
+   "text": "2/years",
+   "ok": true,
+   "items": [
+    {
+     "amount": 2,
+     "multiples": 1,
+     "granularity": "year",
+     "repr": "2 per 1 year",
+     "expiry": 31104000,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/2/1/year"
+    }
+   ]
+  },
+  {
+   "text": "7/Minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 7,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "7 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/7/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "7/HOURS",
+   "ok": true,
+   "items": [
+    {
+     "amount": 7,
+     "multiples": 1,
+     "granularity": "hour",
+     "repr": "7 per 1 hour",
+     "expiry": 3600,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/7/1/hour"
+    }
+   ]
+  },
+  {
+   "text": "7 PER DAY",
+   "ok": true,
+   "items": [
+    {
+     "amount": 7,
+     "multiples": 1,
+     "granularity": "day",
+     "repr": "7 per 1 day",
+     "expiry": 86400,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/7/1/day"
+    }
+   ]
+  },
+  {
+   "text": "10 per hour",
+   "ok": true,
+   "items": [
+    {
+     "amount": 10,
+     "multiples": 1,
+     "granularity": "hour",
+     "repr": "10 per 1 hour",
+     "expiry": 3600,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/10/1/hour"
+    }
+   ]
+  },
+  {
+   "text": "10per hour",
+   "ok": true,
+   "items": [
+    {
+     "amount": 10,
+     "multiples": 1,
+     "granularity": "hour",
+     "repr": "10 per 1 hour",
+     "expiry": 3600,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/10/1/hour"
+    }
+   ]
+  },
+  {
+   "text": "10perhour",
+   "ok": true,
+   "items": [
+    {
+     "amount": 10,
+     "multiples": 1,
+     "granularity": "hour",
+     "repr": "10 per 1 hour",
+     "expiry": 3600,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/10/1/hour"
+    }
+   ]
+  },
+  {
+   "text": "2/3 minutes",
+   "ok": true,
+   "items": [
+    {
+     "amount": 2,
+     "multiples": 3,
+     "granularity": "minute",
+     "repr": "2 per 3 minute",
+     "expiry": 180,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/2/3/minute"
+    }
+   ]
+  },
+  {
+   "text": "5 per 2 hours",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 2,
+     "granularity": "hour",
+     "repr": "5 per 2 hour",
+     "expiry": 7200,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/2/hour"
+    }
+   ]
+  },
+  {
+   "text": "1 per 10seconds",
+   "ok": true,
+   "items": [
+    {
+     "amount": 1,
+     "multiples": 10,
+     "granularity": "second",
+     "repr": "1 per 10 second",
+     "expiry": 10,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/1/10/second"
+    }
+   ]
+  },
+  {
+   "text": "05/minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "5/007 minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 7,
+     "granularity": "minute",
+     "repr": "5 per 7 minute",
+     "expiry": 420,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/7/minute"
+    }
+   ]
+  },
+  {
+   "text": "5/0 minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "0/minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 0,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "0 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/0/1/minute"
+    }
+   ]
+  },
+  {
+   "text": " 5/minute ",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "5 / minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "5\t/\tminute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "5/minute\n",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "\n5/minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "5 per minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "5/minute　",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "1/second; 5/minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 1,
+     "multiples": 1,
+     "granularity": "second",
+     "repr": "1 per 1 second",
+     "expiry": 1,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/1/1/second"
+    },
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "1/second;5/minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 1,
+     "multiples": 1,
+     "granularity": "second",
+     "repr": "1 per 1 second",
+     "expiry": 1,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/1/1/second"
+    },
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "1 per day, 2 per month, 3/year",
+   "ok": true,
+   "items": [
+    {
+     "amount": 1,
+     "multiples": 1,
+     "granularity": "day",
+     "repr": "1 per 1 day",
+     "expiry": 86400,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/1/1/day"
+    },
+    {
+     "amount": 2,
+     "multiples": 1,
+     "granularity": "month",
+     "repr": "2 per 1 month",
+     "expiry": 2592000,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/2/1/month"
+    },
+    {
+     "amount": 3,
+     "multiples": 1,
+     "granularity": "year",
+     "repr": "3 per 1 year",
+     "expiry": 31104000,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/3/1/year"
+    }
+   ]
+  },
+  {
+   "text": "1/second|2/minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 1,
+     "multiples": 1,
+     "granularity": "second",
+     "repr": "1 per 1 second",
+     "expiry": 1,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/1/1/second"
+    },
+    {
+     "amount": 2,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "2 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/2/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "5/minute:;10/hour",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    },
+    {
+     "amount": 10,
+     "multiples": 1,
+     "granularity": "hour",
+     "repr": "10 per 1 hour",
+     "expiry": 3600,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/10/1/hour"
+    }
+   ]
+  },
+  {
+   "text": "5/minute :,10/hour",
+   "ok": true,
+   "items": [
+    {
+     "amount": 5,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "5 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute"
+    },
+    {
+     "amount": 10,
+     "multiples": 1,
+     "granularity": "hour",
+     "repr": "10 per 1 hour",
+     "expiry": 3600,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/10/1/hour"
+    }
+   ]
+  },
+  {
+   "text": "2/second;4/minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 2,
+     "multiples": 1,
+     "granularity": "second",
+     "repr": "2 per 1 second",
+     "expiry": 1,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/2/1/second"
+    },
+    {
+     "amount": 4,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "4 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/4/1/minute"
+    }
+   ]
+  },
+  {
+   "text": "3/hour; 3/hour",
+   "ok": true,
+   "items": [
+    {
+     "amount": 3,
+     "multiples": 1,
+     "granularity": "hour",
+     "repr": "3 per 1 hour",
+     "expiry": 3600,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/3/1/hour"
+    },
+    {
+     "amount": 3,
+     "multiples": 1,
+     "granularity": "hour",
+     "repr": "3 per 1 hour",
+     "expiry": 3600,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/3/1/hour"
+    }
+   ]
+  },
+  {
+   "text": "",
+   "ok": false,
+   "error": "couldn't parse rate limit string ''"
+  },
+  {
+   "text": "abc",
+   "ok": false,
+   "error": "couldn't parse rate limit string 'abc'"
+  },
+  {
+   "text": "5",
+   "ok": false,
+   "error": "couldn't parse rate limit string '5'"
+  },
+  {
+   "text": "5/",
+   "ok": false,
+   "error": "couldn't parse rate limit string '5/'"
+  },
+  {
+   "text": "/minute",
+   "ok": false,
+   "error": "couldn't parse rate limit string '/minute'"
+  },
+  {
+   "text": "minute",
+   "ok": false,
+   "error": "couldn't parse rate limit string 'minute'"
+  },
+  {
+   "text": "5/minute,",
+   "ok": false,
+   "error": "couldn't parse rate limit string '5/minute,'"
+  },
+  {
+   "text": ";5/minute",
+   "ok": false,
+   "error": "couldn't parse rate limit string ';5/minute'"
+  },
+  {
+   "text": "5/minute;;10/hour",
+   "ok": false,
+   "error": "couldn't parse rate limit string '5/minute;;10/hour'"
+  },
+  {
+   "text": "5/min",
+   "ok": false,
+   "error": "no granularity matched for min"
+  },
+  {
+   "text": "5/s",
+   "ok": false,
+   "error": "no granularity matched for s"
+  },
+  {
+   "text": "5/fortnight",
+   "ok": false,
+   "error": "no granularity matched for fortnight"
+  },
+  {
+   "text": "5 minute",
+   "ok": false,
+   "error": "couldn't parse rate limit string '5 minute'"
+  },
+  {
+   "text": "5/-1 minute",
+   "ok": false,
+   "error": "couldn't parse rate limit string '5/-1 minute'"
+  },
+  {
+   "text": "-5/minute",
+   "ok": false,
+   "error": "couldn't parse rate limit string '-5/minute'"
+  },
+  {
+   "text": "5.5/minute",
+   "ok": false,
+   "error": "couldn't parse rate limit string '5.5/minute'"
+  },
+  {
+   "text": "5/minute 10/hour",
+   "ok": false,
+   "error": "couldn't parse rate limit string '5/minute 10/hour'"
+  },
+  {
+   "text": "5/ſecond",
+   "ok": false,
+   "error": "no granularity matched for ſecond"
+  },
+  {
+   "text": "5/mİnute",
+   "ok": false,
+   "error": "no granularity matched for mİnute"
+  },
+  {
+   "text": "5/K",
+   "ok": false,
+   "error": "no granularity matched for K"
+  },
+  {
+   "text": "5/minute:",
+   "ok": false,
+   "error": "couldn't parse rate limit string '5/minute:'"
+  },
+  {
+   "text": "5/minutes:",
+   "ok": false,
+   "error": "couldn't parse rate limit string '5/minutes:'"
+  },
+  {
+   "text": "1234567890123456789/minute",
+   "ok": true,
+   "items": [
+    {
+     "amount": 1234567890123456789,
+     "multiples": 1,
+     "granularity": "minute",
+     "repr": "1234567890123456789 per 1 minute",
+     "expiry": 60,
+     "key": "LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/1234567890123456789/1/minute"
+    }
+   ]
+  }
+ ],
+ "memory": [
+  {
+   "name": "login_5_per_minute",
+   "ops": [
+    {
+     "op": "hit",
+     "at": 1790000000250,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1790000001000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1790000002500,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "stats",
+     "at": 1790000002500,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000060250,
+      2
+     ]
+    },
+    {
+     "op": "hit",
+     "at": 1790000003000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1790000004000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "test",
+     "at": 1790000004000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "hit",
+     "at": 1790000005000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "stats",
+     "at": 1790000005000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000060250,
+      0
+     ]
+    },
+    {
+     "op": "hit",
+     "at": 1790000030000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "stats",
+     "at": 1790000030000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000060250,
+      0
+     ]
+    },
+    {
+     "op": "hit",
+     "at": 1790000060249,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "stats",
+     "at": 1790000060249,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000060250,
+      0
+     ]
+    },
+    {
+     "op": "test",
+     "at": 1790000060250,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "stats",
+     "at": 1790000060250,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000060250,
+      5
+     ]
+    },
+    {
+     "op": "hit",
+     "at": 1790000060250,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "stats",
+     "at": 1790000060250,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000120250,
+      4
+     ]
+    }
+   ]
+  },
+  {
+   "name": "keys_are_separate",
+   "ops": [
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "1/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "1/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "1/minute",
+     "ids": [
+      "10.0.0.2",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "1/hour",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "stats",
+     "at": 1790000000000,
+     "limit": "1/minute",
+     "ids": [
+      "10.0.0.2",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000060000,
+      0
+     ]
+    },
+    {
+     "op": "stats",
+     "at": 1790000000000,
+     "limit": "1/hour",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790003600000,
+      0
+     ]
+    },
+    {
+     "op": "stats",
+     "at": 1790000000000,
+     "limit": "1/second",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000000000,
+      1
+     ]
+    }
+   ]
+  },
+  {
+   "name": "cost",
+   "ops": [
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 2,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1790000000500,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 2,
+     "result": true
+    },
+    {
+     "op": "test",
+     "at": 1790000000500,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "test",
+     "at": 1790000000500,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 2,
+     "result": false
+    },
+    {
+     "op": "hit",
+     "at": 1790000000500,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 2,
+     "result": false
+    },
+    {
+     "op": "stats",
+     "at": 1790000000500,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000060000,
+      0
+     ]
+    },
+    {
+     "op": "hit",
+     "at": 1790000001000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 0,
+     "result": false
+    },
+    {
+     "op": "test",
+     "at": 1790000001000,
+     "limit": "5/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 0,
+     "result": false
+    }
+   ]
+  },
+  {
+   "name": "cost_zero_opens_a_window",
+   "ops": [
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "2/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 0,
+     "result": true
+    },
+    {
+     "op": "stats",
+     "at": 1790000010000,
+     "limit": "2/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000060000,
+      2
+     ]
+    },
+    {
+     "op": "hit",
+     "at": 1790000020000,
+     "limit": "2/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "stats",
+     "at": 1790000020000,
+     "limit": "2/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000080000,
+      1
+     ]
+    },
+    {
+     "op": "hit",
+     "at": 1790000060000,
+     "limit": "2/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "stats",
+     "at": 1790000060000,
+     "limit": "2/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000080000,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "cost_above_amount",
+   "ops": [
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "3/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 4,
+     "result": false
+    },
+    {
+     "op": "stats",
+     "at": 1790000000000,
+     "limit": "3/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000060000,
+      0
+     ]
+    },
+    {
+     "op": "test",
+     "at": 1790000000000,
+     "limit": "3/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "3/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    }
+   ]
+  },
+  {
+   "name": "clear",
+   "ops": [
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "1/hour",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1790000001000,
+     "limit": "1/hour",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "clear",
+     "at": 1790000002000,
+     "limit": "1/hour",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": null
+    },
+    {
+     "op": "stats",
+     "at": 1790000002000,
+     "limit": "1/hour",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000002000,
+      1
+     ]
+    },
+    {
+     "op": "hit",
+     "at": 1790000003000,
+     "limit": "1/hour",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "stats",
+     "at": 1790000003000,
+     "limit": "1/hour",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790003603000,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "multiples",
+   "ops": [
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "2/3 seconds",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1790000001000,
+     "limit": "2/3 seconds",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1790000002999,
+     "limit": "2/3 seconds",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "stats",
+     "at": 1790000002999,
+     "limit": "2/3 seconds",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000003000,
+      0
+     ]
+    },
+    {
+     "op": "hit",
+     "at": 1790000003000,
+     "limit": "2/3 seconds",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "stats",
+     "at": 1790000003000,
+     "limit": "2/3 seconds",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000006000,
+      1
+     ]
+    }
+   ]
+  },
+  {
+   "name": "zero_amount",
+   "ops": [
+    {
+     "op": "test",
+     "at": 1790000000000,
+     "limit": "0/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "0/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "stats",
+     "at": 1790000000000,
+     "limit": "0/minute",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1790000060000,
+      0
+     ]
+    }
+   ]
+  },
+  {
+   "name": "long_windows",
+   "ops": [
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "1/year",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1821017600000,
+     "limit": "1/year",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": false
+    },
+    {
+     "op": "stats",
+     "at": 1821017600000,
+     "limit": "1/year",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1821104000000,
+      0
+     ]
+    },
+    {
+     "op": "hit",
+     "at": 1821104000000,
+     "limit": "1/year",
+     "ids": [
+      "10.0.0.1",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "hit",
+     "at": 1790000000000,
+     "limit": "1/month",
+     "ids": [
+      "10.0.0.2",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": true
+    },
+    {
+     "op": "stats",
+     "at": 1790000000000,
+     "limit": "1/month",
+     "ids": [
+      "10.0.0.2",
+      "/api/v1/job_applicant/auth/login"
+     ],
+     "cost": 1,
+     "result": [
+      1792592000000,
+      0
+     ]
+    }
+   ]
+  }
+ ],
+ "redis": [
+  {
+   "op": "check",
+   "limit": null,
+   "ids": null,
+   "cost": null,
+   "result": true,
+   "commands": [
+    "*4\r\n$6\r\nCLIENT\r\n$7\r\nSETINFO\r\n$8\r\nLIB-NAME\r\n$8\r\nredis-py\r\n",
+    "*4\r\n$6\r\nCLIENT\r\n$7\r\nSETINFO\r\n$7\r\nLIB-VER\r\n$5\r\n6.4.0\r\n",
+    "*1\r\n$4\r\nPING\r\n"
+   ],
+   "replies": [
+    "+OK\r\n",
+    "+OK\r\n",
+    "+PONG\r\n"
+   ]
+  },
+  {
+   "op": "hit",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 1,
+   "result": true,
+   "commands": [
+    "*6\r\n$7\r\nEVALSHA\r\n$40\r\n628bd136a573a06b346879695681af12ccef300f\r\n$1\r\n1\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n$2\r\n60\r\n$1\r\n1\r\n",
+    "*3\r\n$6\r\nSCRIPT\r\n$4\r\nLOAD\r\n$195\r\nlocal current\nlocal amount = tonumber(ARGV[2])\ncurrent = redis.call(\"incrby\", KEYS[1], amount)\n\nif tonumber(current) == amount then\n    redis.call(\"expire\", KEYS[1], ARGV[1])\nend\n\nreturn current\n\r\n",
+    "*6\r\n$7\r\nEVALSHA\r\n$40\r\n628bd136a573a06b346879695681af12ccef300f\r\n$1\r\n1\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n$2\r\n60\r\n$1\r\n1\r\n"
+   ],
+   "replies": [
+    "-NOSCRIPT No matching script. Please use EVAL.\r\n",
+    "$40\r\n628bd136a573a06b346879695681af12ccef300f\r\n",
+    ":1\r\n"
+   ]
+  },
+  {
+   "op": "hit",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 1,
+   "result": true,
+   "commands": [
+    "*6\r\n$7\r\nEVALSHA\r\n$40\r\n628bd136a573a06b346879695681af12ccef300f\r\n$1\r\n1\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n$2\r\n60\r\n$1\r\n1\r\n"
+   ],
+   "replies": [
+    ":2\r\n"
+   ]
+  },
+  {
+   "op": "hit",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 1,
+   "result": true,
+   "commands": [
+    "*6\r\n$7\r\nEVALSHA\r\n$40\r\n628bd136a573a06b346879695681af12ccef300f\r\n$1\r\n1\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n$2\r\n60\r\n$1\r\n1\r\n"
+   ],
+   "replies": [
+    ":3\r\n"
+   ]
+  },
+  {
+   "op": "hit",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 1,
+   "result": true,
+   "commands": [
+    "*6\r\n$7\r\nEVALSHA\r\n$40\r\n628bd136a573a06b346879695681af12ccef300f\r\n$1\r\n1\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n$2\r\n60\r\n$1\r\n1\r\n"
+   ],
+   "replies": [
+    ":4\r\n"
+   ]
+  },
+  {
+   "op": "hit",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 1,
+   "result": true,
+   "commands": [
+    "*6\r\n$7\r\nEVALSHA\r\n$40\r\n628bd136a573a06b346879695681af12ccef300f\r\n$1\r\n1\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n$2\r\n60\r\n$1\r\n1\r\n"
+   ],
+   "replies": [
+    ":5\r\n"
+   ]
+  },
+  {
+   "op": "hit",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 1,
+   "result": false,
+   "commands": [
+    "*6\r\n$7\r\nEVALSHA\r\n$40\r\n628bd136a573a06b346879695681af12ccef300f\r\n$1\r\n1\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n$2\r\n60\r\n$1\r\n1\r\n"
+   ],
+   "replies": [
+    ":6\r\n"
+   ]
+  },
+  {
+   "op": "stats",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": null,
+   "result": [
+    1790000060000,
+    0
+   ],
+   "commands": [
+    "*2\r\n$3\r\nGET\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n",
+    "*2\r\n$3\r\nTTL\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n"
+   ],
+   "replies": [
+    "$1\r\n6\r\n",
+    ":60\r\n"
+   ]
+  },
+  {
+   "op": "test",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 1,
+   "result": false,
+   "commands": [
+    "*2\r\n$3\r\nGET\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n"
+   ],
+   "replies": [
+    "$1\r\n6\r\n"
+   ]
+  },
+  {
+   "op": "hit",
+   "limit": "3 per 1 hour",
+   "ids": [
+    "10.0.0.2",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 3,
+   "result": true,
+   "commands": [
+    "*6\r\n$7\r\nEVALSHA\r\n$40\r\n628bd136a573a06b346879695681af12ccef300f\r\n$1\r\n1\r\n$65\r\nLIMITS:LIMITER/10.0.0.2//api/v1/job_applicant/auth/login/3/1/hour\r\n$4\r\n3600\r\n$1\r\n3\r\n"
+   ],
+   "replies": [
+    ":3\r\n"
+   ]
+  },
+  {
+   "op": "test",
+   "limit": "3 per 1 hour",
+   "ids": [
+    "10.0.0.2",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 1,
+   "result": false,
+   "commands": [
+    "*2\r\n$3\r\nGET\r\n$65\r\nLIMITS:LIMITER/10.0.0.2//api/v1/job_applicant/auth/login/3/1/hour\r\n"
+   ],
+   "replies": [
+    "$1\r\n3\r\n"
+   ]
+  },
+  {
+   "op": "hit",
+   "limit": "3 per 1 hour",
+   "ids": [
+    "10.0.0.2",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 1,
+   "result": false,
+   "commands": [
+    "*6\r\n$7\r\nEVALSHA\r\n$40\r\n628bd136a573a06b346879695681af12ccef300f\r\n$1\r\n1\r\n$65\r\nLIMITS:LIMITER/10.0.0.2//api/v1/job_applicant/auth/login/3/1/hour\r\n$4\r\n3600\r\n$1\r\n1\r\n"
+   ],
+   "replies": [
+    ":4\r\n"
+   ]
+  },
+  {
+   "op": "stats",
+   "limit": "3 per 1 hour",
+   "ids": [
+    "10.0.0.2",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": null,
+   "result": [
+    1790003600000,
+    0
+   ],
+   "commands": [
+    "*2\r\n$3\r\nGET\r\n$65\r\nLIMITS:LIMITER/10.0.0.2//api/v1/job_applicant/auth/login/3/1/hour\r\n",
+    "*2\r\n$3\r\nTTL\r\n$65\r\nLIMITS:LIMITER/10.0.0.2//api/v1/job_applicant/auth/login/3/1/hour\r\n"
+   ],
+   "replies": [
+    "$1\r\n4\r\n",
+    ":3600\r\n"
+   ]
+  },
+  {
+   "op": "clear",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": null,
+   "result": null,
+   "commands": [
+    "*2\r\n$3\r\nDEL\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n"
+   ],
+   "replies": [
+    ":1\r\n"
+   ]
+  },
+  {
+   "op": "stats",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": null,
+   "result": [
+    1790000000000,
+    5
+   ],
+   "commands": [
+    "*2\r\n$3\r\nGET\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n",
+    "*2\r\n$3\r\nTTL\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n"
+   ],
+   "replies": [
+    "$-1\r\n",
+    ":-2\r\n"
+   ]
+  },
+  {
+   "op": "test",
+   "limit": "5 per 1 minute",
+   "ids": [
+    "10.0.0.1",
+    "/api/v1/job_applicant/auth/login"
+   ],
+   "cost": 1,
+   "result": true,
+   "commands": [
+    "*2\r\n$3\r\nGET\r\n$67\r\nLIMITS:LIMITER/10.0.0.1//api/v1/job_applicant/auth/login/5/1/minute\r\n"
+   ],
+   "replies": [
+    "$-1\r\n"
+   ]
+  }
+ ],
+ "apps": [
+  {
+   "name": "backend",
+   "cases": [
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000000250,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000060250,
+      "remaining": 4
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000001250,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000060250,
+      "remaining": 3
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000002250,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000060250,
+      "remaining": 2
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000003250,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000060250,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000004250,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000060250,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000005250,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 5 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000060250,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000006500,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000066500,
+      "remaining": 4
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/employer/auth/login",
+     "at": 1790000007000,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/employer/auth/login"
+      ],
+      "reset": 1790000067000,
+      "remaining": 4
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000060000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 5 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000060250,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000060250,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000120250,
+      "remaining": 4
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000061000,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000120250,
+      "remaining": 3
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/request_password_reset",
+     "at": 1790000100000,
+     "status": 200,
+     "body": "{\"success\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 hour",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/request_password_reset"
+      ],
+      "reset": 1790003700000,
+      "remaining": 2
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/request_password_reset",
+     "at": 1790000101000,
+     "status": 200,
+     "body": "{\"success\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 hour",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/request_password_reset"
+      ],
+      "reset": 1790003700000,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/request_password_reset",
+     "at": 1790000102000,
+     "status": 200,
+     "body": "{\"success\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 hour",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/request_password_reset"
+      ],
+      "reset": 1790003700000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/request_password_reset",
+     "at": 1790000103000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 3 per 1 hour\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 hour",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/request_password_reset"
+      ],
+      "reset": 1790003700000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/request_password_reset",
+     "at": 1790003700000,
+     "status": 200,
+     "body": "{\"success\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 hour",
+      "args": [
+       "203.0.113.7",
+       "/api/v1/job_applicant/auth/request_password_reset"
+      ],
+      "reset": 1790007300000,
+      "remaining": 2
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/auth/verify_email",
+     "at": 1790000005000,
+     "status": 200,
+     "body": "{\"success\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 hour",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/auth/verify_email"
+      ],
+      "reset": 1790003605000,
+      "remaining": 4
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/auth/verify_email",
+     "at": 1790000065000,
+     "status": 200,
+     "body": "{\"success\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 hour",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/auth/verify_email"
+      ],
+      "reset": 1790003605000,
+      "remaining": 3
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/auth/verify_email",
+     "at": 1790000125000,
+     "status": 200,
+     "body": "{\"success\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 hour",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/auth/verify_email"
+      ],
+      "reset": 1790003605000,
+      "remaining": 2
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/auth/verify_email",
+     "at": 1790000185000,
+     "status": 200,
+     "body": "{\"success\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 hour",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/auth/verify_email"
+      ],
+      "reset": 1790003605000,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/auth/verify_email",
+     "at": 1790000245000,
+     "status": 200,
+     "body": "{\"success\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 hour",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/auth/verify_email"
+      ],
+      "reset": 1790003605000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/auth/verify_email",
+     "at": 1790000305000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 5 per 1 hour\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 hour",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/auth/verify_email"
+      ],
+      "reset": 1790003605000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000200000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 29
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000200500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 28
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000201000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 27
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000201500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 26
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000202000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 25
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000202500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 24
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000203000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 23
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000203500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 22
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000204000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 21
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000204500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 20
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000205000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 19
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000205500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 18
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000206000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 17
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000206500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 16
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000207000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 15
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000207500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 14
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000208000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 13
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000208500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 12
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000209000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 11
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000209500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 10
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000210000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 9
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000210500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 8
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000211000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 7
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000211500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 6
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000212000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 5
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000212500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 4
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000213000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 3
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000213500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 2
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000214000,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000214500,
+     "status": 200,
+     "body": "{\"text\":\"\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "POST",
+     "path": "/api/v1/employer/documents/extract_text",
+     "at": 1790000215000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 30 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "30 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "/api/v1/employer/documents/extract_text"
+      ],
+      "reset": 1790000260000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/jobs/1",
+     "at": 1790000300000,
+     "status": 200,
+     "body": "{\"job_id\":1}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/jobs/1"
+      ],
+      "reset": 1790000360000,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/jobs/1",
+     "at": 1790000300000,
+     "status": 200,
+     "body": "{\"job_id\":1}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/jobs/1"
+      ],
+      "reset": 1790000360000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/jobs/1",
+     "at": 1790000300000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 2 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/jobs/1"
+      ],
+      "reset": 1790000360000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/jobs/2",
+     "at": 1790000300000,
+     "status": 200,
+     "body": "{\"job_id\":2}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "/jobs/2"
+      ],
+      "reset": 1790000360000,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/open",
+     "at": 1790000300000,
+     "status": 200,
+     "body": "{\"open\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": null
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/missing",
+     "at": 1790000300000,
+     "status": 404,
+     "body": "{\"detail\":\"Not Found\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": null
+    },
+    {
+     "host": "",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000400000,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "127.0.0.1",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000460000,
+      "remaining": 4
+     }
+    },
+    {
+     "host": "",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000400000,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "127.0.0.1",
+       "/api/v1/job_applicant/auth/login"
+      ],
+      "reset": 1790000460000,
+      "remaining": 3
+     }
+    }
+   ]
+  },
+  {
+   "name": "knobs",
+   "cases": [
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/multi",
+     "at": 1790000000250,
+     "status": 200,
+     "body": "{\"multi\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "1"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000002.25"
+      ],
+      [
+       "retry-after",
+       "2"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 second",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/multi"
+      ],
+      "reset": 1790000001250,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/multi",
+     "at": 1790000000500,
+     "status": 200,
+     "body": "{\"multi\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000002.25"
+      ],
+      [
+       "retry-after",
+       "1"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 second",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/multi"
+      ],
+      "reset": 1790000001250,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/multi",
+     "at": 1790000000750,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 2 per 1 second\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000002.25"
+      ],
+      [
+       "retry-after",
+       "1"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 second",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/multi"
+      ],
+      "reset": 1790000001250,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/multi",
+     "at": 1790000001250,
+     "status": 200,
+     "body": "{\"multi\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "1"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000003.25"
+      ],
+      [
+       "retry-after",
+       "2"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 second",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/multi"
+      ],
+      "reset": 1790000002250,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/multi",
+     "at": 1790000001500,
+     "status": 200,
+     "body": "{\"multi\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000003.25"
+      ],
+      [
+       "retry-after",
+       "1"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 second",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/multi"
+      ],
+      "reset": 1790000002250,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/multi",
+     "at": 1790000002500,
+     "status": 200,
+     "body": "{\"multi\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "1"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000004.5"
+      ],
+      [
+       "retry-after",
+       "2"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 second",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/multi"
+      ],
+      "reset": 1790000003500,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/multi",
+     "at": 1790000003500,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 5 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "5"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000061.25"
+      ],
+      [
+       "retry-after",
+       "57"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/multi"
+      ],
+      "reset": 1790000060250,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/multi",
+     "at": 1790000004500,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 5 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "5"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000061.25"
+      ],
+      [
+       "retry-after",
+       "56"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/multi"
+      ],
+      "reset": 1790000060250,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/stacked",
+     "at": 1790000010000,
+     "status": 200,
+     "body": "{\"stacked\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "1, 1"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0, 0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000012.0, 1790000012.0"
+      ],
+      [
+       "retry-after",
+       "2"
+      ]
+     ],
+     "view": {
+      "limit": "1 per 1 second",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/stacked"
+      ],
+      "reset": 1790000011000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/stacked",
+     "at": 1790000010500,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 1 per 1 second\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "1"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000012.0"
+      ],
+      [
+       "retry-after",
+       "1"
+      ]
+     ],
+     "view": {
+      "limit": "1 per 1 second",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/stacked"
+      ],
+      "reset": 1790000011000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/stacked",
+     "at": 1790000011000,
+     "status": 200,
+     "body": "{\"stacked\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "1, 1"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0, 0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000013.0, 1790000013.0"
+      ],
+      [
+       "retry-after",
+       "2"
+      ]
+     ],
+     "view": {
+      "limit": "1 per 1 second",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/stacked"
+      ],
+      "reset": 1790000012000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/stacked",
+     "at": 1790000012000,
+     "status": 200,
+     "body": "{\"stacked\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "1, 1"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0, 0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000014.0, 1790000014.0"
+      ],
+      [
+       "retry-after",
+       "2"
+      ]
+     ],
+     "view": {
+      "limit": "1 per 1 second",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/stacked"
+      ],
+      "reset": 1790000013000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/stacked",
+     "at": 1790000013000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 3 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "3"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000071.0"
+      ],
+      [
+       "retry-after",
+       "58"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/stacked"
+      ],
+      "reset": 1790000070000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/shared/a",
+     "at": 1790000020000,
+     "status": 200,
+     "body": "{\"a\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "3"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "2"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000081.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "pair"
+      ],
+      "reset": 1790000080000,
+      "remaining": 2
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/shared/b",
+     "at": 1790000020000,
+     "status": 200,
+     "body": "{\"b\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "3"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "1"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000081.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "pair"
+      ],
+      "reset": 1790000080000,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/shared/a",
+     "at": 1790000020000,
+     "status": 200,
+     "body": "{\"a\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "3"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000081.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "pair"
+      ],
+      "reset": 1790000080000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/shared/b",
+     "at": 1790000020000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 3 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "3"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000081.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "pair"
+      ],
+      "reset": 1790000080000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "GET",
+     "path": "/shared/b",
+     "at": 1790000020000,
+     "status": 200,
+     "body": "{\"b\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "3"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "2"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000081.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "3 per 1 minute",
+      "args": [
+       "app",
+       "198.51.100.23",
+       "pair"
+      ],
+      "reset": 1790000080000,
+      "remaining": 2
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/method",
+     "at": 1790000030000,
+     "status": 200,
+     "body": "{\"method\":\"GET\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "1"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000091.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/method:GET"
+      ],
+      "reset": 1790000090000,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/method",
+     "at": 1790000030000,
+     "status": 200,
+     "body": "{\"method\":\"POST\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "1"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000091.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/method:POST"
+      ],
+      "reset": 1790000090000,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/method",
+     "at": 1790000030000,
+     "status": 200,
+     "body": "{\"method\":\"GET\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000091.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/method:GET"
+      ],
+      "reset": 1790000090000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/method",
+     "at": 1790000030000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 2 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000091.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/method:GET"
+      ],
+      "reset": 1790000090000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/method",
+     "at": 1790000030000,
+     "status": 200,
+     "body": "{\"method\":\"POST\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000091.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/method:POST"
+      ],
+      "reset": 1790000090000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/method",
+     "at": 1790000030000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 2 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "2"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000091.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/method:POST"
+      ],
+      "reset": 1790000090000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/only_post",
+     "at": 1790000040000,
+     "status": 200,
+     "body": "{\"method\":\"GET\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": null
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/only_post",
+     "at": 1790000040000,
+     "status": 200,
+     "body": "{\"method\":\"GET\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": null
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/only_post",
+     "at": 1790000040000,
+     "status": 200,
+     "body": "{\"method\":\"POST\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "1"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000101.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "1 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/only_post"
+      ],
+      "reset": 1790000100000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/only_post",
+     "at": 1790000040000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 1 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "1"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000101.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "1 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/only_post"
+      ],
+      "reset": 1790000100000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/only_post",
+     "at": 1790000040000,
+     "status": 200,
+     "body": "{\"method\":\"GET\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": null
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/costly",
+     "at": 1790000050000,
+     "status": 200,
+     "body": "{\"costly\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "5"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "3"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000111.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/costly"
+      ],
+      "reset": 1790000110000,
+      "remaining": 3
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/costly",
+     "at": 1790000050000,
+     "status": 200,
+     "body": "{\"costly\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "5"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "1"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000111.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/costly"
+      ],
+      "reset": 1790000110000,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/costly",
+     "at": 1790000050000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 5 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "5"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000111.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/costly"
+      ],
+      "reset": 1790000110000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/costly",
+     "at": 1790000050000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 5 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "5"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000111.0"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "5 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/costly"
+      ],
+      "reset": 1790000110000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/custom",
+     "at": 1790000060100,
+     "status": 200,
+     "body": "{\"custom\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "1"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000121.1"
+      ],
+      [
+       "retry-after",
+       "61"
+      ]
+     ],
+     "view": {
+      "limit": "1 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/custom"
+      ],
+      "reset": 1790000120100,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/custom",
+     "at": 1790000060200,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: Slow down\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ],
+      [
+       "x-ratelimit-limit",
+       "1"
+      ],
+      [
+       "x-ratelimit-remaining",
+       "0"
+      ],
+      [
+       "x-ratelimit-reset",
+       "1790000121.1"
+      ],
+      [
+       "retry-after",
+       "60"
+      ]
+     ],
+     "view": {
+      "limit": "1 per 1 minute",
+      "args": [
+       "app",
+       "203.0.113.7",
+       "/custom"
+      ],
+      "reset": 1790000120100,
+      "remaining": 0
+     }
+    }
+   ]
+  },
+  {
+   "name": "endpoint",
+   "cases": [
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/jobs/1",
+     "at": 1790000000000,
+     "status": 200,
+     "body": "{\"job_id\":1}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "__main__.job"
+      ],
+      "reset": 1790000060000,
+      "remaining": 1
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/jobs/2",
+     "at": 1790000000000,
+     "status": 200,
+     "body": "{\"job_id\":2}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "__main__.job"
+      ],
+      "reset": 1790000060000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "GET",
+     "path": "/jobs/3",
+     "at": 1790000000000,
+     "status": 429,
+     "body": "{\"error\":\"Rate limit exceeded: 2 per 1 minute\"}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "203.0.113.7",
+       "__main__.job"
+      ],
+      "reset": 1790000060000,
+      "remaining": 0
+     }
+    },
+    {
+     "host": "198.51.100.23",
+     "method": "GET",
+     "path": "/jobs/3",
+     "at": 1790000000000,
+     "status": 200,
+     "body": "{\"job_id\":3}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": {
+      "limit": "2 per 1 minute",
+      "args": [
+       "198.51.100.23",
+       "__main__.job"
+      ],
+      "reset": 1790000060000,
+      "remaining": 1
+     }
+    }
+   ]
+  },
+  {
+   "name": "disabled",
+   "cases": [
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000000000,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": null
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000000000,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": null
+    },
+    {
+     "host": "203.0.113.7",
+     "method": "POST",
+     "path": "/api/v1/job_applicant/auth/login",
+     "at": 1790000000000,
+     "status": 200,
+     "body": "{\"ok\":true}",
+     "headers": [
+      [
+       "content-type",
+       "application/json"
+      ]
+     ],
+     "view": null
+    }
+   ]
+  }
+ ]
+}

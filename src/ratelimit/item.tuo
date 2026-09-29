@@ -1,0 +1,695 @@
+// ratelimit::item — a rate limit, as `limits` spells it.
+//
+// `limits.RateLimitItem` is an amount per some multiple of a granularity:
+// `5/minute` is five per one minute, `2/3 seconds` two per three seconds.
+// Its storage key is the namespace, the caller's identifiers, and the
+// limit itself, joined with `/` — `LIMITER/10.0.0.1//login/5/1/minute` —
+// and its expiry is the granularity's seconds times the multiples. A
+// month is 30 days and a year 360, as `limits` counts them.
+//
+// `parse_many` is `limits.util.parse_many`, whose grammar is two regular
+// expressions: one limit is `\s*([0-9]+)\s*(/|\s*per\s*)\s*([0-9]+)?\s*
+// ([a-z]+)\s*`, without case, and a string is one or more of them joined
+// by `,`, `;`, or `|` — each separator optionally preceded by a `:`, which
+// is what `(:?` in `limits`' pattern means (it was surely meant as `(?:`).
+// Every piece of the expression is greedy with nothing to backtrack into,
+// so a left-to-right scan decides exactly what the regex does. A string
+// that does not match is refused whole with "couldn't parse rate limit
+// string"; a piece whose unit names no granularity (`min`, `s`) is refused
+// with "no granularity matched for", in order, after the whole string
+// matched. A zero multiple means one.
+//
+// Python's `re` makes `\s` and case-blind `[a-z]` wider than ASCII: `\s`
+// is the Unicode spaces (as in `dotenv::parse`), and `[a-z]` also takes
+// U+0130, U+0131, U+017F, and U+212A. None of those four can lower-case
+// into a unit name, so such a unit always ends in the granularity error,
+// as it does in `limits`.
+//
+// One departure: Python's integers are unbounded, and an amount or a
+// multiple beyond `Int`, or a window longer than 2^40 seconds (some
+// 35,000 years), is refused here as unparseable.
+//
+// The fixed-window arithmetic both storages share is here too: a hit
+// passes while the count after it is at most the amount, `test` asks
+// whether `cost` more would, and the window stats are the reset time and
+// what remains. Times are milliseconds since the epoch.
+
+module ratelimit::item;
+
+/// One limit: `amount` per `multiples` × `granularity` seconds.
+pub struct Item {
+    amount: Int,
+    multiples: Int,
+    granularity: Int,
+}
+
+/// What `parse_many` made of a string: its items in order, or the
+/// `ValueError` message `limits` raises.
+pub struct Parsed {
+    ok: Bool,
+    items: Array[Item],
+    error: String,
+}
+
+/// `limits.WindowStats`: when the window resets (milliseconds since the
+/// epoch) and how much of the amount is left in it.
+pub struct Stats {
+    reset: Int,
+    remaining: Int,
+}
+
+// ----------------------------------------------------------------------------
+// Granularities.
+// ----------------------------------------------------------------------------
+
+/// A second, in seconds.
+///
+/// # Example
+/// ```tuo
+/// let s = ratelimit::item::second(); // 1
+/// ```
+pub fn second() -> Int {
+    1
+}
+
+/// A minute, in seconds.
+///
+/// # Example
+/// ```tuo
+/// let s = ratelimit::item::minute(); // 60
+/// ```
+pub fn minute() -> Int {
+    60
+}
+
+/// An hour, in seconds.
+///
+/// # Example
+/// ```tuo
+/// let s = ratelimit::item::hour(); // 3600
+/// ```
+pub fn hour() -> Int {
+    3600
+}
+
+/// A day, in seconds.
+///
+/// # Example
+/// ```tuo
+/// let s = ratelimit::item::day(); // 86400
+/// ```
+pub fn day() -> Int {
+    86400
+}
+
+/// A month — thirty days — in seconds.
+///
+/// # Example
+/// ```tuo
+/// let s = ratelimit::item::month(); // 2592000
+/// ```
+pub fn month() -> Int {
+    2592000
+}
+
+/// A year — twelve thirty-day months — in seconds.
+///
+/// # Example
+/// ```tuo
+/// let s = ratelimit::item::year(); // 31104000
+/// ```
+pub fn year() -> Int {
+    31104000
+}
+
+/// The name of a granularity, or empty when `seconds` is none of them.
+///
+/// # Example
+/// ```tuo
+/// let n = ratelimit::item::granularity_name(60); // "minute"
+/// ```
+pub fn granularity_name(take seconds: Int) -> Str {
+    if seconds == 1 {
+        return "second";
+    }
+    if seconds == 60 {
+        return "minute";
+    }
+    if seconds == 3600 {
+        return "hour";
+    }
+    if seconds == 86400 {
+        return "day";
+    }
+    if seconds == 2592000 {
+        return "month";
+    }
+    if seconds == 31104000 {
+        return "year";
+    }
+    ""
+}
+
+/// The granularity a unit names — its name or its plural, in any ASCII
+/// case — or 0.
+///
+/// # Example
+/// ```tuo
+/// let g = ratelimit::item::granularity_named("Minutes"); // 60
+/// ```
+pub fn granularity_named(in unit: Str) -> Int {
+    let lower = std::str::to_lower(unit);
+    let u = std::string::as_str(lower);
+    var g = 1;
+    while g > 0 {
+        let name = granularity_name(g);
+        if u == name {
+            return g;
+        }
+        var plural = std::string::from_str(name);
+        std::str::push(plural, "s");
+        if u == std::string::as_str(plural) {
+            return g;
+        }
+        g = next_granularity(g);
+    }
+    0
+}
+
+fn next_granularity(take g: Int) -> Int {
+    if g == 1 {
+        return 60;
+    }
+    if g == 60 {
+        return 3600;
+    }
+    if g == 3600 {
+        return 86400;
+    }
+    if g == 86400 {
+        return 2592000;
+    }
+    if g == 2592000 {
+        return 31104000;
+    }
+    0
+}
+
+// ----------------------------------------------------------------------------
+// The item.
+// ----------------------------------------------------------------------------
+
+/// `amount` per `multiples` × `granularity` seconds.
+///
+/// # Example
+/// ```tuo
+/// let login = ratelimit::item::new(5, 1, ratelimit::item::minute());
+/// ```
+pub fn new(take amount: Int, take multiples: Int, take granularity: Int) -> Item {
+    Item { amount: amount, multiples: multiples, granularity: granularity }
+}
+
+/// How long a window lasts, in seconds: `get_expiry`.
+///
+/// # Example
+/// ```tuo
+/// let s = ratelimit::item::expiry(ratelimit::item::new(2, 3, 60)); // 180
+/// ```
+pub fn expiry(in it: Item) -> Int {
+    it.granularity * it.multiples
+}
+
+/// The item as `limits` prints it: `repr`, which is also the detail of
+/// slowapi's `RateLimitExceeded`.
+///
+/// # Example
+/// ```tuo
+/// let d = ratelimit::item::describe(ratelimit::item::new(5, 1, 60)); // "5 per 1 minute"
+/// ```
+pub fn describe(in it: Item) -> String {
+    var out = std::string::empty();
+    std::str::push_int(out, it.amount);
+    std::str::push(out, " per ");
+    std::str::push_int(out, it.multiples);
+    std::str::push(out, " ");
+    std::str::push(out, granularity_name(it.granularity));
+    out
+}
+
+/// The namespace every key starts with.
+///
+/// # Example
+/// ```tuo
+/// let ns = ratelimit::item::namespace(); // "LIMITER"
+/// ```
+pub fn namespace() -> Str {
+    "LIMITER"
+}
+
+/// The storage key of this limit for `ids`: `key_for`.
+///
+/// # Example
+/// ```tuo
+/// var ids = std::array::empty();
+/// std::array::push(ids, std::string::from_str("10.0.0.1"));
+/// let k = ratelimit::item::key_for(ratelimit::item::new(5, 1, 60), ids); // "LIMITER/10.0.0.1/5/1/minute"
+/// ```
+pub fn key_for(in it: Item, in ids: Array[String]) -> String {
+    var out = std::string::from_str(namespace());
+    var i = 0;
+    while i < std::array::len(ids) {
+        std::str::push(out, "/");
+        std::str::push(out, std::string::as_str(std::array::get(ids, i)));
+        i = i + 1;
+    }
+    std::str::push(out, "/");
+    std::str::push_int(out, it.amount);
+    std::str::push(out, "/");
+    std::str::push_int(out, it.multiples);
+    std::str::push(out, "/");
+    std::str::push(out, granularity_name(it.granularity));
+    out
+}
+
+// ----------------------------------------------------------------------------
+// The fixed window's arithmetic.
+// ----------------------------------------------------------------------------
+
+/// Whether a hit that brought the window's count to `count` passes.
+///
+/// # Example
+/// ```tuo
+/// let ok = ratelimit::item::allows(ratelimit::item::new(5, 1, 60), 5); // true
+/// ```
+pub fn allows(in it: Item, take count: Int) -> Bool {
+    count <= it.amount
+}
+
+/// Whether `cost` more would pass a window already at `count`: `test`.
+///
+/// # Example
+/// ```tuo
+/// let ok = ratelimit::item::would_allow(ratelimit::item::new(5, 1, 60), 4, 2); // false
+/// ```
+pub fn would_allow(in it: Item, take count: Int, take cost: Int) -> Bool {
+    count < it.amount - cost + 1
+}
+
+/// The window stats of a window at `count` that resets at `reset`.
+///
+/// # Example
+/// ```tuo
+/// let s = ratelimit::item::stats(ratelimit::item::new(5, 1, 60), 6, 1000); // remaining 0
+/// ```
+pub fn stats(in it: Item, take count: Int, take reset: Int) -> Stats {
+    var remaining = it.amount - count;
+    if remaining < 0 {
+        remaining = 0;
+    }
+    Stats { reset: reset, remaining: remaining }
+}
+
+// ----------------------------------------------------------------------------
+// The grammar.
+// ----------------------------------------------------------------------------
+
+/// The length in bytes of the Python `\s` character at `i`, or 0.
+fn space_len(in s: Str, take i: Int) -> Int {
+    let n = std::str::len(s);
+    if i >= n {
+        return 0;
+    }
+    let b = std::str::byte_at(s, i);
+    if b == 32 || (b >= 9 && b <= 13) || (b >= 28 && b <= 31) {
+        return 1;
+    }
+    if b == 194 && i + 1 < n {
+        let c = std::str::byte_at(s, i + 1);
+        if c == 133 || c == 160 {
+            return 2;
+        }
+        return 0;
+    }
+    if b < 225 || b > 227 || i + 2 >= n {
+        return 0;
+    }
+    let c = std::str::byte_at(s, i + 1);
+    let d = std::str::byte_at(s, i + 2);
+    if b == 225 && c == 154 && d == 128 {
+        return 3;
+    }
+    if b == 226 && c == 128 && ((d >= 128 && d <= 138) || d == 168 || d == 169 || d == 175) {
+        return 3;
+    }
+    if b == 226 && c == 129 && d == 159 {
+        return 3;
+    }
+    if b == 227 && c == 128 && d == 128 {
+        return 3;
+    }
+    0
+}
+
+fn skip_spaces(in s: Str, take from: Int) -> Int {
+    var i = from;
+    var step = space_len(s, i);
+    while step > 0 {
+        i = i + step;
+        step = space_len(s, i);
+    }
+    i
+}
+
+/// The length in bytes of the case-blind `[a-z]` character at `i`, or 0:
+/// an ASCII letter, or one of U+0130, U+0131, U+017F, U+212A.
+fn letter_len(in s: Str, take i: Int) -> Int {
+    let n = std::str::len(s);
+    if i >= n {
+        return 0;
+    }
+    let b = std::str::byte_at(s, i);
+    if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) {
+        return 1;
+    }
+    if i + 1 < n {
+        let c = std::str::byte_at(s, i + 1);
+        if (b == 196 && (c == 176 || c == 177)) || (b == 197 && c == 191) {
+            return 2;
+        }
+    }
+    if b == 226 && i + 2 < n && std::str::byte_at(s, i + 1) == 132 && std::str::byte_at(s, i + 2) == 170 {
+        return 3;
+    }
+    0
+}
+
+fn digits_end(in s: Str, take from: Int) -> Int {
+    var i = from;
+    while i < std::str::len(s) && std::str::is_digit(std::str::byte_at(s, i)) {
+        i = i + 1;
+    }
+    i
+}
+
+fn is_separator(take b: Int) -> Bool {
+    b == 44 || b == 59 || b == 124
+}
+
+fn lower_is(take b: Int, take want: Int) -> Bool {
+    b == want || b == want - 32
+}
+
+/// `per` in any case at `i`.
+fn per_at(in s: Str, take i: Int) -> Bool {
+    i + 3 <= std::str::len(s) && lower_is(std::str::byte_at(s, i), 112) && lower_is(std::str::byte_at(s, i + 1), 101) && lower_is(std::str::byte_at(s, i + 2), 114)
+}
+
+/// The decimal value of `s[from..to]`, or -1 when it does not fit an `Int`.
+fn number(in s: Str, take from: Int, take to: Int) -> Int {
+    var n = 0;
+    var i = from;
+    while i < to {
+        let d = std::str::byte_at(s, i) - 48;
+        if n > (9223372036854775807 - d) / 10 {
+            return 0 - 1;
+        }
+        n = n * 10 + d;
+        i = i + 1;
+    }
+    n
+}
+
+/// The longest window this port accepts, in seconds: 2^40.
+fn longest_window() -> Int {
+    1099511627776
+}
+
+/// One limit, matched from `at`. Its fields are byte offsets into the
+/// string; `end` is -1 when nothing matched.
+struct Single {
+    end: Int,
+    amount_from: Int,
+    amount_to: Int,
+    multiples_from: Int,
+    multiples_to: Int,
+    unit_from: Int,
+    unit_to: Int,
+}
+
+fn no_single() -> Single {
+    Single { end: 0 - 1, amount_from: 0, amount_to: 0, multiples_from: 0, multiples_to: 0, unit_from: 0, unit_to: 0 }
+}
+
+fn single(in s: Str, take at: Int) -> Single {
+    var i = skip_spaces(s, at);
+    let amount_from = i;
+    i = digits_end(s, i);
+    if i == amount_from {
+        return no_single();
+    }
+    let amount_to = i;
+    i = skip_spaces(s, i);
+    if i < std::str::len(s) && std::str::byte_at(s, i) == 47 {
+        i = i + 1;
+    } else if per_at(s, i) {
+        i = i + 3;
+    } else {
+        return no_single();
+    }
+    i = skip_spaces(s, i);
+    let multiples_from = i;
+    i = digits_end(s, i);
+    let multiples_to = i;
+    i = skip_spaces(s, i);
+    let unit_from = i;
+    var step = letter_len(s, i);
+    while step > 0 {
+        i = i + step;
+        step = letter_len(s, i);
+    }
+    if i == unit_from {
+        return no_single();
+    }
+    let unit_to = i;
+    Single { end: skip_spaces(s, i), amount_from: amount_from, amount_to: amount_to, multiples_from: multiples_from, multiples_to: multiples_to, unit_from: unit_from, unit_to: unit_to }
+}
+
+fn refused(in message: Str, in text: Str) -> Parsed {
+    var error = std::string::from_str(message);
+    std::str::push(error, text);
+    Parsed { ok: false, items: std::array::empty(), error: error }
+}
+
+fn unparseable(in text: Str) -> Parsed {
+    var p = refused("couldn't parse rate limit string '", text);
+    std::str::push(p.error, "'");
+    p
+}
+
+/// Every limit in `text`: `limits.parse_many`.
+///
+/// # Example
+/// ```tuo
+/// let p = ratelimit::item::parse_many("1/second; 5/minute"); // two items
+/// ```
+pub fn parse_many(in text: Str) -> Parsed {
+    let n = std::str::len(text);
+    var singles = std::array::empty();
+    var at = 0;
+    var more = true;
+    while more {
+        let one = single(text, at);
+        if one.end < 0 {
+            return unparseable(text);
+        }
+        at = one.end;
+        std::array::push(singles, one);
+        if at == n {
+            more = false;
+        } else {
+            if std::str::byte_at(text, at) == 58 {
+                at = at + 1;
+            }
+            if at >= n || !is_separator(std::str::byte_at(text, at)) {
+                return unparseable(text);
+            }
+            at = at + 1;
+        }
+    }
+    var items = std::array::empty();
+    var k = 0;
+    while k < std::array::len(singles) {
+        let one = std::array::get(singles, k);
+        let unit = std::str::slice(text, one.unit_from, one.unit_to);
+        let g = granularity_named(unit);
+        if g == 0 {
+            return refused("no granularity matched for ", unit);
+        }
+        let amount = number(text, one.amount_from, one.amount_to);
+        var multiples = number(text, one.multiples_from, one.multiples_to);
+        if multiples == 0 {
+            multiples = 1;
+        }
+        if amount < 0 || multiples < 0 || multiples > longest_window() / g {
+            return unparseable(text);
+        }
+        std::array::push(items, new(amount, multiples, g));
+        k = k + 1;
+    }
+    Parsed { ok: true, items: items, error: std::string::empty() }
+}
+
+/// How many items `p` holds.
+///
+/// # Example
+/// ```tuo
+/// let n = ratelimit::item::count(ratelimit::item::parse_many("5/minute")); // 1
+/// ```
+pub fn count(in p: Parsed) -> Int {
+    std::array::len(p.items)
+}
+
+/// Item `i` of `p`.
+///
+/// # Example
+/// ```tuo
+/// let it = ratelimit::item::at(ratelimit::item::parse_many("5/minute"), 0);
+/// ```
+pub fn at(in p: Parsed, take i: Int) -> Item {
+    let it = std::array::get(p.items, i);
+    new(it.amount, it.multiples, it.granularity)
+}
+
+// ----------------------------------------------------------------------------
+// Specs.
+// ----------------------------------------------------------------------------
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+/// Parse case `i` in the fixture's terms: each item as
+/// `amount|multiples|granularity|repr|expiry|key`, one per line, or the
+/// error.
+///
+/// # Example
+/// ```tuo
+/// let out = ratelimit::item::parse_output(0);
+/// ```
+pub fn parse_output(take i: Int) -> String {
+    let p = parse_many(ratelimit::fixture::parse_text(i));
+    if !p.ok {
+        return std::string::from_str(std::string::as_str(p.error));
+    }
+    var ids = std::array::empty();
+    std::array::push(ids, std::string::from_str("10.0.0.1"));
+    std::array::push(ids, std::string::from_str("/api/v1/job_applicant/auth/login"));
+    var out = std::string::empty();
+    var k = 0;
+    while k < count(p) {
+        let it = at(p, k);
+        if k > 0 {
+            std::str::push(out, "\n");
+        }
+        std::str::push_int(out, it.amount);
+        std::str::push(out, "|");
+        std::str::push_int(out, it.multiples);
+        std::str::push(out, "|");
+        std::str::push(out, granularity_name(it.granularity));
+        std::str::push(out, "|");
+        std::str::push(out, std::string::as_str(describe(it)));
+        std::str::push(out, "|");
+        std::str::push_int(out, expiry(it));
+        std::str::push(out, "|");
+        std::str::push(out, std::string::as_str(key_for(it, ids)));
+        k = k + 1;
+    }
+    out
+}
+
+/// Whether parse case `i` came out as `limits` made it.
+///
+/// # Example
+/// ```tuo
+/// let same = ratelimit::item::parse_agrees(0);
+/// ```
+pub fn parse_agrees(take i: Int) -> Bool {
+    let out = parse_output(i);
+    if ratelimit::fixture::parse_ok(i) {
+        return text_is(out, ratelimit::fixture::parse_items(i));
+    }
+    text_is(out, ratelimit::fixture::parse_error(i))
+}
+
+fn parse_range_agrees(take from: Int, take to: Int) -> Bool {
+    var i = from;
+    while i < to {
+        if !parse_agrees(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+spec granularity_named {
+    then granularity_named("minute") == 60;
+    then granularity_named("MINUTES") == 60;
+    then granularity_named("Year") == 31104000;
+    then granularity_named("min") == 0;
+    then granularity_named("s") == 0;
+    then granularity_named("secondss") == 0;
+    then granularity_named("") == 0;
+}
+
+spec describe {
+    then text_is(describe(new(5, 1, 60)), "5 per 1 minute");
+    then text_is(describe(new(2, 3, 1)), "2 per 3 second");
+    then expiry(new(2, 3, 60)) == 180;
+    then expiry(new(1, 1, 31104000)) == 31104000;
+}
+
+spec key_for {
+    then text_is(key_for(new(5, 1, 60), std::array::empty()), "LIMITER/5/1/minute");
+    then text_is(key_for(new(3, 1, 3600), std::str::split("app,1.2.3.4,/x", ",")), "LIMITER/app/1.2.3.4//x/3/1/hour");
+}
+
+spec "the fixed window's arithmetic" {
+    then allows(new(5, 1, 60), 5);
+    then !allows(new(5, 1, 60), 6);
+    then would_allow(new(5, 1, 60), 4, 1);
+    then !would_allow(new(5, 1, 60), 4, 2);
+    then !would_allow(new(0, 1, 60), 0, 1);
+    then stats(new(5, 1, 60), 7, 9).remaining == 0;
+    then stats(new(5, 1, 60), 2, 9).remaining == 3;
+    then stats(new(5, 1, 60), 2, 9).reset == 9;
+}
+
+spec "scanning: whitespace, letters, and digits as Python's re sees them" {
+    then space_len("\u{3000}", 0) == 3;
+    then space_len("\u{a0}", 0) == 2;
+    then space_len("\u{2010}", 0) == 0;
+    then letter_len("\u{17f}", 0) == 2;
+    then letter_len("\u{212a}", 0) == 3;
+    then letter_len("\u{e9}", 0) == 0;
+    then number("123", 0, 3) == 123;
+    then number("9223372036854775807", 0, 19) == 9223372036854775807;
+    then number("9223372036854775808", 0, 19) == 0 - 1;
+    then number("", 0, 0) == 0;
+}
+
+spec parse_many {
+    then parse_many("5/minute").ok;
+    then count(parse_many("1/second;5/minute|2/day")) == 3;
+    then at(parse_many("2/3 seconds"), 0).multiples == 3;
+    then at(parse_many("5/0 minute"), 0).multiples == 1;
+    then text_is(parse_many("5/min").error, "no granularity matched for min");
+    then text_is(parse_many("5/minute,").error, "couldn't parse rate limit string '5/minute,'");
+    then !parse_many("99999999999999999999/minute").ok;
+    then !parse_many("1/9999999999 years").ok;
+}
+
+spec "every captured parse_many reproduced" {
+    then parse_range_agrees(0, 32);
+    then parse_range_agrees(32, ratelimit::fixture::parse_count());
+}

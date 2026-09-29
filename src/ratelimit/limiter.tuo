@@ -1,0 +1,556 @@
+// ratelimit::limiter — slowapi's `Limiter`, as data.
+//
+// slowapi attaches limits to endpoint functions with decorators and, on
+// each request to one, checks them in the order they were registered —
+// the order Python applies decorators, innermost first — against the
+// strategy's storage. For each limit it builds the key arguments: the
+// key prefix when one is set, the client address (`get_remote_address`:
+// the host, or `127.0.0.1` when there is none), and the scope — the
+// shared scope of a `shared_limit`, else the request path (the default
+// `key_style="url"`, so `/jobs/1` and `/jobs/2` are separate buckets) or
+// the endpoint's `module.function` name (`key_style="endpoint"`), with
+// `:METHOD` appended for a `per_method` limit. A limit restricted to
+// `methods` is skipped for any other method. Every limit that is checked
+// is hit — spent — until one fails; the rest are then not hit at all.
+//
+// The limit slowapi reports (`request.state.view_rate_limit`, used for the
+// headers) is the first checked limit with the shortest granularity —
+// `limits` orders items by granularity alone, so `2/second` beats
+// `5/minute` and the first of two per-minute limits wins — or the one
+// that failed. The failure is `RateLimitExceeded`, whose detail is the
+// limit's `error_message` or its `repr`, and whose default handler
+// answers 429 with `{"error": "Rate limit exceeded: <detail>"}`.
+//
+// With `headers_enabled`, a response carries `X-RateLimit-Limit`,
+// `X-RateLimit-Remaining`, `X-RateLimit-Reset` (one second past the
+// window's reset, as a Python float) and `Retry-After` (whole seconds
+// from now to that, truncated). Each decorator on the endpoint wraps it
+// once and appends the first three again — a route with two decorators
+// sends them twice — while `Retry-After` is set, not appended, and comes
+// out once; the 429 is built by the handler, outside the wrappers, and
+// carries them once.
+//
+// `check` runs the limits against a `ratelimit::memory::Store`;
+// `ratelimit::client::check` runs the same plan against Redis.
+//
+// Not ported: dynamic (callable) limits, `exempt_when`, callable costs,
+// `default_limits` and `application_limits` (both need slowapi's
+// middleware), the in-memory fallback, `swallow_errors`,
+// `retry_after="http-date"`, and the `RATELIMIT_*` settings slowapi reads
+// from a `.env` in the working directory. Times are milliseconds since
+// the epoch; `X-RateLimit-Reset` and `Retry-After` are exact where
+// Python's float arithmetic is, which is for every time from 2004 to 2038
+// (one binade of `float`).
+
+module ratelimit::limiter;
+
+/// One registered limit.
+pub struct Limit {
+    route: String,
+    layer: Int,
+    item: ratelimit::item::Item,
+    scope: String,
+    per_method: Bool,
+    methods: String,
+    cost: Int,
+    message: String,
+}
+
+/// The knobs of `limit` beyond the limit string. `methods` empty means
+/// every method; `message` empty means the limit's own `repr`.
+pub struct Options {
+    per_method: Bool,
+    methods: Array[String],
+    cost: Int,
+    message: String,
+}
+
+/// A limiter: its settings and every limit registered on it.
+pub struct Limiter {
+    enabled: Bool,
+    headers_enabled: Bool,
+    key_prefix: String,
+    by_endpoint: Bool,
+    limits: Array[Limit],
+    layers: Int,
+    layer_routes: Array[String],
+}
+
+/// One limit, ready to spend: the item, its key and key arguments (one
+/// per line), the cost, and the detail a failure would carry.
+pub struct Hit {
+    item: ratelimit::item::Item,
+    key: String,
+    args: String,
+    cost: Int,
+    detail: String,
+}
+
+/// What checking a request came to. `has_view` is whether slowapi set a
+/// `view_rate_limit`; `view` is it. `failed` is a storage that did not
+/// answer — slowapi would have raised.
+pub struct Decision {
+    has_view: Bool,
+    view: Hit,
+    exceeded: Bool,
+    failed: Bool,
+}
+
+/// A limiter with slowapi's defaults: enabled, no headers, no key
+/// prefix, keyed by URL.
+///
+/// # Example
+/// ```tuo
+/// var l = ratelimit::limiter::new();
+/// ```
+pub fn new() -> Limiter {
+    Limiter { enabled: true, headers_enabled: false, key_prefix: std::string::empty(), by_endpoint: false, limits: std::array::empty(), layers: 0, layer_routes: std::array::empty() }
+}
+
+/// The default options: one method-blind limit costing 1.
+///
+/// # Example
+/// ```tuo
+/// var o = ratelimit::limiter::options();
+/// ```
+pub fn options() -> Options {
+    Options { per_method: false, methods: std::array::empty(), cost: 1, message: std::string::empty() }
+}
+
+/// Register `text` on `route` — the endpoint's `module.function` — as a
+/// `@limiter.limit(text)` decorator would. False when the string does not
+/// parse; slowapi logs that and the endpoint then goes unlimited by it.
+///
+/// # Example
+/// ```tuo
+/// let ok = ratelimit::limiter::limit(l, "app.api.routers.job_applicant.auth.login_job_applicant", "5/minute");
+/// ```
+pub fn limit(mut l: Limiter, in route: Str, in text: Str) -> Bool {
+    limit_with(l, route, text, options())
+}
+
+/// `limit` with `per_method`, `methods`, `cost`, or `error_message`.
+///
+/// # Example
+/// ```tuo
+/// var o = ratelimit::limiter::options();
+/// o.cost = 2;
+/// let ok = ratelimit::limiter::limit_with(l, "app.costly", "5/minute", o);
+/// ```
+pub fn limit_with(mut l: Limiter, in route: Str, in text: Str, in o: Options) -> Bool {
+    register(l, route, text, "", o)
+}
+
+/// Register `text` on `route` under the shared `scope`, as
+/// `@limiter.shared_limit(text, scope=scope)` would: every route with the
+/// same scope spends from one bucket.
+///
+/// # Example
+/// ```tuo
+/// let ok = ratelimit::limiter::shared_limit(l, "app.a", "3/minute", "pair");
+/// ```
+pub fn shared_limit(mut l: Limiter, in route: Str, in text: Str, in scope: Str) -> Bool {
+    register(l, route, text, scope, options())
+}
+
+fn register(mut l: Limiter, in route: Str, in text: Str, in scope: Str, in o: Options) -> Bool {
+    l.layers = l.layers + 1;
+    std::array::push(l.layer_routes, std::string::from_str(route));
+    let p = ratelimit::item::parse_many(text);
+    if !p.ok {
+        return false;
+    }
+    var k = 0;
+    while k < ratelimit::item::count(p) {
+        var methods = std::string::empty();
+        var m = 0;
+        while m < std::array::len(o.methods) {
+            std::str::push(methods, "\n");
+            std::str::push(methods, std::string::as_str(std::str::to_lower(std::string::as_str(std::array::get(o.methods, m)))));
+            m = m + 1;
+        }
+        if m > 0 {
+            std::str::push(methods, "\n");
+        }
+        std::array::push(l.limits, Limit { route: std::string::from_str(route), layer: l.layers, item: ratelimit::item::at(p, k), scope: std::string::from_str(scope), per_method: o.per_method, methods: methods, cost: o.cost, message: std::string::from_str(std::string::as_str(o.message)) });
+        k = k + 1;
+    }
+    true
+}
+
+/// How many decorators `route` carries — how many times a successful
+/// response's rate-limit headers are appended.
+///
+/// # Example
+/// ```tuo
+/// let n = ratelimit::limiter::layers(l, "app.stacked"); // 2
+/// ```
+pub fn layers(in l: Limiter, in route: Str) -> Int {
+    var n = 0;
+    var i = 0;
+    while i < std::array::len(l.layer_routes) {
+        if std::string::as_str(std::array::get(l.layer_routes, i)) == route {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    n
+}
+
+/// Whether `route` carries any decorator at all.
+///
+/// # Example
+/// ```tuo
+/// let marked = ratelimit::limiter::is_limited(l, "app.open"); // false
+/// ```
+pub fn is_limited(in l: Limiter, in route: Str) -> Bool {
+    layers(l, route) > 0
+}
+
+/// `get_remote_address`: the client host, or `127.0.0.1` without one.
+///
+/// # Example
+/// ```tuo
+/// let a = ratelimit::limiter::remote_address(""); // "127.0.0.1"
+/// ```
+pub fn remote_address(in host: Str) -> String {
+    if std::str::len(host) == 0 {
+        return std::string::from_str("127.0.0.1");
+    }
+    std::string::from_str(host)
+}
+
+fn copy_hit(in h: Hit) -> Hit {
+    Hit { item: ratelimit::item::new(h.item.amount, h.item.multiples, h.item.granularity), key: std::string::from_str(std::string::as_str(h.key)), args: std::string::from_str(std::string::as_str(h.args)), cost: h.cost, detail: std::string::from_str(std::string::as_str(h.detail)) }
+}
+
+/// Whether `lim` is checked for `method`: its methods are held as
+/// `\npost\nget\n`, lower-cased, or empty for every method.
+fn applies(in lim: Limit, in method: Str) -> Bool {
+    if std::string::len(lim.methods) == 0 {
+        return true;
+    }
+    var needle = std::string::from_str("\n");
+    std::str::push(needle, std::string::as_str(std::str::to_lower(method)));
+    std::str::push(needle, "\n");
+    std::str::contains(std::string::as_str(lim.methods), std::string::as_str(needle))
+}
+
+/// The limits a request to `route` checks, in order, with their keys:
+/// method filters applied, scopes and prefixes resolved. Empty when the
+/// limiter is disabled.
+///
+/// # Example
+/// ```tuo
+/// let hits = ratelimit::limiter::plan(l, "app.login", "POST", "/login", "203.0.113.7");
+/// ```
+pub fn plan(in l: Limiter, in route: Str, in method: Str, in path: Str, in host: Str) -> Array[Hit] {
+    var hits = std::array::empty();
+    if !l.enabled {
+        return hits;
+    }
+    var i = 0;
+    while i < std::array::len(l.limits) {
+        let lim = std::array::get(l.limits, i);
+        if std::string::as_str(lim.route) == route && applies(lim, method) {
+            var scope = std::string::from_str(std::string::as_str(lim.scope));
+            if std::string::len(scope) == 0 {
+                if l.by_endpoint {
+                    scope = std::string::from_str(route);
+                } else {
+                    scope = std::string::from_str(path);
+                }
+            }
+            if lim.per_method {
+                std::str::push(scope, ":");
+                std::str::push(scope, method);
+            }
+            var args = std::array::empty();
+            if std::string::len(l.key_prefix) > 0 {
+                std::array::push(args, std::string::from_str(std::string::as_str(l.key_prefix)));
+            }
+            std::array::push(args, remote_address(host));
+            std::array::push(args, scope);
+            var detail = std::string::from_str(std::string::as_str(lim.message));
+            if std::string::len(detail) == 0 {
+                detail = ratelimit::item::describe(lim.item);
+            }
+            let item = ratelimit::item::new(lim.item.amount, lim.item.multiples, lim.item.granularity);
+            let key = ratelimit::item::key_for(item, args);
+            var joined = std::string::empty();
+            var a = 0;
+            while a < std::array::len(args) {
+                if a > 0 {
+                    std::str::push(joined, "\n");
+                }
+                std::str::push(joined, std::string::as_str(std::array::get(args, a)));
+                a = a + 1;
+            }
+            std::array::push(hits, Hit { item: item, key: key, args: joined, cost: lim.cost, detail: detail });
+        }
+        i = i + 1;
+    }
+    hits
+}
+
+/// A decision before any limit is checked.
+///
+/// # Example
+/// ```tuo
+/// var d = ratelimit::limiter::decision();
+/// ```
+pub fn decision() -> Decision {
+    Decision { has_view: false, view: Hit { item: ratelimit::item::new(0, 1, 1), key: std::string::empty(), args: std::string::empty(), cost: 0, detail: std::string::empty() }, exceeded: false, failed: false }
+}
+
+/// Fold one spent limit into `d`: `passed` is what the storage said.
+///
+/// # Example
+/// ```tuo
+/// ratelimit::limiter::record(d, h, true);
+/// ```
+pub fn record(mut d: Decision, in h: Hit, take passed: Bool) {
+    if !d.has_view || h.item.granularity < d.view.item.granularity || !passed {
+        d.view = copy_hit(h);
+        d.has_view = true;
+    }
+    if !passed {
+        d.exceeded = true;
+    }
+}
+
+/// Check a request to `route` against `store` at `now`, spending what it
+/// costs.
+///
+/// # Example
+/// ```tuo
+/// let d = ratelimit::limiter::check(l, store, "app.login", "POST", "/login", "203.0.113.7", now);
+/// ```
+pub fn check(in l: Limiter, mut store: ratelimit::memory::Store, in route: Str, in method: Str, in path: Str, in host: Str, take now: Int) -> Decision {
+    var d = decision();
+    let hits = plan(l, route, method, path, host);
+    var i = 0;
+    while i < std::array::len(hits) {
+        let h = std::array::get(hits, i);
+        let passed = ratelimit::memory::hit(store, h.item, std::string::as_str(h.key), h.cost, now);
+        record(d, h, passed);
+        if !passed {
+            return d;
+        }
+        i = i + 1;
+    }
+    d
+}
+
+/// The window of `d`'s view in `store` at `now`.
+///
+/// # Example
+/// ```tuo
+/// let st = ratelimit::limiter::view_stats(store, d, now);
+/// ```
+pub fn view_stats(mut store: ratelimit::memory::Store, in d: Decision, take now: Int) -> ratelimit::item::Stats {
+    ratelimit::memory::stats(store, d.view.item, std::string::as_str(d.view.key), now)
+}
+
+// ----------------------------------------------------------------------------
+// Responses.
+// ----------------------------------------------------------------------------
+
+/// A time in milliseconds as Python prints the float of its seconds:
+/// `1790000061.25`, `1790000061.0`.
+///
+/// # Example
+/// ```tuo
+/// let t = ratelimit::limiter::seconds_text(1790000061250); // "1790000061.25"
+/// ```
+pub fn seconds_text(take ms: Int) -> String {
+    var out = std::string::empty();
+    var whole = ms / 1000;
+    var frac = ms % 1000;
+    if ms < 0 && frac != 0 {
+        std::str::push(out, "-");
+        whole = 0 - whole;
+        frac = 0 - frac;
+    }
+    std::str::push_int(out, whole);
+    std::str::push(out, ".");
+    if frac == 0 {
+        std::str::push(out, "0");
+        return out;
+    }
+    var digits = 3;
+    while frac % 10 == 0 {
+        frac = frac / 10;
+        digits = digits - 1;
+    }
+    var pad = frac;
+    var width = 1;
+    while pad >= 10 {
+        pad = pad / 10;
+        width = width + 1;
+    }
+    while width < digits {
+        std::str::push(out, "0");
+        width = width + 1;
+    }
+    std::str::push_int(out, frac);
+    out
+}
+
+/// Whole seconds from `now` to one second past `reset`, truncated:
+/// `Retry-After`.
+///
+/// # Example
+/// ```tuo
+/// let s = ratelimit::limiter::retry_after(1790000060250, 1790000003500); // 57
+/// ```
+pub fn retry_after(take reset: Int, take now: Int) -> Int {
+    (reset + 1000 - now) / 1000
+}
+
+/// The rate-limit header lines for `d` — the first three `times` over,
+/// then `Retry-After` — or nothing when headers are off or there is no
+/// view.
+///
+/// # Example
+/// ```tuo
+/// let extra = ratelimit::limiter::header_lines(l, d, st, now, 1);
+/// ```
+pub fn header_lines(in l: Limiter, in d: Decision, in st: ratelimit::item::Stats, take now: Int, take times: Int) -> String {
+    var out = std::string::empty();
+    if !l.enabled || !l.headers_enabled || !d.has_view {
+        return out;
+    }
+    let limit = std::str::to_string(d.view.item.amount);
+    let remaining = std::str::to_string(st.remaining);
+    let reset = seconds_text(st.reset + 1000);
+    var i = 0;
+    while i < times {
+        http::message::header_line(out, "X-RateLimit-Limit", std::string::as_str(limit));
+        http::message::header_line(out, "X-RateLimit-Remaining", std::string::as_str(remaining));
+        http::message::header_line(out, "X-RateLimit-Reset", std::string::as_str(reset));
+        i = i + 1;
+    }
+    http::message::header_line(out, "Retry-After", std::string::as_str(std::str::to_string(retry_after(st.reset, now))));
+    out
+}
+
+/// The body of slowapi's default 429.
+///
+/// # Example
+/// ```tuo
+/// let body = ratelimit::limiter::exceeded_body(d); // {"error":"Rate limit exceeded: 5 per 1 minute"}
+/// ```
+pub fn exceeded_body(in d: Decision) -> String {
+    var message = std::string::from_str("Rate limit exceeded: ");
+    std::str::push(message, std::string::as_str(d.view.detail));
+    var body = std::string::from_str("{\"error\":");
+    web::json::push_string(body, std::string::as_str(message));
+    std::str::push(body, "}");
+    body
+}
+
+/// slowapi's default 429 for an exceeded `d`: `_rate_limit_exceeded_handler`.
+///
+/// # Example
+/// ```tuo
+/// let raw = ratelimit::limiter::exceeded_response(l, d, st, now);
+/// ```
+pub fn exceeded_response(in l: Limiter, in d: Decision, in st: ratelimit::item::Stats, take now: Int) -> String {
+    var extra = std::string::empty();
+    http::message::header_line(extra, "Content-Type", "application/json");
+    std::str::push(extra, std::string::as_str(header_lines(l, d, st, now, 1)));
+    http::message::response(429, std::string::as_str(extra), std::string::as_str(exceeded_body(d)))
+}
+
+/// A JSON `status` response from the endpoint on `route`, with the
+/// rate-limit headers its decorators add.
+///
+/// # Example
+/// ```tuo
+/// let raw = ratelimit::limiter::passed_response(l, "app.login", d, st, now, 200, "{\"ok\":true}");
+/// ```
+pub fn passed_response(in l: Limiter, in route: Str, in d: Decision, in st: ratelimit::item::Stats, take now: Int, take status: Int, in body: Str) -> String {
+    var extra = std::string::empty();
+    http::message::header_line(extra, "Content-Type", "application/json");
+    std::str::push(extra, std::string::as_str(header_lines(l, d, st, now, layers(l, route))));
+    http::message::response(status, std::string::as_str(extra), body)
+}
+
+// ----------------------------------------------------------------------------
+// Specs.
+// ----------------------------------------------------------------------------
+
+fn text_is(in actual: String, in expected: Str) -> Bool {
+    std::string::as_str(actual) == expected
+}
+
+fn first_key(in l: Limiter, in route: Str, in method: Str, in path: Str, in host: Str) -> String {
+    let hits = plan(l, route, method, path, host);
+    if std::array::len(hits) == 0 {
+        return std::string::empty();
+    }
+    std::string::from_str(std::string::as_str(std::array::get(hits, 0).key))
+}
+
+fn keyed() -> Limiter {
+    var l = new();
+    let _ = limit(l, "m.login", "5/minute");
+    let _ = shared_limit(l, "m.a", "3/minute", "pair");
+    var o = options();
+    o.per_method = true;
+    let _ = limit_with(l, "m.method", "2/minute", o);
+    var p = options();
+    std::array::push(p.methods, std::string::from_str("POST"));
+    let _ = limit_with(l, "m.post", "1/minute", p);
+    l
+}
+
+fn view_after(in texts: Str, take failing: Int) -> String {
+    var d = decision();
+    let p = ratelimit::item::parse_many(texts);
+    var i = 0;
+    while i < ratelimit::item::count(p) {
+        let it = ratelimit::item::at(p, i);
+        let h = Hit { item: it, key: ratelimit::item::describe(it), args: std::string::empty(), cost: 1, detail: std::string::empty() };
+        record(d, h, i != failing);
+        if i == failing {
+            return std::string::from_str(std::string::as_str(d.view.key));
+        }
+        i = i + 1;
+    }
+    std::string::from_str(std::string::as_str(d.view.key))
+}
+
+spec plan {
+    then text_is(first_key(keyed(), "m.login", "POST", "/login", "1.2.3.4"), "LIMITER/1.2.3.4//login/5/1/minute");
+    then text_is(first_key(keyed(), "m.login", "POST", "/login", ""), "LIMITER/127.0.0.1//login/5/1/minute");
+    then text_is(first_key(keyed(), "m.a", "GET", "/a", "1.2.3.4"), "LIMITER/1.2.3.4/pair/3/1/minute");
+    then text_is(first_key(keyed(), "m.method", "PUT", "/m", "1.2.3.4"), "LIMITER/1.2.3.4//m:PUT/2/1/minute");
+    then text_is(first_key(keyed(), "m.post", "post", "/p", "1.2.3.4"), "LIMITER/1.2.3.4//p/1/1/minute");
+    then text_is(first_key(keyed(), "m.post", "GET", "/p", "1.2.3.4"), "");
+    then text_is(first_key(keyed(), "m.other", "GET", "/o", "1.2.3.4"), "");
+}
+
+spec record {
+    // The shortest granularity is reported; ties keep the first.
+    then text_is(view_after("5/minute;2/second;4/second", 9), "2 per 1 second");
+    then text_is(view_after("5/minute;3/minute", 9), "5 per 1 minute");
+    // A failure is reported whatever its granularity.
+    then text_is(view_after("2/second;5/minute", 1), "5 per 1 minute");
+}
+
+spec seconds_text {
+    then text_is(seconds_text(1790000061250), "1790000061.25");
+    then text_is(seconds_text(1790000061000), "1790000061.0");
+    then text_is(seconds_text(1790000121100), "1790000121.1");
+    then text_is(seconds_text(1790000121005), "1790000121.005");
+    then text_is(seconds_text(1790000121050), "1790000121.05");
+    then text_is(seconds_text(0), "0.0");
+}
+
+spec retry_after {
+    then retry_after(1790000060250, 1790000003500) == 57;
+    then retry_after(1790000001250, 1790000000250) == 2;
+    then retry_after(1790000000000, 1790000000000) == 1;
+}

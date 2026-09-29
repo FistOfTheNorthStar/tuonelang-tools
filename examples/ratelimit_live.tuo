@@ -1,0 +1,130 @@
+// examples/ratelimit_live — the fixed window against a live Redis.
+//
+// Talks to 127.0.0.1:6380 — the port `shallowflaws/docker/docker-compose.yml`
+// publishes its Redis on — in database 15, the one `examples/redis.tuo`
+// uses, and keys every window by a nonce from the monotonic clock, so it
+// never meets the backend's own `LIMITS:` keys and a rerun never meets
+// its last run's. It checks that the server computes the digest
+// `ratelimit::redis::incr_sha` assumes, spends and inspects windows the
+// way `limits` does, runs slowapi's check through `ratelimit::client`,
+// reads the key back by the name `limits` would give it, and clears what
+// it wrote.
+//
+//     tuo run examples/ratelimit_live.tuo src/ratelimit/*.tuo src/redis/*.tuo src/web/*.tuo src/http/message.tuo src/http/fixture.tuo src/http/url.tuo src/std_str.tuo src/std_bits.tuo src/std_net.tuo
+//
+// One line per check; exit is the failure count.
+
+module ratelimit_live;
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn ids(in first: Str, in second: Str) -> Array[String] {
+    var out = std::array::empty();
+    std::array::push(out, std::string::from_str(first));
+    std::array::push(out, std::string::from_str(second));
+    out
+}
+
+fn main() -> Int {
+    let t = 5000;
+    // The strategy is told the time; any fixed instant will do.
+    let now = 1790000000000;
+    var failed = 0;
+    let fd = ratelimit::client::open("redis://127.0.0.1:6380/15", t);
+    failed = failed + report("connect to redis://127.0.0.1:6380/15 (shallowflaws docker redis)", fd >= 0);
+    if fd < 0 {
+        return failed;
+    }
+    failed = failed + report("the storage answers its health check", ratelimit::client::healthy(fd, t));
+
+    let loaded = redis::client::call(fd, ratelimit::redis::load_incr(), t);
+    failed = failed + report("SCRIPT LOAD of incr_expire.lua returns the digest EVALSHA sends", std::string::as_str(redis::client::reply_text(loaded, "")) == ratelimit::redis::incr_sha());
+
+    var nonce = std::string::from_str("tuo-live-");
+    std::str::push_int(nonce, std::rt::now_nanos());
+    let login = ratelimit::item::new(5, 1, ratelimit::item::minute());
+    let key = ratelimit::item::key_for(login, ids(std::string::as_str(nonce), "/login"));
+    let k = std::string::as_str(key);
+
+    var passes = 0;
+    var last = 0;
+    var i = 0;
+    while i < 6 {
+        let c = ratelimit::client::hit(fd, login, k, 1, t);
+        if c.passed && !c.failed {
+            passes = passes + 1;
+        }
+        last = c.count;
+        i = i + 1;
+    }
+    failed = failed + report("5/minute: five hits pass, the sixth fails and still counts", passes == 5 && last == 6);
+    let tested = ratelimit::client::test(fd, login, k, 1, t);
+    failed = failed + report("test: the spent window has no room", !tested.passed && !tested.failed);
+    let st = ratelimit::client::stats(fd, login, k, now, t);
+    failed = failed + report("stats: nothing remains, and the window closes a minute on", st.stats.remaining == 0 && (st.stats.reset == now + 60000 || st.stats.reset == now + 59000));
+    let ttl = redis::client::reply_int(redis::client::call(fd, redis::command::ttl(std::string::as_str(ratelimit::redis::prefixed(k))), t));
+    failed = failed + report("the script set the key's expiry on the first hit only", ttl == 60 || ttl == 59);
+
+    let cleared = ratelimit::client::clear(fd, k, t);
+    let after = ratelimit::client::test(fd, login, k, 1, t);
+    let fresh = ratelimit::client::stats(fd, login, k, now, t);
+    failed = failed + report("clear: the window is gone; a missing key's TTL of -2 reads as now", !cleared.failed && after.passed && fresh.stats.remaining == 5 && fresh.stats.reset == now);
+
+    let reset = ratelimit::item::new(3, 1, ratelimit::item::hour());
+    let rkey = ratelimit::item::key_for(reset, ids(std::string::as_str(nonce), "/reset"));
+    let big = ratelimit::client::hit(fd, reset, std::string::as_str(rkey), 3, t);
+    let over = ratelimit::client::hit(fd, reset, std::string::as_str(rkey), 1, t);
+    failed = failed + report("cost: 3 of 3/hour fits, one more does not", big.passed && big.count == 3 && !over.passed && over.count == 4);
+    let _ = ratelimit::client::clear(fd, std::string::as_str(rkey), t);
+
+    // slowapi's check, the backend's way: keyed by address and path.
+    var l = ratelimit::limiter::new();
+    let _ = ratelimit::limiter::limit(l, "app.api.routers.job_applicant.auth.login_job_applicant", "5/minute");
+    let path = "/api/v1/job_applicant/auth/login";
+    var exceeded_at = 0 - 1;
+    var n = 0;
+    while n < 6 {
+        let d = ratelimit::client::check(fd, l, "app.api.routers.job_applicant.auth.login_job_applicant", "POST", path, std::string::as_str(nonce), t);
+        if d.exceeded && exceeded_at < 0 {
+            exceeded_at = n;
+        }
+        if d.failed {
+            exceeded_at = 0 - 2;
+        }
+        n = n + 1;
+    }
+    failed = failed + report("slowapi check over Redis: the sixth login is refused", exceeded_at == 5);
+    let d = ratelimit::client::check(fd, l, "app.api.routers.job_applicant.auth.login_job_applicant", "POST", path, std::string::as_str(nonce), t);
+    let vs = ratelimit::client::view_stats(fd, d, now, t);
+    failed = failed + report("  its 429 body is slowapi's", std::string::as_str(ratelimit::limiter::exceeded_body(d)) == "{\"error\":\"Rate limit exceeded: 5 per 1 minute\"}" && vs.remaining == 0);
+    var stored = std::string::from_str("LIMITS:LIMITER/");
+    std::str::push(stored, std::string::as_str(nonce));
+    std::str::push(stored, "/");
+    std::str::push(stored, path);
+    std::str::push(stored, "/5/1/minute");
+    let count = redis::client::get_or(fd, std::string::as_str(stored), "", t);
+    failed = failed + report("  the count sits under the key limits would name, spent 7 times", std::string::as_str(count) == "7");
+    let _ = ratelimit::client::clear(fd, std::string::as_str(d.view.key), t);
+    let gone = redis::client::get_or(fd, std::string::as_str(stored), "gone", t);
+    failed = failed + report("  and is cleared", std::string::as_str(gone) == "gone");
+
+    let _ = redis::client::close(fd);
+    let dead = ratelimit::client::hit(fd, login, k, 1, t);
+    failed = failed + report("a closed connection fails the call instead of passing it", dead.failed && !dead.passed);
+    failed
+}

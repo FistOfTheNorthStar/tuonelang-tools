@@ -1,0 +1,499 @@
+// ratelimit::redis — `limits`' RedisStorage, as the conversation it holds.
+//
+// With Redis behind it, the fixed window is one Lua script. `limits` keeps
+// its keys under `LIMITS:` and increments through `incr_expire.lua` —
+// INCRBY, and EXPIRE when the count equals what was added — sent by
+// redis-py as `EVALSHA <sha1 of the script> 1 <key> <expiry> <amount>`.
+// A server that has not seen the script answers `NOSCRIPT`, and redis-py
+// then sends `SCRIPT LOAD <script>`, adopts the digest the server returns,
+// and sends the EVALSHA again. `test` is a GET; the window stats are a GET
+// and a TTL, the reset being the TTL (a missing key's -2 counts as 0)
+// plus now; `clear` is a DEL; the storage's health check is a PING.
+//
+// Each of those is a `Call`: it holds the next command to write, and
+// `feed` takes the reply that came back and either sets the next command
+// or finishes with the outcome. Nothing here touches a socket —
+// `ratelimit::client` runs a call over one, and `replay` runs one over
+// replies captured from a real server, which is how the specs hold every
+// command to the bytes redis-py wrote. An empty reply (no answer), an
+// error other than the first NOSCRIPT, or a reply of the wrong shape
+// finishes the call as `failed`, where `limits` would have raised.
+
+module ratelimit::redis;
+
+/// One storage operation in flight.
+pub struct Call {
+    op: Int,
+    key: String,
+    amount: Int,
+    expiry: Int,
+    cost: Int,
+    now: Int,
+    sha: String,
+    stage: Int,
+    next: String,
+    done: Bool,
+    failed: Bool,
+    passed: Bool,
+    count: Int,
+    stats: ratelimit::item::Stats,
+}
+
+/// `check`: a PING.
+///
+/// # Example
+/// ```tuo
+/// let op = ratelimit::redis::op_check(); // 0
+/// ```
+pub fn op_check() -> Int {
+    0
+}
+
+/// `hit`: the increment script.
+///
+/// # Example
+/// ```tuo
+/// let op = ratelimit::redis::op_hit(); // 1
+/// ```
+pub fn op_hit() -> Int {
+    1
+}
+
+/// `test`: a GET.
+///
+/// # Example
+/// ```tuo
+/// let op = ratelimit::redis::op_test(); // 2
+/// ```
+pub fn op_test() -> Int {
+    2
+}
+
+/// `get_window_stats`: a GET and a TTL.
+///
+/// # Example
+/// ```tuo
+/// let op = ratelimit::redis::op_stats(); // 3
+/// ```
+pub fn op_stats() -> Int {
+    3
+}
+
+/// `clear`: a DEL.
+///
+/// # Example
+/// ```tuo
+/// let op = ratelimit::redis::op_clear(); // 4
+/// ```
+pub fn op_clear() -> Int {
+    4
+}
+
+/// The prefix `limits` puts before every key it stores.
+///
+/// # Example
+/// ```tuo
+/// let p = ratelimit::redis::key_prefix(); // "LIMITS"
+/// ```
+pub fn key_prefix() -> Str {
+    "LIMITS"
+}
+
+/// `key` as it is stored: `prefixed_key`.
+///
+/// # Example
+/// ```tuo
+/// let k = ratelimit::redis::prefixed("LIMITER/a/5/1/minute"); // "LIMITS:LIMITER/a/5/1/minute"
+/// ```
+pub fn prefixed(in key: Str) -> String {
+    var out = std::string::from_str(key_prefix());
+    std::str::push(out, ":");
+    std::str::push(out, key);
+    out
+}
+
+/// `incr_expire.lua` from limits 5.8.0, byte for byte.
+///
+/// # Example
+/// ```tuo
+/// let lua = ratelimit::redis::incr_script();
+/// ```
+pub fn incr_script() -> Str {
+    "local current\nlocal amount = tonumber(ARGV[2])\ncurrent = redis.call(\"incrby\", KEYS[1], amount)\n\nif tonumber(current) == amount then\n    redis.call(\"expire\", KEYS[1], ARGV[1])\nend\n\nreturn current\n"
+}
+
+/// The SHA-1 of `incr_script`, which redis-py sends before it knows the
+/// server has the script. `examples/ratelimit.tuo` checks it against the
+/// digest a live server computes.
+///
+/// # Example
+/// ```tuo
+/// let sha = ratelimit::redis::incr_sha();
+/// ```
+pub fn incr_sha() -> Str {
+    "628bd136a573a06b346879695681af12ccef300f"
+}
+
+// ----------------------------------------------------------------------------
+// Commands.
+// ----------------------------------------------------------------------------
+
+/// `EVALSHA sha 1 key expiry amount`.
+///
+/// # Example
+/// ```tuo
+/// let cmd = ratelimit::redis::evalsha_incr(ratelimit::redis::incr_sha(), "LIMITS:k", 60, 1);
+/// ```
+pub fn evalsha_incr(in sha: Str, in key: Str, take expiry: Int, take amount: Int) -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, "EVALSHA");
+    redis::resp::push_arg(args, sha);
+    redis::resp::push_arg(args, "1");
+    redis::resp::push_arg(args, key);
+    redis::resp::push_int_arg(args, expiry);
+    redis::resp::push_int_arg(args, amount);
+    redis::resp::encode(args)
+}
+
+/// `SCRIPT LOAD` of the increment script.
+///
+/// # Example
+/// ```tuo
+/// let cmd = ratelimit::redis::load_incr();
+/// ```
+pub fn load_incr() -> String {
+    var args = std::array::empty();
+    redis::resp::push_arg(args, "SCRIPT");
+    redis::resp::push_arg(args, "LOAD");
+    redis::resp::push_arg(args, incr_script());
+    redis::resp::encode(args)
+}
+
+// ----------------------------------------------------------------------------
+// Calls.
+// ----------------------------------------------------------------------------
+
+fn call(take op: Int, in key: Str, in it: ratelimit::item::Item, take cost: Int, take now: Int, take first: String) -> Call {
+    Call { op: op, key: std::string::from_str(key), amount: it.amount, expiry: ratelimit::item::expiry(it), cost: cost, now: now, sha: std::string::from_str(incr_sha()), stage: 0, next: first, done: false, failed: false, passed: false, count: 0, stats: ratelimit::item::Stats { reset: 0, remaining: 0 } }
+}
+
+/// The storage's health check: `check`.
+///
+/// # Example
+/// ```tuo
+/// var c = ratelimit::redis::check();
+/// ```
+pub fn check() -> Call {
+    call(op_check(), "", ratelimit::item::new(0, 1, 1), 0, 0, redis::command::ping())
+}
+
+/// Spend `cost` of `it` under `key` (unprefixed): `hit`.
+///
+/// # Example
+/// ```tuo
+/// var c = ratelimit::redis::hit(it, "LIMITER/a/5/1/minute", 1);
+/// ```
+pub fn hit(in it: ratelimit::item::Item, in key: Str, take cost: Int) -> Call {
+    let k = prefixed(key);
+    let first = evalsha_incr(incr_sha(), std::string::as_str(k), ratelimit::item::expiry(it), cost);
+    call(op_hit(), std::string::as_str(k), it, cost, 0, first)
+}
+
+/// Whether `cost` more of `it` would fit under `key`: `test`.
+///
+/// # Example
+/// ```tuo
+/// var c = ratelimit::redis::test(it, "LIMITER/a/5/1/minute", 1);
+/// ```
+pub fn test(in it: ratelimit::item::Item, in key: Str, take cost: Int) -> Call {
+    let k = prefixed(key);
+    let first = redis::command::get(std::string::as_str(k));
+    call(op_test(), std::string::as_str(k), it, cost, 0, first)
+}
+
+/// The window of `it` under `key` at `now`: `get_window_stats`.
+///
+/// # Example
+/// ```tuo
+/// var c = ratelimit::redis::stats(it, "LIMITER/a/5/1/minute", now);
+/// ```
+pub fn stats(in it: ratelimit::item::Item, in key: Str, take now: Int) -> Call {
+    let k = prefixed(key);
+    let first = redis::command::get(std::string::as_str(k));
+    call(op_stats(), std::string::as_str(k), it, 0, now, first)
+}
+
+/// Close the window under `key`: `clear`.
+///
+/// # Example
+/// ```tuo
+/// var c = ratelimit::redis::clear("LIMITER/a/5/1/minute");
+/// ```
+pub fn clear(in key: Str) -> Call {
+    let k = prefixed(key);
+    let first = redis::command::del(std::string::as_str(k));
+    call(op_clear(), std::string::as_str(k), ratelimit::item::new(0, 1, 1), 0, 0, first)
+}
+
+fn finish(mut c: Call) {
+    c.done = true;
+    c.next = std::string::empty();
+}
+
+fn fail(mut c: Call) {
+    c.failed = true;
+    finish(c);
+}
+
+/// What `reply_number` gives for a reply that holds no number.
+fn no_number() -> Int {
+    0 - 4611686018427387904
+}
+
+/// A reply's integer, as redis-py's `int()` reads an integer reply, a
+/// bulk string of digits, or a null (`or 0`); `no_number` when it is none.
+fn reply_number(in raw: Str) -> Int {
+    let r = redis::resp::parse(raw);
+    if !redis::resp::is_complete(r) {
+        return no_number();
+    }
+    let root = redis::resp::root();
+    let kind = redis::resp::kind_of(r, root);
+    if kind == redis::resp::kind_integer() {
+        return redis::resp::int_of(r, root);
+    }
+    if kind == redis::resp::kind_null() {
+        return 0;
+    }
+    if kind == redis::resp::kind_bulk() {
+        let text = redis::resp::text_of(r, raw, root);
+        let t = std::string::as_str(text);
+        return match std::str::parse_int(t) {
+            Ok { value } => value,
+            Err { error } => no_number(),
+        };
+    }
+    no_number()
+}
+
+fn error_starts(in raw: Str, in prefix: Str) -> Bool {
+    let r = redis::resp::parse(raw);
+    redis::resp::is_complete(r) && redis::resp::is_error(r, redis::resp::root()) && std::str::starts_with(std::string::as_str(redis::resp::text_of(r, raw, redis::resp::root())), prefix)
+}
+
+/// Take the reply to `c.next`, and either set the next command or finish.
+///
+/// # Example
+/// ```tuo
+/// ratelimit::redis::feed(c, ":1\r\n");
+/// ```
+pub fn feed(mut c: Call, in reply: Str) {
+    if c.done {
+        return;
+    }
+    if c.op == op_check() {
+        c.passed = reply == "+PONG\r\n";
+        if !c.passed {
+            c.failed = true;
+        }
+        finish(c);
+        return;
+    }
+    if c.op == op_hit() {
+        if c.stage == 0 && error_starts(reply, "NOSCRIPT") {
+            c.stage = 1;
+            c.next = load_incr();
+            return;
+        }
+        if c.stage == 1 {
+            let r = redis::resp::parse(reply);
+            if !redis::resp::is_complete(r) || redis::resp::kind_of(r, redis::resp::root()) != redis::resp::kind_bulk() {
+                fail(c);
+                return;
+            }
+            c.sha = redis::resp::text_of(r, reply, redis::resp::root());
+            c.stage = 2;
+            c.next = evalsha_incr(std::string::as_str(c.sha), std::string::as_str(c.key), c.expiry, c.cost);
+            return;
+        }
+        let r = redis::resp::parse(reply);
+        if !redis::resp::is_complete(r) || redis::resp::kind_of(r, redis::resp::root()) != redis::resp::kind_integer() {
+            fail(c);
+            return;
+        }
+        c.count = redis::resp::int_of(r, redis::resp::root());
+        c.passed = c.count <= c.amount;
+        finish(c);
+        return;
+    }
+    if c.op == op_clear() {
+        let r = redis::resp::parse(reply);
+        if !redis::resp::is_complete(r) || redis::resp::kind_of(r, redis::resp::root()) != redis::resp::kind_integer() {
+            fail(c);
+            return;
+        }
+        finish(c);
+        return;
+    }
+    let n = reply_number(reply);
+    if n == no_number() {
+        fail(c);
+        return;
+    }
+    if c.stage == 0 {
+        c.count = n;
+        if c.op == op_test() {
+            c.passed = c.count < c.amount - c.cost + 1;
+            finish(c);
+            return;
+        }
+        c.stage = 1;
+        c.next = redis::command::ttl(std::string::as_str(c.key));
+        return;
+    }
+    var ttl = n;
+    if ttl < 0 {
+        ttl = 0;
+    }
+    var remaining = c.amount - c.count;
+    if remaining < 0 {
+        remaining = 0;
+    }
+    c.stats = ratelimit::item::Stats { reset: ttl * 1000 + c.now, remaining: remaining };
+    finish(c);
+}
+
+/// Run `c` against `replies` — whole RESP replies back to back, as a
+/// server sent them — and return the commands it wrote, back to back.
+/// Running out of replies feeds an empty one.
+///
+/// # Example
+/// ```tuo
+/// let wrote = ratelimit::redis::replay(c, ":1\r\n");
+/// ```
+pub fn replay(mut c: Call, in replies: Str) -> String {
+    var wrote = std::string::empty();
+    var at = 0;
+    let n = std::str::len(replies);
+    while !c.done {
+        std::str::push(wrote, std::string::as_str(c.next));
+        var end = at;
+        if at < n {
+            let r = redis::resp::parse(std::str::slice(replies, at, n));
+            if redis::resp::is_complete(r) {
+                end = at + redis::resp::end_of(r);
+            }
+        }
+        feed(c, std::str::slice(replies, at, end));
+        at = end;
+    }
+    wrote
+}
+
+// ----------------------------------------------------------------------------
+// Specs: every captured call, replayed against the captured replies.
+// ----------------------------------------------------------------------------
+
+fn bool_text(take b: Bool) -> String {
+    if b {
+        std::string::from_str("true")
+    } else {
+        std::string::from_str("false")
+    }
+}
+
+/// Fixture call `i`, begun.
+fn begin(take i: Int) -> Call {
+    let op = ratelimit::fixture::redis_op(i);
+    if op == "check" {
+        return check();
+    }
+    let it = ratelimit::item::at(ratelimit::item::parse_many(ratelimit::fixture::redis_limit(i)), 0);
+    let key = ratelimit::item::key_for(it, std::str::split(ratelimit::fixture::redis_ids(i), "\n"));
+    let k = std::string::as_str(key);
+    if op == "hit" {
+        return hit(it, k, ratelimit::fixture::redis_cost(i));
+    }
+    if op == "test" {
+        return test(it, k, ratelimit::fixture::redis_cost(i));
+    }
+    if op == "stats" {
+        return stats(it, k, ratelimit::fixture::t0());
+    }
+    clear(k)
+}
+
+/// A finished call's outcome, in the fixture's terms.
+fn outcome(in c: Call) -> String {
+    if c.op == op_stats() {
+        var out = std::string::empty();
+        std::str::push_int(out, c.stats.reset);
+        std::str::push(out, ",");
+        std::str::push_int(out, c.stats.remaining);
+        return out;
+    }
+    if c.op == op_clear() {
+        return std::string::empty();
+    }
+    bool_text(c.passed)
+}
+
+/// Whether fixture call `i` wrote the bytes redis-py wrote and came to
+/// what `limits` returned.
+///
+/// # Example
+/// ```tuo
+/// let same = ratelimit::redis::call_agrees(1);
+/// ```
+pub fn call_agrees(take i: Int) -> Bool {
+    var c = begin(i);
+    let wrote = replay(c, ratelimit::fixture::redis_replies(i));
+    std::string::as_str(wrote) == ratelimit::fixture::redis_commands(i) && !c.failed && std::string::as_str(outcome(c)) == ratelimit::fixture::redis_result(i)
+}
+
+fn calls_agree() -> Bool {
+    var i = 0;
+    while i < ratelimit::fixture::redis_count() {
+        if !call_agrees(i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn fails_on(take op: Int, in replies: Str) -> Bool {
+    let it = ratelimit::item::new(5, 1, 60);
+    var c = check();
+    if op == op_hit() {
+        c = hit(it, "k", 1);
+    } else if op == op_stats() {
+        c = stats(it, "k", 0);
+    }
+    let _ = replay(c, replies);
+    c.failed
+}
+
+spec prefixed {
+    then std::string::as_str(prefixed("LIMITER/a/1/1/second")) == "LIMITS:LIMITER/a/1/1/second";
+}
+
+spec evalsha_incr {
+    then std::string::as_str(evalsha_incr("ab", "k", 60, 1)) == "*6\r\n$7\r\nEVALSHA\r\n$2\r\nab\r\n$1\r\n1\r\n$1\r\nk\r\n$2\r\n60\r\n$1\r\n1\r\n";
+    then std::str::len(incr_script()) == 195;
+}
+
+spec "a failed conversation fails the call" {
+    then fails_on(op_hit(), "");
+    then fails_on(op_hit(), "-ERR boom\r\n");
+    then fails_on(op_hit(), "-NOSCRIPT x\r\n-NOSCRIPT x\r\n");
+    then fails_on(op_hit(), "$2\r\nab\r\n");
+    then fails_on(op_stats(), "$1\r\nx\r\n");
+    then fails_on(op_stats(), "$1\r\n1\r\n");
+    then fails_on(op_check(), "-LOADING\r\n");
+    then !fails_on(op_stats(), "$-1\r\n:-2\r\n");
+}
+
+spec "every captured RedisStorage call reproduced, byte for byte" {
+    then calls_agree();
+}
