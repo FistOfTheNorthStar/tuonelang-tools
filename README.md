@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Fifteen ports so far:
+Seventeen ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -21,14 +21,16 @@ Fifteen ports so far:
 | **`sentry`** — DSNs, scope with breadcrumbs and tags, message and error events, the envelope, the logging integration | `sentry-sdk` | 6 specs, 7 envelopes serialized by sentry-sdk 2.69 reproduced byte for byte, and a 12-check loopback oracle |
 | **`dotenv`** — `.env` files read as python-dotenv reads them: quoting, escapes, `export`, comments, broken statements and the lines they are reported on, `${VAR:-default}` | `python-dotenv` | 6 specs, and 29 `.env` texts — among them the backend's three example files — read as python-dotenv 1.2.3 read them |
 | **`settings`** — a `BaseSettings` class as data, bound to the environment and a `.env` file: aliases, `AliasChoices`, JSON lists, lax conversion, forbidden extras | `pydantic-settings` | 4 specs, and 33 instantiations of the backend's own 93-field `Settings` by pydantic-settings 2.15 reproduced byte for byte — dumps, errors, and messages |
+| **`inflate`** — deflate and the zlib wrapper, with every zlib error | `zlib` (as `zipfile` and openpyxl use it) | 19 specs, and 82 streams — zlib's own, hand-built corners, and one per error — decompressed as zlib 1.2.12 decompresses them |
+| **`zip`** — archives read as `zipfile` reads them: the end record and ZIP64, names, extra fields, every check `zf.read` makes | `zipfile` | 8 specs, and 49 archives from zipfile, Info-ZIP, `ditto`, and a byte-level builder opened and read alike, exceptions and all |
 | **`ratelimit`** — `limits`' grammar, keys, and fixed window in memory and in Redis; slowapi's check, 429, and headers | `slowapi`, `limits` | 21 specs, 63 strings, 9 storage scripts, 16 Redis exchanges, and 103 requests through slowapi and FastAPI reproduced byte for byte, and a 14-check live oracle |
 | **`jinja`** — the template engine: inheritance, `if`/`elif`/`else`, expressions with filters, autoescaping with `Markup`, Jinja's whitespace rules | `jinja2`, `markupsafe` | 9 specs, and 100 renders of the backend's 30 email templates by Jinja2 3.1.6 reproduced byte for byte |
 | **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
 
 ```bash
 ./run-tests.sh          # front end, the specs, formatting, the native Argon2, X.509,
-                        # settings, and rate-limit oracles, and the HTTP, web, and TLS
-                        # loopback oracles (no network)
+                        # settings, rate-limit, inflate, and zip oracles, and the HTTP,
+                        # web, and TLS loopback oracles (no network)
 ./run-tests.sh --live   # also resolve real names over UDP, fetch from public HTTP servers,
                         # complete TLS 1.3 handshakes with three openssl s_server instances,
                         # fetch https:// from Stripe, Sentry, and Cloudflare, and drive the
@@ -346,6 +348,108 @@ CAs; adding one is one base64 line. And the catalog's own caveat carries
 over: `std::bignum` is variable-time, so the client's X25519 step leaks
 timing on its ephemeral key. Signature *verification* is variable-time
 by design, and there is no signing function in `ec` or `rsa` at all.
+
+---
+
+## `inflate` and `zip` — reading archives
+
+The backend reads zip files three ways: uploaded batches of documents
+through `zipfile` (`unpack_archive`), Excel workbooks through openpyxl,
+and Word documents through its own `.docx` reader. All three are zip
+archives of deflate streams. These two ports are the layer under all
+three: `inflate` decodes RFC 1951 (and RFC 1950's zlib wrapper) as
+CPython's `zlib` does, and `zip` opens and reads an archive as `zipfile`
+does. Both come down to the exception they would raise, with its message
+word for word.
+
+```tuo
+let a = zip::archive::open(bytes);
+if a.ok {
+    var i = 0;
+    while i < zip::archive::count(a) {
+        let e = zip::archive::entry(a, i);
+        let r = zip::archive::read(a, bytes, std::string::as_str(e.filename));
+        i = i + 1;
+    }
+}
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `inflate::huffman` — canonical codes, with `inflate_table`'s rules for what is over-subscribed or incomplete | ✅ proven |
+| `inflate::raw` — stored, fixed, and dynamic blocks; every zlib data error, in zlib's order; truncation as `Z_BUF_ERROR` | ✅ 82 of 82 captured streams alike |
+| `inflate::zlib` — `zlib.decompress(data, wbits)`: the RFC 1950 header, Adler-32, `Z_NEED_DICT`; `crc32` | ✅ proven |
+| `zip::text` — UTF-8 with CPython's `UnicodeDecodeError` text, cp437, `repr` of `str` and `bytes` | ✅ proven |
+| `zip::archive` — the end record and ZIP64, the central directory, name decoding and extra fields, `zf.read` with every check zipfile makes | ✅ 49 of 49 captured archives alike |
+
+### The oracle is zlib and zipfile themselves
+
+`examples/zip_oracle.py` gives CPython's `zlib.decompress` 82 streams:
+zlib's own output at every level and strategy, raw and wrapped;
+streams written bit by bit for what zlib's compressor never emits (the
+longest match at the farthest distance, a lone distance code, a stored
+block of length zero, every code-length repeat); and one malformed
+stream per error inflate reports. It records the output's length,
+CRC-32, and bytes, or the message. Then it writes 49 archives. zipfile
+writes some, Info-ZIP `zip` and macOS `ditto` others, and a
+field-by-field builder the rest: cp437 names, Unicode path fields, a NUL
+in a name, and one malformed archive per exception zipfile raises. The
+script opens each from a file on disk, as the backend does, and records
+every entry and every `zf.read`.
+
+```bash
+../shallowflaws/.venv/bin/python examples/zip_oracle.py   # needs zip and ditto (macOS)
+python3 examples/zip_fixture.py && tuo fmt src/inflate/fixture.tuo src/zip/fixture.tuo
+```
+
+The specs replay the 75 streams held inline and all 49 archives.
+`examples/inflate.tuo` and `examples/zip.tuo` replay everything natively,
+including the seven streams too large to hold inline, which live in
+`examples/zip-test/inflate/`.
+
+### What the specs pin that a comment cannot
+
+**zlib's errors come in zlib's order.** `HLIT` and `HDIST` are judged
+before a code length is read. An incomplete code-length code is refused,
+but a lone one-bit distance code is accepted, and so is none at all
+until a match needs one. A literal code with no end-of-block symbol is
+refused as exactly that. Wherever the bits for a
+decision are missing, the answer is "incomplete or truncated stream",
+not the error those bits would have shown.
+
+**Truncation is not an error inside a zip.** zipfile inflates what the
+entry's compressed size holds and cuts the result to its stated size.
+The CRC is the only check, so a deflate stream cut in half reads as
+`Bad CRC-32`. A stored member shorter than its stated size reads
+without complaint when its CRC agrees.
+
+**Names are three things.** `orig_filename` is the decoded bytes, UTF-8
+or cp437 by flag bit 11. `filename` is that cut at the first NUL, or the
+Unicode path extra field's name when its CRC matches the raw bytes. The
+local header must agree with `orig_filename`, and `zf.read` looks up by
+`filename`, the last entry of a name winning.
+
+**A wrong central-directory offset can be survived.** zipfile finds the
+directory by where the end record sits and treats the difference as a
+prepended stub. That opens self-extracting archives, and it shifts every
+header offset too. One that goes negative fails on the read with a real
+file's `[Errno 22] Invalid argument`.
+
+### What is deliberately not here
+
+Passwords, and bzip2, LZMA, and Zstandard members, which zipfile reads.
+The port refuses them with a `NotImplementedError` of its own wording.
+Also missing: multi-disk archives, `metadata_encoding`, and writing.
+Printing a name with `%r` escapes the controls, spaces, and format
+characters real names meet, not everything Unicode calls unprintable.
+Decoding assumes the 32 KiB window zip streams are written for. Given a
+smaller one, zlib may also refuse a distance, depending on how CPython
+split its output buffer, and that is not modelled. Two findings from
+the compiler shaped the code: a function named `inflate` inside
+`inflate::raw` vanished from native builds (the shadowed-path finding
+again), and `take` is a keyword.
 
 ---
 
@@ -1367,6 +1471,21 @@ examples/settings.tuo    the native oracle: every case, and a .env read from dis
 examples/settings-test/  the .env that oracle reads
 examples/settings_oracle.py  python-dotenv and the backend's Settings, recorded
 examples/settings_fixture.py settings_oracle.json to the two fixtures
+
+src/inflate/huffman.tuo  canonical Huffman codes, as zlib's inflate_table accepts them
+src/inflate/raw.tuo      RFC 1951, with zlib's errors in zlib's order
+src/inflate/zlib.tuo     zlib.decompress: the RFC 1950 wrapper, Adler-32, CRC-32
+src/inflate/fixture.tuo  82 streams and what zlib made of them (generated)
+src/inflate/demo.tuo     the same 82, decompressed here; hex
+src/zip/text.tuo         UTF-8 with CPython's errors, cp437, repr of str and bytes
+src/zip/archive.tuo      zipfile: the end record, ZIP64, the directory, zf.read
+src/zip/fixture.tuo      49 archives as zipfile opened and read them (generated)
+src/zip/demo.tuo         the same 49, opened and read here
+examples/inflate.tuo     the native oracle: every stream, the large ones from files
+examples/zip.tuo         the native oracle: every archive
+examples/zip-test/inflate/  the seven captured streams too large to hold inline
+examples/zip_oracle.py   zlib and zipfile, recorded
+examples/zip_fixture.py  zip_oracle.json to the two fixtures and the stream files
 
 src/ratelimit/item.tuo   limits: parse_many, repr, key_for, the fixed window's arithmetic
 src/ratelimit/memory.tuo MemoryStorage and the fixed window on it

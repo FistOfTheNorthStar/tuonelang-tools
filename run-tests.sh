@@ -2,8 +2,8 @@
 # run-tests.sh — the validation suite for tuonelang-python-tools.
 #
 #   ./run-tests.sh          front end, specs, formatting, the native Argon2,
-#                           X.509, settings, and rate-limit oracles, and the HTTP,
-#                           web, and TLS loopback oracles (no network)
+#                           X.509, settings, rate-limit, inflate, and zip oracles,
+#                           and the HTTP, web, and TLS loopback oracles (no network)
 #   ./run-tests.sh --live   also resolve real names against a public DNS
 #                           server, fetch from public HTTP servers, complete
 #                           TLS 1.3 handshakes with three openssl s_server
@@ -112,6 +112,13 @@ RATELIMIT_SRC=(src/ratelimit/item.tuo src/ratelimit/memory.tuo src/ratelimit/red
                "${WEB_SRC[@]}" src/http/message.tuo src/http/fixture.tuo src/http/url.tuo
                src/std_str.tuo src/std_bits.tuo src/std_net.tuo)
 
+# The deflate decoder and the zip reader on it; the large captured streams
+# are files only native code reads.
+INFLATE_SRC=(src/inflate/huffman.tuo src/inflate/raw.tuo src/inflate/zlib.tuo
+             src/inflate/demo.tuo src/inflate/fixture.tuo src/std_fs.tuo src/std_str.tuo)
+ZIP_SRC=(src/zip/text.tuo src/zip/archive.tuo src/zip/demo.tuo src/zip/fixture.tuo
+         "${INFLATE_SRC[@]}")
+
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
 check() { if [ "$1" -eq 0 ]; then echo "PASS $2"; else echo "FAIL $2"; failed=1; fi }
@@ -197,11 +204,17 @@ step "Rate limiting: front end (check)"
 step "Rate limiting: specs (verify), all 63 strings, 9 scripts, 16 Redis calls, and 103 requests reproduced"
 "$TUO" verify "${RATELIMIT_SRC[@]}"; check $? "ratelimit verify"
 
+step "Inflate and zip: front end (check)"
+"$TUO" check "${ZIP_SRC[@]}" examples/inflate.tuo examples/zip.tuo; check $? "inflate+zip check"
+
+step "Inflate and zip: specs (verify), 75 captured streams and all 49 captured archives reproduced"
+"$TUO" verify "${ZIP_SRC[@]}"; check $? "inflate+zip verify"
+
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
 # to `crates/tuo-stdlib/src/std/` — and src/pg, src/db are tuonelang-db's.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo src/jinja/*.tuo src/dotenv/*.tuo src/settings/*.tuo src/ratelimit/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo src/jinja/*.tuo src/dotenv/*.tuo src/settings/*.tuo src/ratelimit/*.tuo src/inflate/*.tuo src/zip/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.
@@ -249,6 +262,27 @@ if [ "$rc" -eq 0 ]; then
 else
   echo "ratelimit oracle exited $rc — that many checks disagreed"
   check 1 "ratelimit oracle"
+fi
+
+# All 82 captured deflate streams, the seven largest read from their files.
+step "Inflate: native oracle (every captured stream)"
+"$TUO" run examples/inflate.tuo "${INFLATE_SRC[@]}"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  check 0 "inflate oracle (all checks agreed)"
+else
+  echo "inflate oracle exited $rc — that many checks disagreed"
+  check 1 "inflate oracle"
+fi
+
+step "Zip: native oracle (every captured archive)"
+"$TUO" run examples/zip.tuo "${ZIP_SRC[@]}"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  check 0 "zip oracle (all checks agreed)"
+else
+  echo "zip oracle exited $rc — that many checks disagreed"
+  check 1 "zip oracle"
 fi
 
 # The HTTP server and client prove each other over loopback, in one process.
