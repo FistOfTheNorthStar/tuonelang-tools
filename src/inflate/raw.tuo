@@ -1,0 +1,418 @@
+// inflate::raw — a deflate stream (RFC 1951), decoded as zlib decodes it.
+//
+// A stream is a run of blocks, each stored, compressed with the fixed
+// codes, or compressed with codes its own header describes; the last
+// block says so in its first bit. Compressed data is literals and
+// (length, distance) copies of what came before, a copy allowed to
+// overlap its own output. Bits are read least significant first, Huffman
+// codes most significant first (`inflate::huffman`).
+//
+// What this module adds to the RFC is zlib's judgement, in zlib's order,
+// with zlib's words — which is what `zlib.decompress` raises and what
+// `zipfile` passes on:
+//
+// * a block type of 3 — `invalid block type`;
+// * a stored block whose length and its complement disagree — `invalid
+//   stored block lengths`;
+// * more than 286 literal/length or 30 distance codes — `too many length
+//   or distance symbols`;
+// * a code-length code that is not complete — `invalid code lengths set`;
+// * a repeat with nothing to repeat, or past the end — `invalid bit
+//   length repeat`;
+// * no code for end-of-block — `invalid code -- missing end-of-block`;
+// * literal/length or distance lengths `inflate::huffman` refuses —
+//   `invalid literal/lengths set`, `invalid distances set`;
+// * a code naming no symbol, or symbols 286, 287 (literal/length) and
+//   30, 31 (distance) of the fixed code — `invalid literal/length code`,
+//   `invalid distance code`;
+// * a distance reaching before the start of the output — `invalid
+//   distance too far back`.
+//
+// Input that ends first is `incomplete or truncated stream`, zlib's
+// `Z_BUF_ERROR` as CPython reports it, whenever the bits a decision
+// needs are missing — before any of the above can be judged. Bytes after
+// the last block are left alone; `end` says where the stream stopped.
+//
+// The window is the 32 KiB every deflate stream zipfile reads is written
+// for, so "too far back" is exactly "before the start of the output".
+// zlib given a smaller window can also refuse a distance within the
+// output, depending on how its caller's buffers fell; that is not
+// modelled.
+
+module inflate::raw;
+
+/// A decoded stream, or why it could not be. `status` is 0, zlib's `-3`
+/// (`Z_DATA_ERROR`) with `message`, or `-5` (`Z_BUF_ERROR`, truncated).
+/// `data` is everything decoded before a failure — what zlib had already
+/// written when it stopped. `end` is the byte offset just past the stream.
+pub struct Inflated {
+    status: Int,
+    message: String,
+    data: String,
+    end: Int,
+}
+
+/// The reader: a bit position into the input, and a failure once met.
+struct Reader {
+    pos: Int,
+    limit: Int,
+    status: Int,
+    message: String,
+}
+
+/// Success.
+///
+/// # Example
+/// ```tuo
+/// let s = inflate::raw::status_ok(); // 0
+/// ```
+pub fn status_ok() -> Int {
+    0
+}
+
+/// `Z_DATA_ERROR`: the stream is malformed.
+///
+/// # Example
+/// ```tuo
+/// let s = inflate::raw::status_data_error(); // -3
+/// ```
+pub fn status_data_error() -> Int {
+    0 - 3
+}
+
+/// `Z_BUF_ERROR`: the input ended before the stream did.
+///
+/// # Example
+/// ```tuo
+/// let s = inflate::raw::status_truncated(); // -5
+/// ```
+pub fn status_truncated() -> Int {
+    0 - 5
+}
+
+fn failed(in r: Reader) -> Bool {
+    r.status != 0
+}
+
+fn refuse(mut r: Reader, in message: Str) {
+    if r.status == 0 {
+        r.status = status_data_error();
+        r.message = std::string::from_str(message);
+    }
+}
+
+fn truncate(mut r: Reader) {
+    if r.status == 0 {
+        r.status = status_truncated();
+    }
+}
+
+fn bit(mut r: Reader, in src: Str) -> Int {
+    if r.pos >= r.limit {
+        truncate(r);
+        return 0;
+    }
+    let b = std::str::byte_at(src, r.pos / 8);
+    let v = (b >> (r.pos % 8)) % 2;
+    r.pos = r.pos + 1;
+    v
+}
+
+/// `n` bits, least significant first; 0 once the input has run out.
+fn bits(mut r: Reader, in src: Str, take n: Int) -> Int {
+    if r.pos + n > r.limit {
+        r.pos = r.limit;
+        truncate(r);
+        return 0;
+    }
+    var v = 0;
+    var i = 0;
+    var weight = 1;
+    while i < n {
+        v = v + bit(r, src) * weight;
+        weight = weight * 2;
+        i = i + 1;
+    }
+    v
+}
+
+/// One symbol of `c`, or `no_symbol`; reads what zlib would.
+fn decode(mut r: Reader, in src: Str, in c: inflate::huffman::Code) -> Int {
+    if c.longest == 0 {
+        let _ = bit(r, src);
+        return inflate::huffman::no_symbol();
+    }
+    var code = 0;
+    var first = 0;
+    var index = 0;
+    var len = 1;
+    while len <= 15 {
+        code = code + bit(r, src);
+        if failed(r) {
+            return inflate::huffman::no_symbol();
+        }
+        let s = inflate::huffman::step(c, len, code, first, index);
+        if s != 0 - 2 {
+            return s;
+        }
+        let count = std::array::get(c.counts, len);
+        index = index + count;
+        first = (first + count) * 2;
+        code = code * 2;
+        len = len + 1;
+    }
+    inflate::huffman::no_symbol()
+}
+
+// ----------------------------------------------------------------------------
+// Tables.
+// ----------------------------------------------------------------------------
+
+fn table_of(in text: Str) -> Array[Int] {
+    var out = std::array::empty();
+    let parts = std::str::split(text, ",");
+    var i = 0;
+    while i < std::array::len(parts) {
+        let n = match std::str::parse_int(std::string::as_str(std::array::get(parts, i))) {
+            Ok { value } => value,
+            Err { error } => 0,
+        };
+        std::array::push(out, n);
+        i = i + 1;
+    }
+    out
+}
+
+/// The tables a block's copies are read by: length bases and extra bits
+/// for symbols 257–285, distance bases and extra bits for codes 0–29.
+struct Tables {
+    length_base: Array[Int],
+    length_extra: Array[Int],
+    distance_base: Array[Int],
+    distance_extra: Array[Int],
+    order: Array[Int],
+}
+
+fn tables() -> Tables {
+    Tables { length_base: table_of("3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258"), length_extra: table_of("0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0"), distance_base: table_of("1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577"), distance_extra: table_of("0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13"), order: table_of("16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15") }
+}
+
+// ----------------------------------------------------------------------------
+// Blocks.
+// ----------------------------------------------------------------------------
+
+fn stored(mut r: Reader, in src: Str, mut out: String) {
+    r.pos = (r.pos + 7) / 8 * 8;
+    let len = bits(r, src, 16);
+    let nlen = bits(r, src, 16);
+    if failed(r) {
+        return;
+    }
+    if len != 65535 - nlen {
+        refuse(r, "invalid stored block lengths");
+        return;
+    }
+    // A stored block cut short still yields the bytes that arrived, as
+    // zlib copies them before it runs out of input.
+    let at = r.pos / 8;
+    var avail = len;
+    if at + len > r.limit / 8 {
+        avail = r.limit / 8 - at;
+    }
+    var i = 0;
+    while i < avail {
+        std::string::push_byte(out, std::str::byte_at(src, at + i));
+        i = i + 1;
+    }
+    r.pos = (at + avail) * 8;
+    if avail < len {
+        truncate(r);
+    }
+}
+
+fn codes(mut r: Reader, in src: Str, mut out: String, in t: Tables, in lit: inflate::huffman::Code, in dist: inflate::huffman::Code) {
+    while true {
+        let sym = decode(r, src, lit);
+        if failed(r) {
+            return;
+        }
+        if sym < 0 || sym > 285 {
+            refuse(r, "invalid literal/length code");
+            return;
+        }
+        if sym < 256 {
+            std::string::push_byte(out, sym);
+        } else if sym == 256 {
+            return;
+        } else {
+            let li = sym - 257;
+            let len = std::array::get(t.length_base, li) + bits(r, src, std::array::get(t.length_extra, li));
+            let dsym = decode(r, src, dist);
+            if failed(r) {
+                return;
+            }
+            if dsym < 0 || dsym > 29 {
+                refuse(r, "invalid distance code");
+                return;
+            }
+            let d = std::array::get(t.distance_base, dsym) + bits(r, src, std::array::get(t.distance_extra, dsym));
+            if failed(r) {
+                return;
+            }
+            let have = std::string::len(out);
+            if d > have {
+                refuse(r, "invalid distance too far back");
+                return;
+            }
+            var i = 0;
+            while i < len {
+                std::string::push_byte(out, std::string::byte_at(out, have - d + i));
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fn dynamic(mut r: Reader, in src: Str, mut out: String, in t: Tables) {
+    let nlen = bits(r, src, 5) + 257;
+    let ndist = bits(r, src, 5) + 1;
+    let ncode = bits(r, src, 4) + 4;
+    if failed(r) {
+        return;
+    }
+    if nlen > 286 || ndist > 30 {
+        refuse(r, "too many length or distance symbols");
+        return;
+    }
+    var cl = std::array::empty();
+    var i = 0;
+    while i < 19 {
+        std::array::push(cl, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < ncode {
+        std::array::set(cl, std::array::get(t.order, i), bits(r, src, 3));
+        i = i + 1;
+    }
+    if failed(r) {
+        return;
+    }
+    if !inflate::huffman::acceptable(cl, 0, 19, inflate::huffman::kind_code_lengths()) {
+        refuse(r, "invalid code lengths set");
+        return;
+    }
+    let clcode = inflate::huffman::build(cl, 0, 19);
+    var lengths = std::array::empty();
+    let total = nlen + ndist;
+    while std::array::len(lengths) < total {
+        var sym = decode(r, src, clcode);
+        if failed(r) {
+            return;
+        }
+        if sym < 0 {
+            // An empty code-length code: zlib reads a zero.
+            sym = 0;
+        }
+        if sym < 16 {
+            std::array::push(lengths, sym);
+        } else {
+            var len = 0;
+            var copy = 0;
+            if sym == 16 {
+                copy = 3 + bits(r, src, 2);
+                if failed(r) {
+                    return;
+                }
+                if std::array::len(lengths) == 0 {
+                    refuse(r, "invalid bit length repeat");
+                    return;
+                }
+                len = std::array::get(lengths, std::array::len(lengths) - 1);
+            } else if sym == 17 {
+                copy = 3 + bits(r, src, 3);
+            } else {
+                copy = 11 + bits(r, src, 7);
+            }
+            if failed(r) {
+                return;
+            }
+            if std::array::len(lengths) + copy > total {
+                refuse(r, "invalid bit length repeat");
+                return;
+            }
+            var k = 0;
+            while k < copy {
+                std::array::push(lengths, len);
+                k = k + 1;
+            }
+        }
+    }
+    if std::array::get(lengths, 256) == 0 {
+        refuse(r, "invalid code -- missing end-of-block");
+        return;
+    }
+    if !inflate::huffman::acceptable(lengths, 0, nlen, inflate::huffman::kind_symbols()) {
+        refuse(r, "invalid literal/lengths set");
+        return;
+    }
+    if !inflate::huffman::acceptable(lengths, nlen, ndist, inflate::huffman::kind_symbols()) {
+        refuse(r, "invalid distances set");
+        return;
+    }
+    let lit = inflate::huffman::build(lengths, 0, nlen);
+    let dist = inflate::huffman::build(lengths, nlen, ndist);
+    codes(r, src, out, t, lit, dist);
+}
+
+/// Decode the deflate stream that starts at byte `from` of `src`.
+///
+/// # Example
+/// ```tuo
+/// let got = inflate::raw::decompress(stream, 0);
+/// ```
+pub fn decompress(in src: Str, take from: Int) -> Inflated {
+    var r = Reader { pos: from * 8, limit: std::str::len(src) * 8, status: 0, message: std::string::empty() };
+    var out = std::string::empty();
+    let t = tables();
+    var last = false;
+    while !last && !failed(r) {
+        last = bits(r, src, 1) == 1;
+        let kind = bits(r, src, 2);
+        if !failed(r) {
+            if kind == 0 {
+                stored(r, src, out);
+            } else if kind == 1 {
+                codes(r, src, out, t, inflate::huffman::fixed_literals(), inflate::huffman::fixed_distances());
+            } else if kind == 2 {
+                dynamic(r, src, out, t);
+            } else {
+                refuse(r, "invalid block type");
+            }
+        }
+    }
+    if failed(r) {
+        return Inflated { status: r.status, message: r.message, data: out, end: r.pos / 8 };
+    }
+    Inflated { status: 0, message: std::string::empty(), data: out, end: (r.pos + 7) / 8 }
+}
+
+/// The `zlib.error` text CPython raises for a failed stream:
+/// `Error -3 while decompressing data: invalid block type`.
+///
+/// # Example
+/// ```tuo
+/// let e = inflate::raw::error_text(got);
+/// ```
+pub fn error_text(in got: Inflated) -> String {
+    var out = std::string::from_str("Error ");
+    std::str::push_int(out, got.status);
+    std::str::push(out, " while decompressing data");
+    if got.status == status_truncated() {
+        std::str::push(out, ": incomplete or truncated stream");
+    } else if std::string::len(got.message) > 0 {
+        std::str::push(out, ": ");
+        std::str::push(out, std::string::as_str(got.message));
+    }
+    out
+}

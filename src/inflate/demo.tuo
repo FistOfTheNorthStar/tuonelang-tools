@@ -1,0 +1,185 @@
+// inflate::demo — the captured streams, decompressed again.
+//
+// `examples/zip_oracle.py` handed CPython's `zlib.decompress` 82 streams;
+// `inflate::fixture` holds what came back. The specs decompress every
+// stream held inline and compare the output's length, CRC-32, and bytes,
+// or the error message; `examples/inflate.tuo` also reads the seven large
+// streams from their files, which only native code can do.
+
+module inflate::demo;
+
+fn nibble(take c: Int) -> Int {
+    if c >= 97 {
+        return c - 87;
+    }
+    if c >= 65 {
+        return c - 55;
+    }
+    c - 48
+}
+
+/// The bytes spelled by `hex`.
+///
+/// # Example
+/// ```tuo
+/// let b = inflate::demo::from_hex("4869"); // "Hi"
+/// ```
+pub fn from_hex(in hex: Str) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i + 1 < std::str::len(hex) {
+        std::string::push_byte(out, nibble(std::str::byte_at(hex, i)) * 16 + nibble(std::str::byte_at(hex, i + 1)));
+        i = i + 2;
+    }
+    out
+}
+
+/// `data` as lower-case hex.
+///
+/// # Example
+/// ```tuo
+/// let h = inflate::demo::to_hex("Hi"); // "4869"
+/// ```
+pub fn to_hex(in data: Str) -> String {
+    let digits = "0123456789abcdef";
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::str::len(data) {
+        let b = std::str::byte_at(data, i);
+        std::string::push_byte(out, std::str::byte_at(digits, b / 16));
+        std::string::push_byte(out, std::str::byte_at(digits, b % 16));
+        i = i + 1;
+    }
+    out
+}
+
+/// What stream `i` of `input` decompressed to, in the fixture's terms: the
+/// output's length, CRC-32, and hex (up to 512 bytes), or the error.
+///
+/// # Example
+/// ```tuo
+/// let out = inflate::demo::output(0, input);
+/// ```
+pub fn output(take i: Int, in input: Str) -> String {
+    let got = inflate::zlib::decompress(input, inflate::fixture::wbits(i));
+    if got.status != 0 {
+        return inflate::raw::error_text(got);
+    }
+    let data = std::string::as_str(got.data);
+    var out = std::string::empty();
+    std::str::push_int(out, std::str::len(data));
+    std::str::push(out, " ");
+    std::str::push_int(out, inflate::zlib::crc32(data));
+    if std::str::len(data) <= 512 {
+        std::str::push(out, " ");
+        std::str::push(out, std::string::as_str(to_hex(data)));
+    }
+    out
+}
+
+/// What the fixture says stream `i` decompressed to, in `output`'s terms.
+///
+/// # Example
+/// ```tuo
+/// let want = inflate::demo::expected(0);
+/// ```
+pub fn expected(take i: Int) -> String {
+    if !inflate::fixture::ok(i) {
+        return std::string::from_str(inflate::fixture::error(i));
+    }
+    var out = std::string::empty();
+    std::str::push_int(out, inflate::fixture::length(i));
+    std::str::push(out, " ");
+    std::str::push_int(out, inflate::fixture::crc(i));
+    if inflate::fixture::length(i) <= 512 {
+        std::str::push(out, " ");
+        std::str::push(out, inflate::fixture::output_hex(i));
+    }
+    out
+}
+
+/// Whether stream `i`, given its bytes, came out as zlib made it.
+///
+/// # Example
+/// ```tuo
+/// let same = inflate::demo::agrees(0, input);
+/// ```
+pub fn agrees(take i: Int, in input: Str) -> Bool {
+    std::string::as_str(output(i, input)) == std::string::as_str(expected(i))
+}
+
+/// Whether every inline stream from `from` to `to` agrees.
+///
+/// # Example
+/// ```tuo
+/// let same = inflate::demo::inline_agree(0, 10);
+/// ```
+pub fn inline_agree(take from: Int, take to: Int) -> Bool {
+    var i = from;
+    while i < to && i < inflate::fixture::count() {
+        if std::str::len(inflate::fixture::input_file(i)) == 0 {
+            if !agrees(i, std::string::as_str(from_hex(inflate::fixture::input_hex(i)))) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    true
+}
+
+spec from_hex {
+    then std::string::as_str(from_hex("4869")) == "Hi";
+    then std::string::as_str(to_hex(std::string::as_str(from_hex("00ff7f")))) == "00ff7f";
+}
+
+spec "captured streams 0 to 12" {
+    then inline_agree(0, 13);
+}
+
+spec "captured streams 13 to 13" {
+    then inline_agree(13, 14);
+}
+
+spec "captured streams 14 to 14" {
+    then inline_agree(14, 15);
+}
+
+spec "captured streams 15 to 20" {
+    then inline_agree(15, 21);
+}
+
+spec "captured streams 21 to 22" {
+    then inline_agree(21, 23);
+}
+
+spec "captured streams 23 to 28" {
+    then inline_agree(23, 29);
+}
+
+spec "captured streams 29 to 29" {
+    then inline_agree(29, 30);
+}
+
+spec "captured streams 30 to 33" {
+    then inline_agree(30, 34);
+}
+
+spec "captured streams 34 to 34" {
+    then inline_agree(34, 35);
+}
+
+spec "captured streams 35 to 36" {
+    then inline_agree(35, 37);
+}
+
+spec "captured streams 37 to 37" {
+    then inline_agree(37, 38);
+}
+
+spec "captured streams 38 to 50" {
+    then inline_agree(38, 51);
+}
+
+spec "captured streams 51 to 81" {
+    then inline_agree(51, 82);
+}
