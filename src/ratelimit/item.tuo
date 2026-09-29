@@ -292,7 +292,9 @@ pub fn allows(in it: Item, take count: Int) -> Bool {
 /// let ok = ratelimit::item::would_allow(ratelimit::item::new(5, 1, 60), 4, 2); // false
 /// ```
 pub fn would_allow(in it: Item, take count: Int, take cost: Int) -> Bool {
-    count < it.amount - cost + 1
+    // `count < amount - cost + 1`, as `limits` writes it, without the `+ 1`
+    // that overflows for an amount at the top of `Int`'s range.
+    count + cost <= it.amount
 }
 
 /// The window stats of a window at `count` that resets at `reset`.
@@ -660,6 +662,7 @@ spec "the fixed window's arithmetic" {
     then would_allow(new(5, 1, 60), 4, 1);
     then !would_allow(new(5, 1, 60), 4, 2);
     then !would_allow(new(0, 1, 60), 0, 1);
+    then would_allow(new(9223372036854775807, 1, 60), 0, 0);
     then stats(new(5, 1, 60), 7, 9).remaining == 0;
     then stats(new(5, 1, 60), 2, 9).remaining == 3;
     then stats(new(5, 1, 60), 2, 9).reset == 9;

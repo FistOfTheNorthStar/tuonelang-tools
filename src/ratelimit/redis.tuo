@@ -343,7 +343,7 @@ pub fn feed(mut c: Call, in reply: Str) {
     if c.stage == 0 {
         c.count = n;
         if c.op == op_test() {
-            c.passed = c.count < c.amount - c.cost + 1;
+            c.passed = c.count + c.cost <= c.amount;
             finish(c);
             return;
         }
