@@ -1,0 +1,55 @@
+// examples/zip — every captured archive, opened and read natively.
+//
+// The specs replay the archives a few at a time; this program replays all
+// 49 as native code and prints what differs.
+//
+//     tuo run examples/zip.tuo src/zip/*.tuo src/inflate/*.tuo src/std_fs.tuo src/std_str.tuo
+//
+// No network. One line per archive; exit is the failure count.
+
+module zip_check;
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn show(in label: Str, in text: Str) {
+    var line = std::string::from_str("      ");
+    std::str::push(line, label);
+    std::str::push(line, ":\n");
+    std::str::push(line, text);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+}
+
+fn main() -> Int {
+    var failed = 0;
+    var k = 0;
+    while k < zip::fixture::archive_count() {
+        let same = zip::demo::agrees(k);
+        failed = failed + report(zip::fixture::archive_name(k), same);
+        if !same {
+            show("opened", std::string::as_str(zip::demo::opened(k)));
+            show("zipfile opened", std::string::as_str(zip::demo::expected_open(k)));
+            if zip::fixture::archive_ok(k) {
+                show("reads", std::string::as_str(zip::demo::reads(k)));
+                show("zipfile reads", std::string::as_str(zip::demo::expected_reads(k)));
+            }
+        }
+        k = k + 1;
+    }
+    failed
+}
