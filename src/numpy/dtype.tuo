@@ -1,0 +1,201 @@
+// numpy::dtype — the four dtypes the port carries, and NEP 50's promotion.
+//
+// `bool`, `int64`, `float32`, and `float64` are numpy's default boolean,
+// integer, and the two float types the backend's arithmetic uses; they are
+// codes 0 to 3, in the order numpy's promotion lattice mostly follows.
+// The exception is the one pair that has no common type without widening:
+// int64 and float32 meet at float64.
+//
+// A Python `int` or `float` passed where an array is expected is *weak*
+// (NEP 50, numpy 2): it takes the dtype of the array it meets — `x * 0.1`
+// stays float32 for a float32 `x` — unless the array's kind cannot hold it,
+// when it takes the default of its own kind (int64 for an int meeting a
+// bool, float64 for a float meeting an integer). Two weak scalars meet as
+// numpy's defaults. A numpy scalar, such as a sum's result, is strong.
+
+module numpy::dtype;
+
+/// The bool dtype.
+///
+/// # Example
+/// ```tuo
+/// let d = numpy::dtype::bool_(); // 0
+/// ```
+pub fn bool_() -> Int {
+    0
+}
+
+/// The int64 dtype.
+///
+/// # Example
+/// ```tuo
+/// let d = numpy::dtype::int64(); // 1
+/// ```
+pub fn int64() -> Int {
+    1
+}
+
+/// The float32 dtype.
+///
+/// # Example
+/// ```tuo
+/// let d = numpy::dtype::float32(); // 2
+/// ```
+pub fn float32() -> Int {
+    2
+}
+
+/// The float64 dtype.
+///
+/// # Example
+/// ```tuo
+/// let d = numpy::dtype::float64(); // 3
+/// ```
+pub fn float64() -> Int {
+    3
+}
+
+/// What `None` is, where a numpy function takes one in place of an array.
+///
+/// # Example
+/// ```tuo
+/// let d = numpy::dtype::none(); // -1
+/// ```
+pub fn none() -> Int {
+    0 - 1
+}
+
+/// Whether `dtype` is float32 or float64.
+///
+/// # Example
+/// ```tuo
+/// let yes = numpy::dtype::is_float(numpy::dtype::float32());
+/// ```
+pub fn is_float(take dtype: Int) -> Bool {
+    dtype == 2 || dtype == 3
+}
+
+/// numpy's name for `dtype`.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::dtype::name(2); // "float32"
+/// ```
+pub fn name(take dtype: Int) -> Str {
+    if dtype == 0 {
+        return "bool";
+    }
+    if dtype == 1 {
+        return "int64";
+    }
+    if dtype == 2 {
+        return "float32";
+    }
+    if dtype == 3 {
+        return "float64";
+    }
+    "None"
+}
+
+/// The dtype named `text`, or -1.
+///
+/// # Example
+/// ```tuo
+/// let d = numpy::dtype::named("float64"); // 3
+/// ```
+pub fn named(in text: Str) -> Int {
+    if text == "bool" {
+        return 0;
+    }
+    if text == "int64" {
+        return 1;
+    }
+    if text == "float32" {
+        return 2;
+    }
+    if text == "float64" {
+        return 3;
+    }
+    0 - 1
+}
+
+fn larger(take a: Int, take b: Int) -> Int {
+    if a > b {
+        return a;
+    }
+    b
+}
+
+/// The dtype two strong dtypes promote to.
+///
+/// # Example
+/// ```tuo
+/// let d = numpy::dtype::promote(1, 2); // 3: int64 and float32 meet at float64
+/// ```
+pub fn promote(take a: Int, take b: Int) -> Int {
+    if (a == 1 && b == 2) || (a == 2 && b == 1) {
+        return 3;
+    }
+    larger(a, b)
+}
+
+/// The dtype a strong `dtype` and a weak Python scalar of `weak` (int64 for
+/// an `int`, float64 for a `float`) promote to.
+fn with_weak(take dtype: Int, take weak: Int) -> Int {
+    if weak == 1 {
+        if dtype == 0 {
+            return 1;
+        }
+        return dtype;
+    }
+    if dtype == 0 || dtype == 1 {
+        return 3;
+    }
+    dtype
+}
+
+/// The result dtype of two operands, each a dtype and whether it is weak.
+///
+/// # Example
+/// ```tuo
+/// let d = numpy::dtype::result_type(2, false, 3, true); // 2: float32 * 0.1
+/// ```
+pub fn result_type(take a: Int, take a_weak: Bool, take b: Int, take b_weak: Bool) -> Int {
+    if a_weak && b_weak {
+        return larger(a, b);
+    }
+    if a_weak {
+        return with_weak(b, a);
+    }
+    if b_weak {
+        return with_weak(a, b);
+    }
+    promote(a, b)
+}
+
+spec promote {
+    then promote(0, 0) == 0;
+    then promote(0, 1) == 1;
+    then promote(1, 2) == 3;
+    then promote(2, 1) == 3;
+    then promote(2, 3) == 3;
+    then promote(0, 2) == 2;
+}
+
+spec result_type {
+    then result_type(2, false, 3, true) == 2;
+    then result_type(2, false, 1, true) == 2;
+    then result_type(1, false, 3, true) == 3;
+    then result_type(0, false, 1, true) == 1;
+    then result_type(0, false, 3, true) == 3;
+    then result_type(1, true, 3, true) == 3;
+    then result_type(1, true, 1, true) == 1;
+    then result_type(3, true, 0, false) == 3;
+}
+
+spec named {
+    then named("float32") == float32();
+    then named("bool") == bool_();
+    then named("int8") == 0 - 1;
+    then name(named("int64")) == "int64";
+}

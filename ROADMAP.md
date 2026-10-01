@@ -29,8 +29,9 @@ SHA-256/HMAC/PBKDF2, `std::bignum`, `std::json`, `std::fs`, `std::sync`,
 | this repo, `inflate` + `zip` | `zlib` (decompression), `zipfile` (reading) | deflate with zlib's errors; archives read as zipfile reads them; 82 streams and 54 archives reproduced; bounded memory on archives that expand past their stated size |
 | this repo, `ratelimit` | `slowapi`, `limits` | the grammar, keys, and fixed window in memory and Redis; slowapi's check and 429; 63 strings, 16 Redis exchanges, and 103 slowapi responses reproduced |
 | this repo, `x509` + `ec` + `rsa` | the trust half of `ssl`, `certifi` | X.509 parsing and chain validation, a root store, ECDSA P-256/P-384, RSA v1.5/PSS; 380 specs; real chains validated |
+| this repo, `numpy` | `numpy` (the arrays under the questionnaire matching) | bool/int64/float32/float64 arrays, broadcasting, NEP 50, elementwise ops, numpy's summation order, extrema, stable sorting; 488 expressions evaluated by numpy 2.5.3 reproduced bit for bit |
 
-All twelve prove the thesis: the *engine* of a Python library is pure logic, and pure
+All thirteen prove the thesis: the *engine* of a Python library is pure logic, and pure
 logic is what tuonelang specs pin best.
 
 ---
@@ -155,7 +156,7 @@ Be honest about these rather than half-porting them.
 
 | Python lib | Why it is hard |
 |---|---|
-| `torch`, `torchvision` | Needs BLAS-class linear algebra, and realistically GPU. The `gguf-reader` example shows *inference* is reachable; training is not. Consider a narrow inference-only port for the questionnaire matching, not a torch replacement. |
+| `torch`, `torchvision` | Needs BLAS-class linear algebra, and realistically GPU. The `gguf-reader` example shows *inference* is reachable; training is not. The questionnaire matching needs neither: it is elementwise float32 arithmetic, sums, and a top-k, which the `numpy` port (done 2026-10-02) computes bit-identically to torch on the captured case. |
 | `pyllym` (LLM framework) | Mostly HTTP + JSON + prompt templating — becomes easy once Tier 1 lands. Low priority, high tractability. |
 | `pillow`, `python-docx`, `reportlab`, `pypdf` | Binary format encoders/decoders. Each is a large, self-contained project. PDF *generation* is the most tractable; image *decoding* is the least. |
 | `beautifulsoup4`, `lxml` | An HTML5 tolerant parser is a genuinely large spec, but it is pure parsing — a strong fit for TDG, just expensive. |
@@ -181,7 +182,8 @@ Be honest about these rather than half-porting them.
 10. ✅ **Config and `.env` loading**.
 11. ✅ **Rate limiting**.
 12. ✅ **Deflate and zip reading**.
-   **Next:** XLSX reading on top of them, then `.docx` text.
+13. ✅ **numpy** — the array arithmetic under the questionnaire matching.
+   **Next:** XLSX reading on top of the zip layer, then `.docx` text.
 
 The application itself — shallowflaws's routers, services, and models —
 stays in Python and is **out of scope** here. It is the oracle these

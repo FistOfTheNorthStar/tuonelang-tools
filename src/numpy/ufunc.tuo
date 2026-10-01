@@ -1,0 +1,903 @@
+// numpy::ufunc — elementwise operations, broadcast.
+//
+// Operands broadcast as numpy's do: shapes are aligned at their last axis,
+// and an axis of length one (or a missing one) stretches to the other's;
+// anything else is numpy's ValueError, every operand's shape listed. The
+// operation runs in the operands' promoted dtype (`numpy::dtype`), and the
+// loop numpy picks for that dtype is reproduced exactly:
+//
+// - float32 and float64: the binary64 operation, rounded once to float32
+//   for float32. `maximum` and `minimum` propagate NaN and order -0.0
+//   below 0.0 (IEEE 754-2019 maximum/minimum, which is what numpy's NEON
+//   loops compute on the aarch64 machine the oracle ran on).
+// - int64: wraparound on overflow, as numpy's C loops have.
+// - bool: `add` is or, `multiply` is and, `subtract` and `negative` are
+//   refused with numpy's own TypeError, and `divide` is float64.
+//
+// Where numpy would return a dtype the port does not carry (float16 from
+// `sqrt` of a bool, int8 from `square` of one) the port refuses with a
+// TypeError of its own instead.
+
+module numpy::ufunc;
+
+/// Operation codes for `binary`.
+///
+/// # Example
+/// ```tuo
+/// let op = numpy::ufunc::op_add();
+/// ```
+pub fn op_add() -> Int {
+    0
+}
+
+/// `subtract`.
+///
+/// # Example
+/// ```tuo
+/// let op = numpy::ufunc::op_subtract();
+/// ```
+pub fn op_subtract() -> Int {
+    1
+}
+
+/// `multiply`.
+///
+/// # Example
+/// ```tuo
+/// let op = numpy::ufunc::op_multiply();
+/// ```
+pub fn op_multiply() -> Int {
+    2
+}
+
+/// `divide` (true division).
+///
+/// # Example
+/// ```tuo
+/// let op = numpy::ufunc::op_divide();
+/// ```
+pub fn op_divide() -> Int {
+    3
+}
+
+/// `maximum`.
+///
+/// # Example
+/// ```tuo
+/// let op = numpy::ufunc::op_maximum();
+/// ```
+pub fn op_maximum() -> Int {
+    4
+}
+
+/// `minimum`.
+///
+/// # Example
+/// ```tuo
+/// let op = numpy::ufunc::op_minimum();
+/// ```
+pub fn op_minimum() -> Int {
+    5
+}
+
+/// `equal`; `not_equal`, `less`, `less_equal`, `greater`, `greater_equal`
+/// follow it as 7 to 11.
+///
+/// # Example
+/// ```tuo
+/// let op = numpy::ufunc::op_equal();
+/// ```
+pub fn op_equal() -> Int {
+    6
+}
+
+fn int_min() -> Int {
+    0 - 9223372036854775807 - 1
+}
+
+/// `a + b` modulo 2^64, as int64 addition wraps in numpy.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::ufunc::wrapping_add(9223372036854775807, 1); // the minimum
+/// ```
+pub fn wrapping_add(take a: Int, take b: Int) -> Int {
+    if b > 0 && a > 9223372036854775807 - b {
+        return (a + (b + int_min())) + int_min();
+    }
+    if b < 0 && a < int_min() - b {
+        return (a + (b - int_min())) - int_min();
+    }
+    a + b
+}
+
+/// `a - b` modulo 2^64.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::ufunc::wrapping_sub(0, 1);
+/// ```
+pub fn wrapping_sub(take a: Int, take b: Int) -> Int {
+    if b == int_min() {
+        return wrapping_add(a, int_min());
+    }
+    wrapping_add(a, 0 - b)
+}
+
+/// `a * b` modulo 2^64, from 16-bit limbs so that no partial product
+/// overflows.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::ufunc::wrapping_mul(4294967296, 4294967296); // 0
+/// ```
+pub fn wrapping_mul(take a: Int, take b: Int) -> Int {
+    let a0 = a & 65535;
+    let a1 = (a >> 16) & 65535;
+    let a2 = (a >> 32) & 65535;
+    let a3 = (a >> 48) & 65535;
+    let b0 = b & 65535;
+    let b1 = (b >> 16) & 65535;
+    let b2 = (b >> 32) & 65535;
+    let b3 = (b >> 48) & 65535;
+    var t = a0 * b0;
+    let r0 = t & 65535;
+    t = (t >> 16) + a0 * b1 + a1 * b0;
+    let r1 = t & 65535;
+    t = (t >> 16) + a0 * b2 + a1 * b1 + a2 * b0;
+    let r2 = t & 65535;
+    t = (t >> 16) + a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0;
+    var r3 = t & 65535;
+    if r3 >= 32768 {
+        r3 = r3 - 65536;
+    }
+    r3 * 281474976710656 + r2 * 4294967296 + r1 * 65536 + r0
+}
+
+/// The larger of two floats as numpy's `maximum`: NaN if either is, and
+/// 0.0 over -0.0.
+///
+/// # Example
+/// ```tuo
+/// let m = numpy::ufunc::float_max(-0.0, 0.0); // 0.0
+/// ```
+pub fn float_max(take x: Float, take y: Float) -> Float {
+    if x != x {
+        return x;
+    }
+    if y != y {
+        return y;
+    }
+    if x == y {
+        if numpy::ieee::signbit(x) {
+            return y;
+        }
+        return x;
+    }
+    if x > y {
+        return x;
+    }
+    y
+}
+
+/// The smaller of two floats as numpy's `minimum`: NaN if either is, and
+/// -0.0 under 0.0.
+///
+/// # Example
+/// ```tuo
+/// let m = numpy::ufunc::float_min(0.0, -0.0); // -0.0
+/// ```
+pub fn float_min(take x: Float, take y: Float) -> Float {
+    if x != x {
+        return x;
+    }
+    if y != y {
+        return y;
+    }
+    if x == y {
+        if numpy::ieee::signbit(x) {
+            return x;
+        }
+        return y;
+    }
+    if x < y {
+        return x;
+    }
+    y
+}
+
+/// The shape `a` and `b` broadcast to, or `[-1]` when they do not.
+///
+/// # Example
+/// ```tuo
+/// let s = numpy::ufunc::broadcast_shape(a.shape, b.shape);
+/// ```
+pub fn broadcast_shape(in a: Array[Int], in b: Array[Int]) -> Array[Int] {
+    let na = std::array::len(a);
+    let nb = std::array::len(b);
+    var n = na;
+    if nb > n {
+        n = nb;
+    }
+    var out = std::array::empty();
+    var i = 0;
+    while i < n {
+        var da = 1;
+        if i >= n - na {
+            da = std::array::get(a, i - (n - na));
+        }
+        var db = 1;
+        if i >= n - nb {
+            db = std::array::get(b, i - (n - nb));
+        }
+        if da == db || db == 1 {
+            std::array::push(out, da);
+        } else if da == 1 {
+            std::array::push(out, db);
+        } else {
+            var bad = std::array::empty();
+            std::array::push(bad, 0 - 1);
+            return bad;
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// Whether `broadcast_shape` failed.
+///
+/// # Example
+/// ```tuo
+/// let bad = numpy::ufunc::is_mismatch(numpy::ufunc::broadcast_shape(a.shape, b.shape));
+/// ```
+pub fn is_mismatch(in shape: Array[Int]) -> Bool {
+    std::array::len(shape) > 0 && std::array::get(shape, 0) < 0
+}
+
+fn mismatch(in a: Array[Int], in b: Array[Int], in c: Array[Int], take three: Bool) -> numpy::ndarray::NdArray {
+    var message = std::string::from_str("operands could not be broadcast together with shapes ");
+    std::str::push(message, std::string::as_str(numpy::ndarray::shape_compact(a)));
+    std::str::push(message, " ");
+    std::str::push(message, std::string::as_str(numpy::ndarray::shape_compact(b)));
+    std::str::push(message, " ");
+    if three {
+        std::str::push(message, std::string::as_str(numpy::ndarray::shape_compact(c)));
+        std::str::push(message, " ");
+    }
+    numpy::ndarray::failure("ValueError", std::string::as_str(message))
+}
+
+/// The strides, aligned to `out`'s axes, at which an operand of `shape`
+/// broadcast to `out` advances: 0 along the axes it is stretched over.
+///
+/// # Example
+/// ```tuo
+/// let s = numpy::ufunc::strides(b.shape, out_shape);
+/// ```
+pub fn strides(in shape: Array[Int], in out: Array[Int]) -> Array[Int] {
+    let n = std::array::len(out);
+    let k = std::array::len(shape);
+    var result = std::array::empty();
+    var i = 0;
+    while i < n {
+        std::array::push(result, 0);
+        i = i + 1;
+    }
+    var step = 1;
+    var j = k - 1;
+    while j >= 0 {
+        let d = std::array::get(shape, j);
+        if d != 1 {
+            std::array::set(result, n - k + j, step);
+        }
+        step = step * d;
+        j = j - 1;
+    }
+    result
+}
+
+/// An odometer over an output shape, carrying the offsets of up to three
+/// broadcast operands.
+pub struct Walk {
+    shape: Array[Int],
+    index: Array[Int],
+    sa: Array[Int],
+    sb: Array[Int],
+    sc: Array[Int],
+    oa: Int,
+    ob: Int,
+    oc: Int,
+}
+
+/// A walk over `out` with operands of shapes `a`, `b`, `c`.
+///
+/// # Example
+/// ```tuo
+/// var w = numpy::ufunc::walk(out_shape, a.shape, b.shape, c.shape);
+/// ```
+pub fn walk(in out: Array[Int], in a: Array[Int], in b: Array[Int], in c: Array[Int]) -> Walk {
+    var index = std::array::empty();
+    var i = 0;
+    while i < std::array::len(out) {
+        std::array::push(index, 0);
+        i = i + 1;
+    }
+    Walk { shape: numpy::ndarray::copy_shape(out), index: index, sa: strides(a, out), sb: strides(b, out), sc: strides(c, out), oa: 0, ob: 0, oc: 0 }
+}
+
+/// Steps `w` to the next output element in C order.
+///
+/// # Example
+/// ```tuo
+/// numpy::ufunc::advance(w);
+/// ```
+pub fn advance(mut w: Walk) {
+    var d = std::array::len(w.shape) - 1;
+    while d >= 0 {
+        let i = std::array::get(w.index, d) + 1;
+        if i < std::array::get(w.shape, d) {
+            std::array::set(w.index, d, i);
+            w.oa = w.oa + std::array::get(w.sa, d);
+            w.ob = w.ob + std::array::get(w.sb, d);
+            w.oc = w.oc + std::array::get(w.sc, d);
+            return;
+        }
+        std::array::set(w.index, d, 0);
+        w.oa = w.oa - std::array::get(w.sa, d) * (i - 1);
+        w.ob = w.ob - std::array::get(w.sb, d) * (i - 1);
+        w.oc = w.oc - std::array::get(w.sc, d) * (i - 1);
+        d = d - 1;
+    }
+}
+
+fn is_comparison(take op: Int) -> Bool {
+    op >= 6
+}
+
+fn compare_floats(take op: Int, take x: Float, take y: Float) -> Bool {
+    if op == 6 {
+        return x == y;
+    }
+    if op == 7 {
+        return x != y;
+    }
+    if op == 8 {
+        return x < y;
+    }
+    if op == 9 {
+        return x <= y;
+    }
+    if op == 10 {
+        return x > y;
+    }
+    x >= y
+}
+
+fn compare_ints(take op: Int, take x: Int, take y: Int) -> Bool {
+    if op == 6 {
+        return x == y;
+    }
+    if op == 7 {
+        return x != y;
+    }
+    if op == 8 {
+        return x < y;
+    }
+    if op == 9 {
+        return x <= y;
+    }
+    if op == 10 {
+        return x > y;
+    }
+    x >= y
+}
+
+fn float_op(take op: Int, take x: Float, take y: Float, take dtype: Int) -> Float {
+    var r = 0.0;
+    if op == 0 {
+        r = x + y;
+    } else if op == 1 {
+        r = x - y;
+    } else if op == 2 {
+        r = x * y;
+    } else if op == 3 {
+        r = x / y;
+    } else if op == 4 {
+        return float_max(x, y);
+    } else {
+        return float_min(x, y);
+    }
+    if dtype == 2 {
+        return numpy::ieee::round32(r);
+    }
+    r
+}
+
+fn int_op(take op: Int, take x: Int, take y: Int) -> Int {
+    if op == 0 {
+        return wrapping_add(x, y);
+    }
+    if op == 1 {
+        return wrapping_sub(x, y);
+    }
+    if op == 2 {
+        return wrapping_mul(x, y);
+    }
+    if op == 4 {
+        if x > y {
+            return x;
+        }
+        return y;
+    }
+    if x < y {
+        return x;
+    }
+    y
+}
+
+fn bool_op(take op: Int, take x: Int, take y: Int) -> Int {
+    if op == 0 || op == 4 {
+        if x != 0 || y != 0 {
+            return 1;
+        }
+        return 0;
+    }
+    if x != 0 && y != 0 {
+        return 1;
+    }
+    0
+}
+
+fn push_bool(mut out: numpy::ndarray::NdArray, take b: Bool) {
+    if b {
+        std::array::push(out.ints, 1);
+    } else {
+        std::array::push(out.ints, 0);
+    }
+}
+
+/// `op` applied elementwise to `a` and `b`, broadcast.
+///
+/// # Example
+/// ```tuo
+/// let c = numpy::ufunc::binary(a, b, numpy::ufunc::op_add());
+/// ```
+pub fn binary(in a: numpy::ndarray::NdArray, in b: numpy::ndarray::NdArray, take op: Int) -> numpy::ndarray::NdArray {
+    if !numpy::ndarray::ok(a) {
+        return numpy::ndarray::failed(a);
+    }
+    if !numpy::ndarray::ok(b) {
+        return numpy::ndarray::failed(b);
+    }
+    let shape = broadcast_shape(a.shape, b.shape);
+    if is_mismatch(shape) {
+        return mismatch(a.shape, b.shape, a.shape, false);
+    }
+    var dtype = numpy::dtype::result_type(a.dtype, a.weak, b.dtype, b.weak);
+    if op == 3 && !numpy::dtype::is_float(dtype) {
+        dtype = 3;
+    }
+    if dtype == 0 && op == 1 {
+        return numpy::ndarray::failure("TypeError", "numpy boolean subtract, the `-` operator, is not supported, use the bitwise_xor, the `^` operator, or the logical_xor function instead.");
+    }
+    var out_dtype = dtype;
+    if is_comparison(op) {
+        out_dtype = 0;
+    }
+    var out = numpy::ndarray::build(out_dtype, numpy::ndarray::copy_shape(shape), std::array::empty(), std::array::empty());
+    let n = numpy::ndarray::product(shape);
+    let none = std::array::empty();
+    var w = walk(shape, a.shape, b.shape, none);
+    var k = 0;
+    while k < n {
+        if numpy::dtype::is_float(dtype) {
+            let x = numpy::ndarray::float_at(a, w.oa, dtype);
+            let y = numpy::ndarray::float_at(b, w.ob, dtype);
+            if is_comparison(op) {
+                push_bool(out, compare_floats(op, x, y));
+            } else {
+                std::array::push(out.floats, float_op(op, x, y, dtype));
+            }
+        } else {
+            let x = numpy::ndarray::int_at(a, w.oa);
+            let y = numpy::ndarray::int_at(b, w.ob);
+            if is_comparison(op) {
+                push_bool(out, compare_ints(op, x, y));
+            } else if dtype == 0 {
+                std::array::push(out.ints, bool_op(op, x, y));
+            } else {
+                std::array::push(out.ints, int_op(op, x, y));
+            }
+        }
+        advance(w);
+        k = k + 1;
+    }
+    out
+}
+
+/// `np.add`.
+///
+/// # Example
+/// ```tuo
+/// let c = numpy::ufunc::add(a, b);
+/// ```
+pub fn add(in a: numpy::ndarray::NdArray, in b: numpy::ndarray::NdArray) -> numpy::ndarray::NdArray {
+    binary(a, b, 0)
+}
+
+/// `np.subtract`.
+///
+/// # Example
+/// ```tuo
+/// let c = numpy::ufunc::subtract(a, b);
+/// ```
+pub fn subtract(in a: numpy::ndarray::NdArray, in b: numpy::ndarray::NdArray) -> numpy::ndarray::NdArray {
+    binary(a, b, 1)
+}
+
+/// `np.multiply`.
+///
+/// # Example
+/// ```tuo
+/// let c = numpy::ufunc::multiply(a, b);
+/// ```
+pub fn multiply(in a: numpy::ndarray::NdArray, in b: numpy::ndarray::NdArray) -> numpy::ndarray::NdArray {
+    binary(a, b, 2)
+}
+
+/// `np.divide` — true division; integers and bools divide as float64.
+///
+/// # Example
+/// ```tuo
+/// let c = numpy::ufunc::divide(a, b);
+/// ```
+pub fn divide(in a: numpy::ndarray::NdArray, in b: numpy::ndarray::NdArray) -> numpy::ndarray::NdArray {
+    binary(a, b, 3)
+}
+
+/// Unary operation codes, for `unary`: `negative` 0, `absolute` 1, `sqrt`
+/// 2, `square` 3, `rint` 4, `floor` 5, `ceil` 6, `isnan` 7.
+///
+/// # Example
+/// ```tuo
+/// let op = numpy::ufunc::op_sqrt();
+/// ```
+pub fn op_sqrt() -> Int {
+    2
+}
+
+fn float_unary(take op: Int, take x: Float, take dtype: Int) -> Float {
+    var r = x;
+    if op == 0 {
+        return numpy::ieee::negate(x);
+    }
+    if op == 1 {
+        if numpy::ieee::signbit(x) {
+            return numpy::ieee::negate(x);
+        }
+        return x;
+    }
+    if op == 2 {
+        r = numpy::ieee::sqrt(x);
+    } else if op == 3 {
+        r = x * x;
+    } else if op == 4 {
+        return numpy::ieee::rint(x);
+    } else if op == 5 {
+        return numpy::ieee::floor(x);
+    } else {
+        return numpy::ieee::ceil(x);
+    }
+    if dtype == 2 {
+        return numpy::ieee::round32(r);
+    }
+    r
+}
+
+/// `op` (see `op_sqrt`) applied elementwise to `a`.
+///
+/// # Example
+/// ```tuo
+/// let r = numpy::ufunc::unary(a, numpy::ufunc::op_sqrt());
+/// ```
+pub fn unary(in a: numpy::ndarray::NdArray, take op: Int) -> numpy::ndarray::NdArray {
+    if !numpy::ndarray::ok(a) {
+        return numpy::ndarray::failed(a);
+    }
+    let n = numpy::ndarray::size(a);
+    let shape = numpy::ndarray::copy_shape(a.shape);
+    if op == 7 {
+        var out = numpy::ndarray::build(0, shape, std::array::empty(), std::array::empty());
+        var i = 0;
+        while i < n {
+            push_bool(out, numpy::dtype::is_float(a.dtype) && numpy::ieee::is_nan(std::array::get(a.floats, i)));
+            i = i + 1;
+        }
+        return out;
+    }
+    if a.dtype == 0 {
+        if op == 0 {
+            return numpy::ndarray::failure("TypeError", "The numpy boolean negative, the `-` operator, is not supported, use the `~` operator or the logical_not function instead.");
+        }
+        if op == 1 {
+            return numpy::ndarray::astype(a, 0);
+        }
+        if op == 3 {
+            return numpy::ndarray::failure("TypeError", "int8 results are not carried by this port");
+        }
+        return numpy::ndarray::failure("TypeError", "float16 results are not carried by this port");
+    }
+    if a.dtype == 1 && (op == 2 || op == 4) {
+        return unary(numpy::ndarray::astype(a, 3), op);
+    }
+    if a.dtype == 1 {
+        var out = numpy::ndarray::build(1, shape, std::array::empty(), std::array::empty());
+        var i = 0;
+        while i < n {
+            let x = std::array::get(a.ints, i);
+            var r = x;
+            if op == 0 {
+                r = wrapping_sub(0, x);
+            } else if op == 1 {
+                if x < 0 {
+                    r = wrapping_sub(0, x);
+                }
+            } else if op == 3 {
+                r = wrapping_mul(x, x);
+            }
+            std::array::push(out.ints, r);
+            i = i + 1;
+        }
+        return out;
+    }
+    var out = numpy::ndarray::build(a.dtype, shape, std::array::empty(), std::array::empty());
+    var i = 0;
+    while i < n {
+        std::array::push(out.floats, float_unary(op, std::array::get(a.floats, i), a.dtype));
+        i = i + 1;
+    }
+    out
+}
+
+/// `np.where(condition, x, y)`: `x` where the condition is true (non-zero,
+/// NaN included), `y` elsewhere, all three broadcast, in `x` and `y`'s
+/// promoted dtype.
+///
+/// # Example
+/// ```tuo
+/// let r = numpy::ufunc::where_(c, x, y);
+/// ```
+pub fn where_(in condition: numpy::ndarray::NdArray, in x: numpy::ndarray::NdArray, in y: numpy::ndarray::NdArray) -> numpy::ndarray::NdArray {
+    if !numpy::ndarray::ok(condition) {
+        return numpy::ndarray::failed(condition);
+    }
+    if !numpy::ndarray::ok(x) {
+        return numpy::ndarray::failed(x);
+    }
+    if !numpy::ndarray::ok(y) {
+        return numpy::ndarray::failed(y);
+    }
+    let first = broadcast_shape(condition.shape, x.shape);
+    var shape = std::array::empty();
+    if !is_mismatch(first) {
+        shape = broadcast_shape(first, y.shape);
+    }
+    if is_mismatch(first) || is_mismatch(shape) {
+        return mismatch(condition.shape, x.shape, y.shape, true);
+    }
+    let dtype = numpy::dtype::result_type(x.dtype, x.weak, y.dtype, y.weak);
+    var out = numpy::ndarray::build(dtype, numpy::ndarray::copy_shape(shape), std::array::empty(), std::array::empty());
+    let n = numpy::ndarray::product(shape);
+    var w = walk(shape, condition.shape, x.shape, y.shape);
+    var k = 0;
+    while k < n {
+        if numpy::ndarray::truth_at(condition, w.oa) {
+            numpy::ndarray::push_converted(out, x, w.ob);
+        } else {
+            numpy::ndarray::push_converted(out, y, w.oc);
+        }
+        advance(w);
+        k = k + 1;
+    }
+    out
+}
+
+/// `np.clip(x, low, high)`, either bound `None`.
+///
+/// With one bound `None` numpy calls `maximum` or `minimum`. With both, its
+/// clip loop keeps `x` on equality when both bounds are 0-d (a scalar each:
+/// `x < low` and `x > high` decide) and takes the bound on equality when
+/// either is an array (`x <= low`, `x >= high`) — invisible but for signed
+/// zeros, where it decides between -0.0 and 0.0. A NaN anywhere is NaN.
+/// (numpy's choice is really made by its iterator — whether the bounds'
+/// inner strides are zero — and for an array bound broadcast along the last
+/// axis its iterator can still pick the scalar loop; the port does not.)
+///
+/// # Example
+/// ```tuo
+/// let r = numpy::ufunc::clip(x, low, high);
+/// ```
+pub fn clip(in x: numpy::ndarray::NdArray, in low: numpy::ndarray::NdArray, in high: numpy::ndarray::NdArray) -> numpy::ndarray::NdArray {
+    if !numpy::ndarray::ok(x) {
+        return numpy::ndarray::failed(x);
+    }
+    if !numpy::ndarray::ok(low) {
+        return numpy::ndarray::failed(low);
+    }
+    if !numpy::ndarray::ok(high) {
+        return numpy::ndarray::failed(high);
+    }
+    let no_low = numpy::ndarray::is_none(low);
+    let no_high = numpy::ndarray::is_none(high);
+    if no_low && no_high {
+        return numpy::ndarray::copy(x);
+    }
+    if no_low {
+        return binary(x, high, 5);
+    }
+    if no_high {
+        return binary(x, low, 4);
+    }
+    let first = broadcast_shape(x.shape, low.shape);
+    var shape = std::array::empty();
+    if !is_mismatch(first) {
+        shape = broadcast_shape(first, high.shape);
+    }
+    if is_mismatch(first) || is_mismatch(shape) {
+        return mismatch(x.shape, low.shape, high.shape, true);
+    }
+    let pair = numpy::dtype::result_type(x.dtype, x.weak, low.dtype, low.weak);
+    let dtype = numpy::dtype::result_type(pair, x.weak && low.weak, high.dtype, high.weak);
+    let strict = numpy::ndarray::ndim(low) == 0 && numpy::ndarray::ndim(high) == 0;
+    var out = numpy::ndarray::build(dtype, numpy::ndarray::copy_shape(shape), std::array::empty(), std::array::empty());
+    let n = numpy::ndarray::product(shape);
+    var w = walk(shape, x.shape, low.shape, high.shape);
+    var k = 0;
+    while k < n {
+        if numpy::dtype::is_float(dtype) {
+            let v = numpy::ndarray::float_at(x, w.oa, dtype);
+            let lo = numpy::ndarray::float_at(low, w.ob, dtype);
+            let hi = numpy::ndarray::float_at(high, w.oc, dtype);
+            var r = v;
+            if v != v || lo != lo || hi != hi {
+                r = numpy::ieee::nan();
+            } else if strict {
+                if r < lo {
+                    r = lo;
+                }
+                if r > hi {
+                    r = hi;
+                }
+            } else {
+                if r <= lo {
+                    r = lo;
+                }
+                if r >= hi {
+                    r = hi;
+                }
+            }
+            std::array::push(out.floats, r);
+        } else {
+            var r = numpy::ndarray::int_at(x, w.oa);
+            let lo = numpy::ndarray::int_at(low, w.ob);
+            let hi = numpy::ndarray::int_at(high, w.oc);
+            if r < lo {
+                r = lo;
+            }
+            if r > hi {
+                r = hi;
+            }
+            std::array::push(out.ints, r);
+        }
+        advance(w);
+        k = k + 1;
+    }
+    out
+}
+
+/// 10^n as numpy's `power_of_ten` computes it: a table to 10^8, then
+/// repeated multiplication.
+fn power_of_ten(take n: Int) -> Float {
+    var r = 1.0;
+    var i = 0;
+    if n < 9 {
+        while i < n {
+            r = r * 10.0;
+            i = i + 1;
+        }
+        return r;
+    }
+    r = 1000000000.0;
+    i = 9;
+    while i < n {
+        r = r * 10.0;
+        i = i + 1;
+    }
+    r
+}
+
+/// `np.round(x, decimals)`, as numpy computes it: multiply by 10^decimals
+/// (a Python float, so in `x`'s own dtype), round half to even, divide
+/// back — or the reverse for negative `decimals`. Integers are copied for
+/// `decimals >= 0` and go through float64 otherwise.
+///
+/// # Example
+/// ```tuo
+/// let r = numpy::ufunc::round(x, 2);
+/// ```
+pub fn round(in x: numpy::ndarray::NdArray, take decimals: Int) -> numpy::ndarray::NdArray {
+    if !numpy::ndarray::ok(x) {
+        return numpy::ndarray::failed(x);
+    }
+    if x.dtype == 0 {
+        return numpy::ndarray::failure("TypeError", "round of a bool array is not carried by this port");
+    }
+    if x.dtype == 1 {
+        if decimals >= 0 {
+            return numpy::ndarray::copy(x);
+        }
+        return numpy::ndarray::astype(round(numpy::ndarray::astype(x, 3), decimals), 1);
+    }
+    if decimals == 0 {
+        return unary(x, 4);
+    }
+    if decimals > 0 {
+        let f = numpy::ndarray::python_float(power_of_ten(decimals));
+        return binary(unary(binary(x, f, 2), 4), f, 3);
+    }
+    let f = numpy::ndarray::python_float(power_of_ten(0 - decimals));
+    binary(unary(binary(x, f, 3), 4), f, 2)
+}
+
+fn f64s(take a: Float, take b: Float, take c: Float) -> numpy::ndarray::NdArray {
+    var v = std::array::empty();
+    std::array::push(v, a);
+    std::array::push(v, b);
+    std::array::push(v, c);
+    numpy::ndarray::from_floats(3, v)
+}
+
+spec wrapping_add {
+    then wrapping_add(9223372036854775807, 1) == int_min();
+    then wrapping_add(int_min(), 0 - 1) == 9223372036854775807;
+    then wrapping_add(4611686018427387904, 4611686018427387904) == int_min();
+    then wrapping_add(2, 3) == 5;
+}
+
+spec wrapping_mul {
+    then wrapping_mul(4294967296, 4294967296) == 0;
+    then wrapping_mul(9223372036854775807, 9223372036854775807) == 1;
+    then wrapping_mul(int_min(), 0 - 1) == int_min();
+    then wrapping_mul(0 - 3, 7) == 0 - 21;
+    then wrapping_mul(3037000500, 3037000500) == 0 - 9223372036709301616;
+}
+
+spec float_max {
+    then !numpy::ieee::signbit(float_max(-0.0, 0.0));
+    then !numpy::ieee::signbit(float_max(0.0, -0.0));
+    then numpy::ieee::signbit(float_min(0.0, -0.0));
+    then numpy::ieee::is_nan(float_max(1.0, numpy::ieee::nan()));
+    then numpy::ieee::is_nan(float_min(numpy::ieee::nan(), 1.0));
+}
+
+spec broadcast_shape {
+    then std::string::as_str(numpy::ndarray::shape_tuple(broadcast_shape(f64s(1.0, 2.0, 3.0).shape, numpy::ndarray::expand_dims(f64s(1.0, 2.0, 3.0), 1).shape))) == "(3, 3)";
+    then is_mismatch(broadcast_shape(f64s(1.0, 2.0, 3.0).shape, numpy::ndarray::arange(4).shape));
+    then std::string::as_str(add(f64s(1.0, 2.0, 3.0), numpy::ndarray::arange(4)).error) == "operands could not be broadcast together with shapes (3,) (4,) ";
+}
+
+spec binary {
+    then std::array::get(add(f64s(1.0, 2.0, 3.0), numpy::ndarray::python_int(2)).floats, 2) == 5.0;
+    then multiply(numpy::ndarray::astype(f64s(1.0, 2.0, 3.0), 2), numpy::ndarray::python_float(0.1)).dtype == 2;
+    then std::array::get(multiply(numpy::ndarray::astype(f64s(1.0, 2.0, 3.0), 2), numpy::ndarray::python_float(0.1)).floats, 2) == numpy::ieee::round32(3.0 * numpy::ieee::round32(0.1));
+    then divide(numpy::ndarray::arange(3), numpy::ndarray::python_int(2)).dtype == 3;
+    then std::array::get(binary(numpy::ndarray::arange(3), numpy::ndarray::python_float(1.0), 8).ints, 0) == 1;
+}
+
+spec round {
+    // Not Python's round, which gives 2.67: 2.675 * 100 is 267.5 in binary64.
+    then std::array::get(round(f64s(2.675, 0.125, 0.0 - 2.5), 2).floats, 0) == 2.68;
+    then std::array::get(round(f64s(2.675, 0.125, 0.0 - 2.5), 2).floats, 1) == 0.12;
+    then std::array::get(round(f64s(2.675, 0.125, 0.0 - 2.5), 0).floats, 2) == 0.0 - 2.0;
+    then std::array::get(round(f64s(150.0, 250.0, 0.0 - 2.5), 0 - 2).floats, 1) == 200.0;
+}

@@ -1,0 +1,561 @@
+// numpy::demo — the captured expressions, evaluated by the port.
+//
+// `examples/numpy_oracle.py` evaluated 488 expressions with numpy; this
+// module evaluates the same text with the port and renders the result
+// the way the oracle did, so a case agrees when the two strings are
+// equal. The syntax is the oracle's: calls `name(arg, …)`, input names,
+// Python ints (`-1`), Python floats by their bits (`f('3fe0…')`), `True`,
+// `False`, `None`, and the dtype names.
+
+module numpy::demo;
+
+/// A value and where the text after it starts.
+pub struct Ev {
+    value: numpy::ndarray::NdArray,
+    pos: Int,
+}
+
+fn skip_spaces(in s: Str, take pos: Int) -> Int {
+    var p = pos;
+    while p < std::str::len(s) && std::str::byte_at(s, p) == 32 {
+        p = p + 1;
+    }
+    p
+}
+
+/// The first index of byte `b` in `s` from `from`, or -1.
+fn find_byte(in s: Str, take b: Int, take from: Int) -> Int {
+    var i = from;
+    while i < std::str::len(s) {
+        if std::str::byte_at(s, i) == b {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+fn is_name_byte(take b: Int) -> Bool {
+    (b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) || b == 95
+}
+
+/// The integer in `text`, which may be negative, the int64 minimum
+/// included.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::demo::int_of("-12"); // -12
+/// ```
+pub fn int_of(in text: Str) -> Int {
+    var negative = false;
+    var i = 0;
+    if std::str::len(text) > 0 && std::str::byte_at(text, 0) == 45 {
+        negative = true;
+        i = 1;
+    }
+    var v = 0;
+    while i < std::str::len(text) {
+        v = v * 10 - (std::str::byte_at(text, i) - 48);
+        i = i + 1;
+    }
+    if negative {
+        return v;
+    }
+    0 - v
+}
+
+/// The array written as `dtype|shape|elements` (floats as bit patterns).
+///
+/// # Example
+/// ```tuo
+/// let a = numpy::demo::parse_array("int64|2|3 -4");
+/// ```
+pub fn parse_array(in text: Str) -> numpy::ndarray::NdArray {
+    let bar1 = find_byte(text, 124, 0);
+    let rest = std::str::slice(text, bar1 + 1, std::str::len(text));
+    let bar2 = find_byte(rest, 124, 0);
+    if bar1 < 0 || bar2 < 0 {
+        return numpy::ndarray::failure("ValueError", "malformed input");
+    }
+    let dtype = numpy::dtype::named(std::str::slice(text, 0, bar1));
+    let shape_text = std::str::slice(rest, 0, bar2);
+    let body = std::str::slice(rest, bar2 + 1, std::str::len(rest));
+    var shape = std::array::empty();
+    var start = 0;
+    var i = 0;
+    while i <= std::str::len(shape_text) {
+        if i == std::str::len(shape_text) || std::str::byte_at(shape_text, i) == 44 {
+            if i > start {
+                std::array::push(shape, int_of(std::str::slice(shape_text, start, i)));
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    var floats = std::array::empty();
+    var ints = std::array::empty();
+    start = 0;
+    i = 0;
+    while i <= std::str::len(body) {
+        if i == std::str::len(body) || std::str::byte_at(body, i) == 32 {
+            if i > start {
+                let item = std::str::slice(body, start, i);
+                if dtype == 2 {
+                    std::array::push(floats, numpy::ieee::from_hex32(item));
+                } else if dtype == 3 {
+                    std::array::push(floats, numpy::ieee::from_hex64(item));
+                } else {
+                    std::array::push(ints, int_of(item));
+                }
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    numpy::ndarray::build(dtype, shape, floats, ints)
+}
+
+/// Pushes `n` in decimal. (`std::str::push_int` negates a negative `n`
+/// first, which traps for the int64 minimum; digits are taken here from
+/// the negative side, where every int64 fits.)
+fn push_decimal(mut out: String, take n: Int) {
+    var m = n;
+    if m > 0 {
+        m = 0 - m;
+    } else if m < 0 {
+        std::str::push(out, "-");
+    }
+    var digits = std::array::empty();
+    std::array::push(digits, 0 - (m % 10));
+    m = m / 10;
+    while m < 0 {
+        std::array::push(digits, 0 - (m % 10));
+        m = m / 10;
+    }
+    var i = std::array::len(digits) - 1;
+    while i >= 0 {
+        std::string::push_byte(out, 48 + std::array::get(digits, i));
+        i = i - 1;
+    }
+}
+
+/// `a` as the oracle renders a result: `dtype|shape|elements`, floats as
+/// bit patterns and NaN as `nan`; or `Type: message`.
+///
+/// # Example
+/// ```tuo
+/// let text = numpy::demo::render(a);
+/// ```
+pub fn render(in a: numpy::ndarray::NdArray) -> String {
+    var out = std::string::empty();
+    if !numpy::ndarray::ok(a) {
+        std::str::push(out, std::string::as_str(a.error_type));
+        std::str::push(out, ": ");
+        std::str::push(out, std::string::as_str(a.error));
+        return out;
+    }
+    std::str::push(out, numpy::dtype::name(a.dtype));
+    std::str::push(out, "|");
+    var i = 0;
+    while i < numpy::ndarray::ndim(a) {
+        if i > 0 {
+            std::str::push(out, ",");
+        }
+        std::str::push_int(out, numpy::ndarray::dim(a, i));
+        i = i + 1;
+    }
+    std::str::push(out, "|");
+    i = 0;
+    while i < numpy::ndarray::size(a) {
+        if i > 0 {
+            std::str::push(out, " ");
+        }
+        if a.dtype == 2 {
+            std::str::push(out, std::string::as_str(numpy::ieee::hex32(std::array::get(a.floats, i))));
+        } else if a.dtype == 3 {
+            std::str::push(out, std::string::as_str(numpy::ieee::hex64(std::array::get(a.floats, i))));
+        } else {
+            push_decimal(out, std::array::get(a.ints, i));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+/// Input `name` of case `k`.
+fn lookup(take k: Int, in name: Str) -> numpy::ndarray::NdArray {
+    let refs = numpy::fixture::case_inputs(k);
+    var start = 0;
+    var i = 0;
+    while i <= std::str::len(refs) {
+        if i == std::str::len(refs) || std::str::byte_at(refs, i) == 44 {
+            let entry = std::str::slice(refs, start, i);
+            let eq = find_byte(entry, 61, 0);
+            if eq > 0 && std::str::slice(entry, 0, eq) == name {
+                let index = int_of(std::str::slice(entry, eq + 1, std::str::len(entry)));
+                return parse_array(numpy::fixture::input_text(index));
+            }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    var message = std::string::from_str("name '");
+    std::str::push(message, name);
+    std::str::push(message, "' is not defined");
+    numpy::ndarray::failure("NameError", std::string::as_str(message))
+}
+
+fn int_arg(in a: numpy::ndarray::NdArray) -> Int {
+    if std::array::len(a.ints) > 0 {
+        return std::array::get(a.ints, 0);
+    }
+    0
+}
+
+fn binary_op(in name: Str) -> Int {
+    if name == "add" {
+        return 0;
+    }
+    if name == "subtract" {
+        return 1;
+    }
+    if name == "multiply" {
+        return 2;
+    }
+    if name == "divide" {
+        return 3;
+    }
+    if name == "maximum" {
+        return 4;
+    }
+    if name == "minimum" {
+        return 5;
+    }
+    if name == "equal" {
+        return 6;
+    }
+    if name == "not_equal" {
+        return 7;
+    }
+    if name == "less" {
+        return 8;
+    }
+    if name == "less_equal" {
+        return 9;
+    }
+    if name == "greater" {
+        return 10;
+    }
+    if name == "greater_equal" {
+        return 11;
+    }
+    0 - 1
+}
+
+fn unary_op(in name: Str) -> Int {
+    if name == "negative" {
+        return 0;
+    }
+    if name == "absolute" {
+        return 1;
+    }
+    if name == "sqrt" {
+        return 2;
+    }
+    if name == "square" {
+        return 3;
+    }
+    if name == "rint" {
+        return 4;
+    }
+    if name == "floor" {
+        return 5;
+    }
+    if name == "ceil" {
+        return 6;
+    }
+    if name == "isnan" {
+        return 7;
+    }
+    0 - 1
+}
+
+fn reduce_kind(in name: Str) -> Int {
+    if name == "sum" {
+        return 0;
+    }
+    if name == "mean" {
+        return 1;
+    }
+    if name == "max" {
+        return 2;
+    }
+    if name == "min" {
+        return 3;
+    }
+    if name == "argmax" {
+        return 4;
+    }
+    if name == "argmin" {
+        return 5;
+    }
+    0 - 1
+}
+
+/// The function `name` applied to `count` arguments: the first three as
+/// arrays, and the integers among the rest (for `reshape`) in `extra`.
+fn apply(in name: Str, take count: Int, in a0: numpy::ndarray::NdArray, in a1: numpy::ndarray::NdArray, in a2: numpy::ndarray::NdArray, in extra: Array[Int]) -> numpy::ndarray::NdArray {
+    if binary_op(name) >= 0 {
+        return numpy::ufunc::binary(a0, a1, binary_op(name));
+    }
+    if unary_op(name) >= 0 {
+        return numpy::ufunc::unary(a0, unary_op(name));
+    }
+    if reduce_kind(name) >= 0 {
+        var keepdims = false;
+        if count > 2 {
+            keepdims = numpy::ndarray::truth_at(a2, 0);
+        }
+        if count > 1 {
+            return numpy::reduce::reduce(a0, a1, keepdims, reduce_kind(name));
+        }
+        return numpy::reduce::reduce(a0, numpy::ndarray::none(), keepdims, reduce_kind(name));
+    }
+    if name == "arange" {
+        return numpy::ndarray::arange(int_arg(a0));
+    }
+    if name == "reshape" {
+        return numpy::ndarray::reshape(a0, extra);
+    }
+    if name == "expand_dims" {
+        return numpy::ndarray::expand_dims(a0, int_arg(a1));
+    }
+    if name == "squeeze" {
+        if count > 1 {
+            return numpy::ndarray::squeeze(a0, a1);
+        }
+        return numpy::ndarray::squeeze(a0, numpy::ndarray::none());
+    }
+    if name == "ravel" {
+        return numpy::ndarray::ravel(a0);
+    }
+    if name == "astype" {
+        return numpy::ndarray::astype(a0, int_arg(a1));
+    }
+    if name == "where" {
+        return numpy::ufunc::where_(a0, a1, a2);
+    }
+    if name == "clip" {
+        return numpy::ufunc::clip(a0, a1, a2);
+    }
+    if name == "round" {
+        if count > 1 {
+            return numpy::ufunc::round(a0, int_arg(a1));
+        }
+        return numpy::ufunc::round(a0, 0);
+    }
+    if name == "sort" || name == "argsort" {
+        var axis = numpy::ndarray::python_int(0 - 1);
+        if count > 1 {
+            axis = numpy::ndarray::copy(a1);
+            if numpy::ndarray::is_none(a1) {
+                axis = numpy::ndarray::none();
+            }
+        }
+        if name == "sort" {
+            return numpy::sort::sort(a0, axis);
+        }
+        return numpy::sort::argsort(a0, axis);
+    }
+    if name == "take" {
+        if count > 2 {
+            return numpy::sort::take_(a0, a1, a2);
+        }
+        return numpy::sort::take_(a0, a1, numpy::ndarray::none());
+    }
+    if name == "take_along_axis" {
+        return numpy::sort::take_along_axis(a0, a1, int_arg(a2));
+    }
+    var message = std::string::from_str("no function ");
+    std::str::push(message, name);
+    numpy::ndarray::failure("NameError", std::string::as_str(message))
+}
+
+/// The value of the expression in `s` from `pos`, for case `k`.
+///
+/// # Example
+/// ```tuo
+/// let ev = numpy::demo::eval(0, "sum(a)", 0);
+/// ```
+pub fn eval(take k: Int, in s: Str, take pos: Int) -> Ev {
+    var p = skip_spaces(s, pos);
+    let b = std::str::byte_at(s, p);
+    if b == 45 || (b >= 48 && b <= 57) {
+        var end = p + 1;
+        while end < std::str::len(s) && std::str::byte_at(s, end) >= 48 && std::str::byte_at(s, end) <= 57 {
+            end = end + 1;
+        }
+        return Ev { value: numpy::ndarray::python_int(int_of(std::str::slice(s, p, end))), pos: end };
+    }
+    var end = p;
+    while end < std::str::len(s) && is_name_byte(std::str::byte_at(s, end)) {
+        end = end + 1;
+    }
+    let name = std::str::slice(s, p, end);
+    p = end;
+    if p >= std::str::len(s) || std::str::byte_at(s, p) != 40 {
+        if name == "None" {
+            return Ev { value: numpy::ndarray::none(), pos: p };
+        }
+        if name == "True" {
+            return Ev { value: numpy::ndarray::scalar(0, 0.0, 1), pos: p };
+        }
+        if name == "False" {
+            return Ev { value: numpy::ndarray::scalar(0, 0.0, 0), pos: p };
+        }
+        if name == "bool_" {
+            return Ev { value: numpy::ndarray::python_int(0), pos: p };
+        }
+        let dtype = numpy::dtype::named(name);
+        if dtype >= 0 {
+            return Ev { value: numpy::ndarray::python_int(dtype), pos: p };
+        }
+        return Ev { value: lookup(k, name), pos: p };
+    }
+    if name == "f" {
+        // f('<16 hex digits>')
+        let hex = std::str::slice(s, p + 2, p + 18);
+        return Ev { value: numpy::ndarray::python_float(numpy::ieee::from_hex64(hex)), pos: p + 20 };
+    }
+    p = p + 1;
+    var count = 0;
+    var a0 = numpy::ndarray::none();
+    var a1 = numpy::ndarray::none();
+    var a2 = numpy::ndarray::none();
+    var extra = std::array::empty();
+    p = skip_spaces(s, p);
+    while std::str::byte_at(s, p) != 41 {
+        let arg = eval(k, s, p);
+        p = skip_spaces(s, arg.pos);
+        if count > 0 && std::array::len(arg.value.ints) > 0 {
+            std::array::push(extra, std::array::get(arg.value.ints, 0));
+        }
+        if count == 0 {
+            a0 = arg.value;
+        } else if count == 1 {
+            a1 = arg.value;
+        } else if count == 2 {
+            a2 = arg.value;
+        } else {
+            // A fourth argument and later are only `reshape`'s lengths.
+            let rest = arg.value;
+        }
+        count = count + 1;
+        if std::str::byte_at(s, p) == 44 {
+            p = skip_spaces(s, p + 1);
+        }
+    }
+    Ev { value: apply(name, count, a0, a1, a2, extra), pos: p + 1 }
+}
+
+/// What the port makes of case `k`, rendered.
+///
+/// # Example
+/// ```tuo
+/// let text = numpy::demo::result(0);
+/// ```
+pub fn result(take k: Int) -> String {
+    render(eval(k, numpy::fixture::case_expr(k), 0).value)
+}
+
+/// Whether the port agrees with numpy on case `k`.
+///
+/// # Example
+/// ```tuo
+/// let same = numpy::demo::agrees(0);
+/// ```
+pub fn agrees(take k: Int) -> Bool {
+    std::string::as_str(result(k)) == numpy::fixture::case_result(k)
+}
+
+/// Whether the port agrees on every case in `from..to`.
+///
+/// # Example
+/// ```tuo
+/// let same = numpy::demo::range_agrees(0, 10);
+/// ```
+pub fn range_agrees(take from: Int, take to: Int) -> Bool {
+    var k = from;
+    while k < to && k < numpy::fixture::case_count() {
+        if !agrees(k) {
+            return false;
+        }
+        k = k + 1;
+    }
+    true
+}
+
+spec int_of {
+    then int_of("-12") == 0 - 12;
+    then int_of("-9223372036854775808") == 0 - 9223372036854775807 - 1;
+    then int_of("9223372036854775807") == 9223372036854775807;
+}
+
+spec render {
+    then std::string::as_str(render(parse_array("int64|2|3 -4"))) == "int64|2|3 -4";
+    then std::string::as_str(render(parse_array("float32||7fc00000"))) == "float32||nan";
+    then std::string::as_str(render(parse_array("float64|0|"))) == "float64|0|";
+    then std::string::as_str(render(parse_array("bool|2,1|1 0"))) == "bool|2,1|1 0";
+    then std::string::as_str(render(parse_array("int64|3|-9223372036854775808 0 9223372036854775807"))) == "int64|3|-9223372036854775808 0 9223372036854775807";
+}
+
+// The captured cases, a group at a time; each `then` stays well inside
+// the sandbox's instruction fuel (the 1000-element sums cost the most).
+
+spec "sums: pairwise along the last axis, slice by slice along the others, means" {
+    then range_agrees(0, 29);
+    then range_agrees(29, 33);
+    then range_agrees(33, 44);
+    then range_agrees(44, 48);
+    then range_agrees(48, 50);
+    then range_agrees(50, 52);
+    then range_agrees(52, 94);
+    then range_agrees(94, 99);
+    then range_agrees(99, 110);
+    then range_agrees(110, 114);
+    then range_agrees(114, 117);
+    then range_agrees(117, 119);
+    then range_agrees(119, 145);
+}
+
+spec "arithmetic: float32 rounded once, special values, int64 wraparound, bools" {
+    then range_agrees(145, 229);
+}
+
+spec "promotion under NEP 50, comparisons, and casts" {
+    then range_agrees(229, 276);
+}
+
+spec "broadcasting and its errors" {
+    then range_agrees(276, 289);
+}
+
+spec "reshape, expand_dims, squeeze, ravel, and axis errors" {
+    then range_agrees(289, 306);
+}
+
+spec "where, clip, and round" {
+    then range_agrees(306, 340);
+}
+
+spec "max, min, argmax, argmin: NaN, signed zeros, empty axes" {
+    then range_agrees(340, 438);
+}
+
+spec "stable sort and argsort, take, take_along_axis" {
+    then range_agrees(438, 477);
+}
+
+spec "the questionnaire score of app/core/matching.py, in numpy" {
+    then range_agrees(477, 488);
+}

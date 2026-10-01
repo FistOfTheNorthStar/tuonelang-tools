@@ -1,0 +1,56 @@
+// examples/numpy — every captured numpy expression, evaluated natively.
+//
+// The specs replay the cases group by group; this program replays all of
+// them as native code and prints what differs.
+//
+//     tuo run examples/numpy.tuo src/numpy/*.tuo src/std_str.tuo
+//
+// No network. One line per case; exit is the failure count.
+
+module numpy_check;
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn show(in label: Str, in text: Str) {
+    var line = std::string::from_str("      ");
+    std::str::push(line, label);
+    std::str::push(line, ": ");
+    std::str::push(line, text);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+}
+
+fn main() -> Int {
+    var failed = 0;
+    var k = 0;
+    while k < numpy::fixture::case_count() {
+        let got = numpy::demo::result(k);
+        let same = std::string::as_str(got) == numpy::fixture::case_result(k);
+        var label = std::string::from_str(numpy::fixture::case_group(k));
+        std::str::push(label, ": ");
+        std::str::push(label, numpy::fixture::case_name(k));
+        failed = failed + report(std::string::as_str(label), same);
+        if !same {
+            show("expr ", numpy::fixture::case_expr(k));
+            show("port ", std::string::as_str(got));
+            show("numpy", numpy::fixture::case_result(k));
+        }
+        k = k + 1;
+    }
+    failed
+}

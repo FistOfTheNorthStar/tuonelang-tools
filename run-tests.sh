@@ -2,8 +2,9 @@
 # run-tests.sh — the validation suite for tuonelang-python-tools.
 #
 #   ./run-tests.sh          front end, specs, formatting, the native Argon2,
-#                           X.509, settings, rate-limit, inflate, and zip oracles,
-#                           and the HTTP, web, and TLS loopback oracles (no network)
+#                           X.509, settings, rate-limit, inflate, zip, and numpy
+#                           oracles, and the HTTP, web, and TLS loopback oracles
+#                           (no network)
 #   ./run-tests.sh --live   also resolve real names against a public DNS
 #                           server, fetch from public HTTP servers, complete
 #                           TLS 1.3 handshakes with three openssl s_server
@@ -119,6 +120,11 @@ INFLATE_SRC=(src/inflate/huffman.tuo src/inflate/raw.tuo src/inflate/zlib.tuo
 ZIP_SRC=(src/zip/text.tuo src/zip/archive.tuo src/zip/demo.tuo src/zip/fixture.tuo
          "${INFLATE_SRC[@]}")
 
+# The ndarray port and the expressions numpy evaluated.
+NUMPY_SRC=(src/numpy/ieee.tuo src/numpy/dtype.tuo src/numpy/ndarray.tuo src/numpy/ufunc.tuo
+           src/numpy/reduce.tuo src/numpy/sort.tuo src/numpy/fixture.tuo src/numpy/demo.tuo
+           src/std_str.tuo)
+
 failed=0
 step() { printf '\n=== %s ===\n' "$1"; }
 check() { if [ "$1" -eq 0 ]; then echo "PASS $2"; else echo "FAIL $2"; failed=1; fi }
@@ -210,11 +216,17 @@ step "Inflate and zip: front end (check)"
 step "Inflate and zip: specs (verify), 75 captured streams and all 54 captured archives reproduced"
 "$TUO" verify "${ZIP_SRC[@]}"; check $? "inflate+zip verify"
 
+step "Numpy: front end (check)"
+"$TUO" check "${NUMPY_SRC[@]}" examples/numpy.tuo; check $? "numpy check"
+
+step "Numpy: specs (verify), all 488 captured numpy expressions reproduced"
+"$TUO" verify "${NUMPY_SRC[@]}"; check $? "numpy verify"
+
 # Only this crate's own sources. The vendored std_*.tuo are verbatim catalog
 # copies and are deliberately not reformatted — they must stay byte-identical
 # to `crates/tuo-stdlib/src/std/` — and src/pg, src/db are tuonelang-db's.
 step "Formatting"
-"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo src/jinja/*.tuo src/dotenv/*.tuo src/settings/*.tuo src/ratelimit/*.tuo src/inflate/*.tuo src/zip/*.tuo examples/*.tuo; check $? "fmt --check"
+"$TUO" fmt --check src/dns/*.tuo src/argon2/*.tuo src/redis/*.tuo src/http/*.tuo src/web/*.tuo src/tls/*.tuo src/x509/*.tuo src/ec/*.tuo src/rsa/*.tuo src/crypto/*.tuo src/sql/*.tuo src/s3/*.tuo src/log/*.tuo src/sentry/*.tuo src/jinja/*.tuo src/dotenv/*.tuo src/settings/*.tuo src/ratelimit/*.tuo src/inflate/*.tuo src/zip/*.tuo src/numpy/*.tuo examples/*.tuo; check $? "fmt --check"
 
 # The RFC 9106 tags and the backend's own 64 MiB hash exceed the spec
 # sandbox's instruction fuel, so they are asserted natively. No network.
@@ -283,6 +295,17 @@ if [ "$rc" -eq 0 ]; then
 else
   echo "zip oracle exited $rc — that many checks disagreed"
   check 1 "zip oracle"
+fi
+
+# Every captured numpy expression again, as native code.
+step "Numpy: native oracle (every captured expression)"
+"$TUO" run examples/numpy.tuo "${NUMPY_SRC[@]}"
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  check 0 "numpy oracle (all checks agreed)"
+else
+  echo "numpy oracle exited $rc — that many checks disagreed"
+  check 1 "numpy oracle"
 fi
 
 # The HTTP server and client prove each other over loopback, in one process.

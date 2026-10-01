@@ -5,7 +5,7 @@
 [roadmap](ROADMAP.md) sets, each proven by colocated specs against its
 published test vectors.
 
-Seventeen ports so far:
+Eighteen ports so far:
 
 | Port | Replaces | Proven by |
 |---|---|---|
@@ -26,11 +26,12 @@ Seventeen ports so far:
 | **`ratelimit`** — `limits`' grammar, keys, and fixed window in memory and in Redis; slowapi's check, 429, and headers | `slowapi`, `limits` | 21 specs, 63 strings, 9 storage scripts, 16 Redis exchanges, and 103 requests through slowapi and FastAPI reproduced byte for byte, and a 14-check live oracle |
 | **`jinja`** — the template engine: inheritance, `if`/`elif`/`else`, expressions with filters, autoescaping with `Markup`, Jinja's whitespace rules | `jinja2`, `markupsafe` | 9 specs, and 100 renders of the backend's 30 email templates by Jinja2 3.1.6 reproduced byte for byte |
 | **`web`** — routing as Starlette does it, request models as data, Pydantic's lax validation, FastAPI's 422 body | `fastapi`, `pydantic`, `starlette`, `email-validator` (the request path) | 37 specs, and 107 responses captured from FastAPI 0.141 reproduced byte for byte — as a pure function, and again over a socket |
+| **`numpy`** — n-dimensional arrays in bool, int64, float32, and float64: broadcasting, NEP 50 promotion, elementwise arithmetic, `where`, `clip`, `round`, sums in numpy's own order, extrema, stable sorting, `take` | `numpy` (the questionnaire's float32 math) | 66 specs, and 488 expressions evaluated by numpy 2.5.3 reproduced bit for bit — every element's IEEE pattern, every exception's text |
 
 ```bash
 ./run-tests.sh          # front end, the specs, formatting, the native Argon2, X.509,
-                        # settings, rate-limit, inflate, and zip oracles, and the HTTP,
-                        # web, and TLS loopback oracles (no network)
+                        # settings, rate-limit, inflate, zip, and numpy oracles, and the
+                        # HTTP, web, and TLS loopback oracles (no network)
 ./run-tests.sh --live   # also resolve real names over UDP, fetch from public HTTP servers,
                         # complete TLS 1.3 handshakes with three openssl s_server instances,
                         # fetch https:// from Stripe, Sentry, and Cloudflare, and drive the
@@ -348,6 +349,173 @@ CAs; adding one is one base64 line. And the catalog's own caveat carries
 over: `std::bignum` is variable-time, so the client's X25519 step leaks
 timing on its ephemeral key. Signature *verification* is variable-time
 by design, and there is no signing function in `ec` or `rsa` at all.
+
+---
+
+## `numpy` — arrays, as numpy computes them
+
+numpy reaches the backend through `shapely` and `torchvision`. The array
+arithmetic it actually runs is the questionnaire matching in
+`app/core/matching.py`, written with torch: float32 vectors, broadcasting,
+`where`, sums along an axis, square roots, a clamp, and the five largest
+and smallest of each row. This port is that kind of array, with numpy's
+semantics: an n-dimensional `NdArray` in bool, int64, float32, or float64,
+and the operations that computation is made of, each as numpy does it.
+
+```tuo
+let answers = numpy::ndarray::reshape(numpy::ndarray::from_floats(numpy::dtype::float32(), values), shape);
+let weighted = numpy::ufunc::multiply(answers, numpy::ndarray::python_float(0.5));    // stays float32
+let per_row = numpy::reduce::sum(weighted, numpy::ndarray::python_int(1), false);   // numpy's order
+let order = numpy::sort::argsort(numpy::ufunc::unary(per_row, 0), numpy::ndarray::python_int(0 - 1));
+```
+
+### Status
+
+| Layer | State |
+|---|---|
+| `numpy::ieee` — binary64 and binary32 bit patterns taken apart and put together arithmetically, exact scaling, a correctly rounded `sqrt`, `rint`, `floor`, `ceil`, one-rounding int-to-float | ✅ proven |
+| `numpy::dtype` — the four dtypes, the promotion lattice, NEP 50's weak Python scalars | ✅ proven |
+| `numpy::ndarray` — the array, `reshape`, `expand_dims`, `squeeze`, `ravel`, `astype`, `arange`, numpy's shape and axis errors | ✅ proven |
+| `numpy::ufunc` — broadcasting; `add`, `subtract`, `multiply`, `divide`, `maximum`, `minimum`, the six comparisons; `negative`, `absolute`, `sqrt`, `square`, `rint`, `floor`, `ceil`, `isnan`; `where`, `clip`, `round` | ✅ proven |
+| `numpy::reduce` — `sum` and `mean` in numpy's summation order; `max`, `min`, `argmax`, `argmin` | ✅ proven |
+| `numpy::sort` — stable `sort` and `argsort`, `take`, `take_along_axis` | ✅ proven |
+| all of it against numpy | ✅ 488 of 488 captured expressions alike, in the specs and natively |
+
+### The oracle is numpy itself
+
+`examples/numpy_oracle.py` writes each case as named input arrays and one
+expression in a small call syntax, such as `sum(multiply(a, b), 1)`. It
+evaluates the expression with numpy 2.5.3 from the backend's virtualenv
+and records the result bit for bit: dtype, shape, and every element (floats
+as their IEEE patterns, NaN as `nan`), or the exception, type and message.
+`numpy::demo` parses the same text, evaluates it with the port, and renders
+the result the same way. The cases cover:
+- sums of every length across the pairwise boundaries, along every axis
+  of 2-d and 3-d arrays
+- arithmetic on ordinary and special values (NaN, infinities, signed
+  zeros, subnormals, the largest finite values)
+- all sixteen dtype pairings, and each dtype against Python scalars
+- broadcasting, shapes and their errors
+- `where`, `clip`, and `round`, with NaN and signed zeros
+- extrema with NaN, ties, and empty axes
+- sorting with NaN, infinities, signed zeros, and ties
+- the questionnaire score itself, written in numpy
+
+```bash
+../shallowflaws/.venv/bin/python examples/numpy_oracle.py
+python3 examples/numpy_fixture.py && tuo fmt src/numpy/fixture.tuo
+```
+
+The specs replay every case in the interpreter (about 3.5 s), and
+`examples/numpy.tuo` replays them as native code. The machine matters: the
+capture ran on aarch64 macOS, where numpy's SIMD loops are NEON's.
+
+### What the specs pin that a comment cannot
+
+**The order of a sum.** Float addition is not associative, so numpy's
+result depends on its loops:
+- **Along the last axis, or over the whole array:** the pairwise sum.
+  Under eight elements are added in turn. Up to 128 run through eight
+  interleaved accumulators, combined as `((r0+r1)+(r2+r3))+((r4+r5)+(r6+r7))`.
+  Longer runs split in two at a multiple of eight.
+- **Along any other axis:** one whole slice at a time.
+- **Either way:** the sum starts from 0.0, so a sum of `-0.0`s is `0.0`.
+
+A float32 sum stays float32 throughout. An axis followed only by axes of
+length one counts as the last. Lengths from 1 to 1031, and every axis of
+`(200, 7)`, `(7, 200)`, `(4, 33, 10)`, and five other shapes, pin it.
+
+**float32 is rounded once per operation.** Each float32 `+ - * /` and
+`sqrt` is the binary64 operation rounded to binary32. That is exact
+because 53 ≥ 2·24 + 2. The runtime has no bit-cast, so `numpy::ieee`
+takes a float apart arithmetically to read and write the patterns the
+fixture holds. `std::math::sqrt` iterates Newton's method to a tolerance
+and returns 0 for negative input, so `sqrt` is computed here from the
+significand, digit by digit, and rounded once. `int64` to float32 is
+also rounded once, never through float64: `2**62 + 2**38 + 1` tells the
+difference.
+
+**NEP 50.** A Python `float` meeting a float32 array becomes float32, so
+`x * 0.1` stays float32. Meeting int64, it becomes float64. A Python
+`int` meeting a bool array becomes int64. A numpy scalar, such as a
+sum's result, is strong: int64 plus a float32 scalar is float64.
+
+**Signed zeros and NaN, where numpy's loops decide them.**
+- **`maximum`, `minimum`, `max`, `min`:** propagate NaN and put -0.0
+  below 0.0, in every lane and tail and when broadcasting.
+- **`clip` with two scalar bounds:** keeps `x` when it equals a bound,
+  so `clip(-0.0, 0.0, 1.0)` is -0.0.
+- **`clip` with an array bound:** takes the bound on equality.
+- **`clip` with one bound `None`:** is `maximum` or `minimum`.
+- **`argmax` and `argmin`:** return the first NaN, or the first of tied
+  extremes.
+- **`sort`:** puts NaN last, with -0.0 and 0.0 kept in their original
+  order.
+
+**`round` is not Python's.** `np.round(2.675, 2)` is 2.68 because
+2.675 × 100 is 267.5 in binary64. numpy multiplies by 10^d, applies
+`rint`, which rounds halves to even, and divides back, all in the
+array's own dtype.
+
+**Errors are numpy's, word for word**, and so are their shapes:
+- "operands could not be broadcast together with shapes (2,3) (4,) "
+  (each shape followed by a space)
+- "cannot reshape array of size 6 into shape (4,newaxis)"
+- `AxisError` with the axis exactly as the caller gave it
+- the two refused bool operations, with numpy's long TypeErrors
+- `take`'s `same_kind` cast error
+
+### Next to torch
+
+The backend computes the score with torch. The port, with the same inputs
+and operations, returns the same float32 numbers as
+`compute_questionnaire_scores`. All six scores and all thirty top-five
+impacts are bit-identical, checked by calling the backend's function.
+torch.topk's tie order is not specified, so for tied impacts it can list
+the indices differently from a stable `argsort`.
+
+### A finding in the backend
+
+`matching.py` scales the applicant's answers by `sqrt(employer_weight *
+applicant_weight)` and the employer's by `sqrt(employer_weight)` alone.
+It then normalises by the largest distance the *combined* weights allow.
+As a result, an applicant whose answers equal the employer's scores
+100.0 only when every applicant weight is 1.0. With all weights 2.0 the
+same answers score 91.03, and with 0.5 they score 87.32. A large enough
+difference can also exceed the normaliser and clamp to 0. This is
+recorded, not fixed. The application is out of scope here, and the
+oracle reproduces the formula as written.
+
+### What is deliberately not here
+
+- **Views and transposes.** numpy sums a transposed view in memory
+  order, and a contiguous copy would not reproduce that. Arrays here are
+  always C-ordered copies.
+- **`matmul` and `dot`.** They are Accelerate's BLAS on this machine,
+  whose summation order is not numpy's to specify.
+- **`exp`, `log`, `power`, and the other transcendentals.** They call a
+  libm whose results are not correctly rounded.
+- **Other dtypes.** float16, int8, and the rest are not carried. Where
+  numpy would return one (`sqrt` or `rint` of a bool, `square` of a
+  bool), the port refuses with a TypeError of its own.
+- **Printing, fancy and boolean indexing, in-place operations,
+  `random`, and `linalg`.**
+- **Float-to-int casts of NaN or out-of-range values.** numpy leaves
+  these undefined. Here they saturate.
+- **One iterator choice in `clip`.** When an array bound is broadcast
+  along the last axis, numpy's iterator can still pick the scalar loop,
+  which compares strictly. The port uses the strict comparison only when
+  both bounds are 0-d.
+
+Three things in the toolchain shaped the code:
+- The catalog's `std::str::to_string`, and so `push_int`, traps on the
+  int64 minimum because it negates first. `numpy::demo` prints integers
+  from the negative side.
+- `given` and `take` are keywords, so `take` is `take_` here, as `where`
+  is `where_`.
+- `std::math` is not usable for numpy's semantics (Newton `sqrt`,
+  half-away `round`, `floor` through `Int`), so `numpy::ieee` replaces
+  what it needs.
 
 ---
 
@@ -1500,6 +1668,18 @@ examples/zip.tuo         the native oracle: every archive
 examples/zip-test/inflate/  the seven captured streams too large to hold inline
 examples/zip_oracle.py   zlib and zipfile, recorded
 examples/zip_fixture.py  zip_oracle.json to the two fixtures and the stream files
+
+src/numpy/ieee.tuo       binary64/binary32 patterns, exact scaling, sqrt, rint, floor, ceil
+src/numpy/dtype.tuo      bool, int64, float32, float64; promotion and NEP 50
+src/numpy/ndarray.tuo    the array; reshape, expand_dims, squeeze, ravel, astype, arange
+src/numpy/ufunc.tuo      broadcasting, elementwise operations, where, clip, round
+src/numpy/reduce.tuo     sum and mean in numpy's order; max, min, argmax, argmin
+src/numpy/sort.tuo       stable sort and argsort, take, take_along_axis
+src/numpy/fixture.tuo    488 expressions and what numpy made of them (generated)
+src/numpy/demo.tuo       the expression syntax, evaluated by the port
+examples/numpy.tuo       the native oracle: every captured expression
+examples/numpy_oracle.py numpy 2.5.3, recorded
+examples/numpy_fixture.py numpy_oracle.json to src/numpy/fixture.tuo
 
 src/ratelimit/item.tuo   limits: parse_many, repr, key_for, the fixed window's arithmetic
 src/ratelimit/memory.tuo MemoryStorage and the fixed window on it

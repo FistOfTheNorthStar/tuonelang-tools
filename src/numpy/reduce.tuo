@@ -1,0 +1,382 @@
+// numpy::reduce — sum, mean, max, min, argmax, argmin, over an axis or all.
+//
+// A float sum depends on the order it is added in, and numpy's order is
+// fixed by its loops, so the port follows it:
+//
+// - Along an axis whose elements are adjacent in memory — the last axis,
+//   or one followed only by axes of length one, or the whole array when
+//   `axis` is None — numpy's inner loop is its pairwise sum: from -0.0,
+//   runs under eight elements added in turn; runs up to 128 through eight
+//   interleaved accumulators, combined as ((r0+r1)+(r2+r3))+((r4+r5)+
+//   (r6+r7)), the remainder added after; longer runs split in two at a
+//   multiple of eight and each half summed so.
+// - Along any other axis the loop runs over the output, adding one slice
+//   at a time.
+//
+// Either way the sum starts from the identity, 0.0, so a sum of -0.0s is
+// 0.0. Every addition is rounded to the accumulator's dtype: float32 for a
+// float32 sum (numpy does not widen it), float64 for a float64 one and for
+// a mean of integers or bools, int64 (wrapping) for a sum of either.
+//
+// `max` and `min` propagate NaN and order -0.0 below 0.0, as `maximum` and
+// `minimum` do. `argmax` and `argmin` return the first index of the
+// extreme — the first NaN, if there is one.
+
+module numpy::reduce;
+
+/// `sum`, for `reduce`; then `mean` 1, `max` 2, `min` 3, `argmax` 4,
+/// `argmin` 5.
+///
+/// # Example
+/// ```tuo
+/// let k = numpy::reduce::kind_sum();
+/// ```
+pub fn kind_sum() -> Int {
+    0
+}
+
+fn add_in(take x: Float, take y: Float, take dtype: Int) -> Float {
+    if dtype == 2 {
+        return numpy::ieee::round32(x + y);
+    }
+    x + y
+}
+
+/// numpy's pairwise sum of `n` values of `values` from `start`, `stride`
+/// apart, each addition rounded to `dtype`.
+///
+/// # Example
+/// ```tuo
+/// let s = numpy::reduce::pairwise(values, 0, n, 1, numpy::dtype::float32());
+/// ```
+pub fn pairwise(in values: Array[Float], take start: Int, take n: Int, take stride: Int, take dtype: Int) -> Float {
+    if n < 8 {
+        var r = -0.0;
+        var i = 0;
+        while i < n {
+            r = add_in(r, std::array::get(values, start + i * stride), dtype);
+            i = i + 1;
+        }
+        return r;
+    }
+    if n <= 128 {
+        var r0 = std::array::get(values, start);
+        var r1 = std::array::get(values, start + stride);
+        var r2 = std::array::get(values, start + 2 * stride);
+        var r3 = std::array::get(values, start + 3 * stride);
+        var r4 = std::array::get(values, start + 4 * stride);
+        var r5 = std::array::get(values, start + 5 * stride);
+        var r6 = std::array::get(values, start + 6 * stride);
+        var r7 = std::array::get(values, start + 7 * stride);
+        var i = 8;
+        while i < n - n % 8 {
+            let at = start + i * stride;
+            r0 = add_in(r0, std::array::get(values, at), dtype);
+            r1 = add_in(r1, std::array::get(values, at + stride), dtype);
+            r2 = add_in(r2, std::array::get(values, at + 2 * stride), dtype);
+            r3 = add_in(r3, std::array::get(values, at + 3 * stride), dtype);
+            r4 = add_in(r4, std::array::get(values, at + 4 * stride), dtype);
+            r5 = add_in(r5, std::array::get(values, at + 5 * stride), dtype);
+            r6 = add_in(r6, std::array::get(values, at + 6 * stride), dtype);
+            r7 = add_in(r7, std::array::get(values, at + 7 * stride), dtype);
+            i = i + 8;
+        }
+        let left = add_in(add_in(r0, r1, dtype), add_in(r2, r3, dtype), dtype);
+        let right = add_in(add_in(r4, r5, dtype), add_in(r6, r7, dtype), dtype);
+        var r = add_in(left, right, dtype);
+        while i < n {
+            r = add_in(r, std::array::get(values, start + i * stride), dtype);
+            i = i + 1;
+        }
+        return r;
+    }
+    var half = n / 2;
+    half = half - half % 8;
+    add_in(pairwise(values, start, half, stride, dtype), pairwise(values, start + half * stride, n - half, stride, dtype), dtype)
+}
+
+/// The geometry of a reduction: `outer` fibers before the axis, `length`
+/// along it, `inner` after it, and the result's shape.
+struct Plan {
+    outer: Int,
+    length: Int,
+    inner: Int,
+    shape: Array[Int],
+}
+
+fn plan_of(in a: numpy::ndarray::NdArray, take whole: Bool, take axis: Int, take keepdims: Bool) -> Plan {
+    var shape = std::array::empty();
+    if whole {
+        var i = 0;
+        while keepdims && i < numpy::ndarray::ndim(a) {
+            std::array::push(shape, 1);
+            i = i + 1;
+        }
+        return Plan { outer: 1, length: numpy::ndarray::size(a), inner: 1, shape: shape };
+    }
+    var outer = 1;
+    var inner = 1;
+    var i = 0;
+    while i < numpy::ndarray::ndim(a) {
+        let d = numpy::ndarray::dim(a, i);
+        if i < axis {
+            outer = outer * d;
+        }
+        if i > axis {
+            inner = inner * d;
+        }
+        if i != axis {
+            std::array::push(shape, d);
+        } else if keepdims {
+            std::array::push(shape, 1);
+        }
+        i = i + 1;
+    }
+    Plan { outer: outer, length: numpy::ndarray::dim(a, axis), inner: inner, shape: shape }
+}
+
+fn empty_error(take kind: Int) -> numpy::ndarray::NdArray {
+    if kind == 2 {
+        return numpy::ndarray::failure("ValueError", "zero-size array to reduction operation maximum which has no identity");
+    }
+    if kind == 3 {
+        return numpy::ndarray::failure("ValueError", "zero-size array to reduction operation minimum which has no identity");
+    }
+    if kind == 4 {
+        return numpy::ndarray::failure("ValueError", "attempt to get argmax of an empty sequence");
+    }
+    numpy::ndarray::failure("ValueError", "attempt to get argmin of an empty sequence")
+}
+
+fn sum_floats(in values: Array[Float], in p: Plan, take dtype: Int) -> Array[Float] {
+    var out = std::array::empty();
+    var o = 0;
+    while o < p.outer {
+        var j = 0;
+        while j < p.inner {
+            let base = o * p.length * p.inner + j;
+            // From the identity, 0.0: a sum of -0.0s is 0.0.
+            var s = 0.0;
+            if p.inner == 1 {
+                // An axis followed only by axes of length one (or the
+                // whole array) is adjacent in memory: numpy's inner loop.
+                s = add_in(s, pairwise(values, base, p.length, 1, dtype), dtype);
+            } else {
+                var t = 0;
+                while t < p.length {
+                    s = add_in(s, std::array::get(values, base + t * p.inner), dtype);
+                    t = t + 1;
+                }
+            }
+            std::array::push(out, s);
+            j = j + 1;
+        }
+        o = o + 1;
+    }
+    out
+}
+
+/// The extreme of one fiber, by `kind` (2 max, 3 min, 4 argmax, 5 argmin):
+/// the value, or for the arg kinds its index as a float.
+fn extreme_float(in values: Array[Float], take base: Int, take length: Int, take inner: Int, take kind: Int) -> Float {
+    var best = std::array::get(values, base);
+    var at = 0;
+    var t = 1;
+    while t < length && best == best {
+        let x = std::array::get(values, base + t * inner);
+        if kind == 2 {
+            best = numpy::ufunc::float_max(best, x);
+        } else if kind == 3 {
+            best = numpy::ufunc::float_min(best, x);
+        } else if kind == 4 {
+            if !(x <= best) {
+                best = x;
+                at = t;
+            }
+        } else if !(x >= best) {
+            best = x;
+            at = t;
+        }
+        t = t + 1;
+    }
+    if kind >= 4 {
+        return at as Float;
+    }
+    best
+}
+
+fn extreme_int(in values: Array[Int], take base: Int, take length: Int, take inner: Int, take kind: Int) -> Int {
+    var best = std::array::get(values, base);
+    var at = 0;
+    var t = 1;
+    while t < length {
+        let x = std::array::get(values, base + t * inner);
+        if (kind == 2 || kind == 4) && x > best {
+            best = x;
+            at = t;
+        }
+        if (kind == 3 || kind == 5) && x < best {
+            best = x;
+            at = t;
+        }
+        t = t + 1;
+    }
+    if kind >= 4 {
+        return at;
+    }
+    best
+}
+
+/// The reduction `kind` (see `kind_sum`) of `a` along `axis` (a Python
+/// int, or `None` for all of it), keeping the reduced axis as length one
+/// when `keepdims`.
+///
+/// # Example
+/// ```tuo
+/// let s = numpy::reduce::reduce(a, numpy::ndarray::python_int(1), false, numpy::reduce::kind_sum());
+/// ```
+pub fn reduce(in a: numpy::ndarray::NdArray, in axis: numpy::ndarray::NdArray, take keepdims: Bool, take kind: Int) -> numpy::ndarray::NdArray {
+    if !numpy::ndarray::ok(a) {
+        return numpy::ndarray::failed(a);
+    }
+    if !numpy::ndarray::ok(axis) {
+        return numpy::ndarray::failed(axis);
+    }
+    let whole = numpy::ndarray::is_none(axis);
+    var k = 0;
+    if !whole {
+        let requested = std::array::get(axis.ints, 0);
+        if !numpy::ndarray::axis_in(requested, numpy::ndarray::ndim(a)) {
+            return numpy::ndarray::axis_error(requested, numpy::ndarray::ndim(a));
+        }
+        k = numpy::ndarray::normal_axis(requested, numpy::ndarray::ndim(a));
+    }
+    let p = plan_of(a, whole, k, keepdims);
+    let out_size = p.outer * p.inner;
+    if kind >= 2 && p.length == 0 && (whole || out_size > 0) {
+        return empty_error(kind);
+    }
+    let shape = numpy::ndarray::copy_shape(p.shape);
+    if kind <= 1 {
+        var dtype = a.dtype;
+        if kind == 0 && dtype == 0 {
+            dtype = 1;
+        }
+        if kind == 1 && !numpy::dtype::is_float(dtype) {
+            dtype = 3;
+        }
+        if dtype == 1 {
+            var out = numpy::ndarray::build(1, shape, std::array::empty(), std::array::empty());
+            var o = 0;
+            while o < p.outer {
+                var j = 0;
+                while j < p.inner {
+                    var s = 0;
+                    var t = 0;
+                    while t < p.length {
+                        s = numpy::ufunc::wrapping_add(s, std::array::get(a.ints, (o * p.length + t) * p.inner + j));
+                        t = t + 1;
+                    }
+                    std::array::push(out.ints, s);
+                    j = j + 1;
+                }
+                o = o + 1;
+            }
+            return out;
+        }
+        var sums = std::array::empty();
+        if numpy::dtype::is_float(a.dtype) {
+            sums = sum_floats(a.floats, p, dtype);
+        } else {
+            let converted = numpy::ndarray::astype(a, dtype);
+            sums = sum_floats(converted.floats, p, dtype);
+        }
+        if kind == 1 {
+            let count = numpy::ieee::from_int(p.length, 53);
+            var i = 0;
+            while i < std::array::len(sums) {
+                var m = std::array::get(sums, i) / count;
+                if dtype == 2 {
+                    m = numpy::ieee::round32(m);
+                }
+                std::array::set(sums, i, m);
+                i = i + 1;
+            }
+        }
+        return numpy::ndarray::build(dtype, shape, sums, std::array::empty());
+    }
+    var out_dtype = a.dtype;
+    if kind >= 4 {
+        out_dtype = 1;
+    }
+    var out = numpy::ndarray::build(out_dtype, shape, std::array::empty(), std::array::empty());
+    var o = 0;
+    while o < p.outer {
+        var j = 0;
+        while j < p.inner {
+            let base = o * p.length * p.inner + j;
+            if numpy::dtype::is_float(a.dtype) {
+                let r = extreme_float(a.floats, base, p.length, p.inner, kind);
+                if kind >= 4 {
+                    std::array::push(out.ints, r as Int);
+                } else {
+                    std::array::push(out.floats, r);
+                }
+            } else {
+                std::array::push(out.ints, extreme_int(a.ints, base, p.length, p.inner, kind));
+            }
+            j = j + 1;
+        }
+        o = o + 1;
+    }
+    out
+}
+
+/// `np.sum(a, axis, keepdims=keepdims)`.
+///
+/// # Example
+/// ```tuo
+/// let s = numpy::reduce::sum(a, numpy::ndarray::none(), false);
+/// ```
+pub fn sum(in a: numpy::ndarray::NdArray, in axis: numpy::ndarray::NdArray, take keepdims: Bool) -> numpy::ndarray::NdArray {
+    reduce(a, axis, keepdims, 0)
+}
+
+/// `np.mean(a, axis, keepdims=keepdims)`.
+///
+/// # Example
+/// ```tuo
+/// let m = numpy::reduce::mean(a, numpy::ndarray::none(), false);
+/// ```
+pub fn mean(in a: numpy::ndarray::NdArray, in axis: numpy::ndarray::NdArray, take keepdims: Bool) -> numpy::ndarray::NdArray {
+    reduce(a, axis, keepdims, 1)
+}
+
+fn sequence(take n: Int, take dtype: Int) -> numpy::ndarray::NdArray {
+    var fs = std::array::empty();
+    var i = 0;
+    while i < n {
+        std::array::push(fs, 1.0 / ((i + 1) as Float));
+        i = i + 1;
+    }
+    numpy::ndarray::from_floats(dtype, fs)
+}
+
+spec pairwise {
+    // Under eight values: in turn, from -0.0.
+    then numpy::ieee::signbit(pairwise(sequence(0, 3).floats, 0, 0, 1, 3));
+    then pairwise(sequence(3, 3).floats, 0, 3, 1, 3) == (1.0 + 0.5) + 1.0 / 3.0;
+    // Eight accumulators: the ninth value joins the first.
+    then pairwise(sequence(9, 3).floats, 0, 9, 1, 3) == ((((1.0 + 0.5) + (1.0 / 3.0 + 0.25)) + ((0.2 + 1.0 / 6.0) + (1.0 / 7.0 + 0.125))) + 1.0 / 9.0);
+}
+
+spec reduce {
+    then std::array::get(sum(sequence(3, 3), numpy::ndarray::none(), false).floats, 0) == (1.0 + 0.5) + 1.0 / 3.0;
+    then sum(sequence(3, 2), numpy::ndarray::none(), false).dtype == 2;
+    then std::array::get(mean(sequence(4, 3), numpy::ndarray::none(), false).floats, 0) == (((1.0 + 0.5) + 1.0 / 3.0) + 0.25) / 4.0;
+    then std::array::get(reduce(sequence(4, 3), numpy::ndarray::none(), false, 4).ints, 0) == 0;
+    then std::array::get(reduce(sequence(4, 3), numpy::ndarray::none(), false, 5).ints, 0) == 3;
+    then std::string::as_str(reduce(sequence(0, 3), numpy::ndarray::none(), false, 2).error) == "zero-size array to reduction operation maximum which has no identity";
+    then std::string::as_str(sum(sequence(3, 3), numpy::ndarray::python_int(1), false).error) == "axis 1 is out of bounds for array of dimension 1";
+    then !numpy::ieee::signbit(std::array::get(sum(sequence(0, 3), numpy::ndarray::none(), false).floats, 0));
+}
