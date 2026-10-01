@@ -1,0 +1,717 @@
+// numpy::ieee — IEEE 754 binary64 and binary32, exactly.
+//
+// numpy's results are bit patterns, and the port is held to them. Floats
+// here are tuonelang's `Float`, an IEEE binary64; a float32 is a `Float`
+// that happens to be representable in binary32, and `round32` is how one
+// is made — every float32 operation numpy performs (+, -, *, /, sqrt) is
+// the binary64 operation rounded once to binary32, which gives the same
+// answer because 53 >= 2 * 24 + 2 (double rounding is innocuous at that
+// margin). There is no bit-cast in the runtime, so the patterns are taken
+// apart and put together arithmetically: scaling by a power of two is
+// exact whenever the result is representable, and a significand under
+// 2^53 converts to and from `Int` exactly.
+//
+// The square root is the one operation the catalog's `std::math` does not
+// give correctly (it iterates Newton's method to a tolerance); `sqrt` here
+// computes the root of the significand digit by digit and rounds it once,
+// as the hardware instruction numpy calls does.
+
+module numpy::ieee;
+
+/// A float taken apart: `kind` is 0 for a zero, 1 for a finite non-zero
+/// value, 2 for an infinity, 3 for NaN; a finite value is `mantissa *
+/// 2^(exponent - 52)` with `mantissa` in `[2^52, 2^53)`.
+pub struct Parts {
+    kind: Int,
+    negative: Bool,
+    exponent: Int,
+    mantissa: Int,
+}
+
+/// The largest finite binary64.
+///
+/// # Example
+/// ```tuo
+/// let m = numpy::ieee::max64();
+/// ```
+pub fn max64() -> Float {
+    1.7976931348623157e308
+}
+
+/// 2^52, the weight of a binary64 significand's leading bit.
+fn two52() -> Int {
+    4503599627370496
+}
+
+/// Positive infinity.
+///
+/// # Example
+/// ```tuo
+/// let inf = numpy::ieee::infinity();
+/// ```
+pub fn infinity() -> Float {
+    max64() * 2.0
+}
+
+/// A quiet NaN.
+///
+/// # Example
+/// ```tuo
+/// let nan = numpy::ieee::nan();
+/// ```
+pub fn nan() -> Float {
+    0.0 / 0.0
+}
+
+/// Whether `x` is NaN.
+///
+/// # Example
+/// ```tuo
+/// let yes = numpy::ieee::is_nan(numpy::ieee::nan());
+/// ```
+pub fn is_nan(take x: Float) -> Bool {
+    x != x
+}
+
+/// Whether `x` is an infinity.
+///
+/// # Example
+/// ```tuo
+/// let yes = numpy::ieee::is_inf(numpy::ieee::infinity());
+/// ```
+pub fn is_inf(take x: Float) -> Bool {
+    x > max64() || x < 0.0 - max64()
+}
+
+/// Whether the sign bit of `x` is set — true for -0.0, false for 0.0.
+/// (A NaN's sign is not observable without a bit-cast; it reads false.)
+///
+/// # Example
+/// ```tuo
+/// let yes = numpy::ieee::signbit(-0.0);
+/// ```
+pub fn signbit(take x: Float) -> Bool {
+    x < 0.0 || (x == 0.0 && 1.0 / x < 0.0)
+}
+
+/// `x` rounded to the nearest binary32, ties to even; overflow is an
+/// infinity and underflow a subnormal or zero, as a cast to float32 is.
+///
+/// # Example
+/// ```tuo
+/// let third = numpy::ieee::round32(1.0 / 3.0); // 0.3333333432674408
+/// ```
+pub fn round32(take x: Float) -> Float {
+    (x as F32) as Float
+}
+
+/// 2^k for k in 1, 2, 4, …, 512.
+fn up(take k: Int) -> Float {
+    if k == 512 {
+        return 1.3407807929942597e154;
+    }
+    if k == 256 {
+        return 1.157920892373162e77;
+    }
+    if k == 128 {
+        return 3.402823669209385e38;
+    }
+    if k == 64 {
+        return 1.8446744073709552e19;
+    }
+    if k == 32 {
+        return 4294967296.0;
+    }
+    if k == 16 {
+        return 65536.0;
+    }
+    if k == 8 {
+        return 256.0;
+    }
+    if k == 4 {
+        return 16.0;
+    }
+    if k == 2 {
+        return 4.0;
+    }
+    2.0
+}
+
+/// 2^-k for k in 1, 2, 4, …, 512.
+fn down(take k: Int) -> Float {
+    if k == 512 {
+        return 7.458340731200207e-155;
+    }
+    if k == 256 {
+        return 8.636168555094445e-78;
+    }
+    if k == 128 {
+        return 2.938735877055719e-39;
+    }
+    if k == 64 {
+        return 5.421010862427522e-20;
+    }
+    if k == 32 {
+        return 2.3283064365386963e-10;
+    }
+    if k == 16 {
+        return 0.0000152587890625;
+    }
+    if k == 8 {
+        return 0.00390625;
+    }
+    if k == 4 {
+        return 0.0625;
+    }
+    if k == 2 {
+        return 0.25;
+    }
+    0.5
+}
+
+/// `x * 2^k`, exact whenever the result is representable: each step is a
+/// multiplication by a power of two whose intermediate lies between `x`
+/// and the result.
+///
+/// # Example
+/// ```tuo
+/// let tiny = numpy::ieee::scale(1.0, 0 - 1074); // 5e-324
+/// ```
+pub fn scale(take x: Float, take k: Int) -> Float {
+    var y = x;
+    var left = k;
+    while left >= 512 {
+        y = y * up(512);
+        left = left - 512;
+    }
+    while left <= 0 - 512 {
+        y = y * down(512);
+        left = left + 512;
+    }
+    var step = 256;
+    while step >= 1 {
+        if left >= step {
+            y = y * up(step);
+            left = left - step;
+        } else if left <= 0 - step {
+            y = y * down(step);
+            left = left + step;
+        }
+        step = step / 2;
+    }
+    y
+}
+
+/// `x` taken apart.
+///
+/// # Example
+/// ```tuo
+/// let p = numpy::ieee::parts(0.75); // mantissa 3 * 2^51, exponent -1
+/// ```
+pub fn parts(take x: Float) -> Parts {
+    if is_nan(x) {
+        return Parts { kind: 3, negative: false, exponent: 0, mantissa: 0 };
+    }
+    let negative = signbit(x);
+    var y = x;
+    if negative {
+        y = 0.0 - x;
+    }
+    if y == 0.0 {
+        return Parts { kind: 0, negative: negative, exponent: 0, mantissa: 0 };
+    }
+    if y > max64() {
+        return Parts { kind: 2, negative: negative, exponent: 0, mantissa: 0 };
+    }
+    var e = 0;
+    if y >= 2.0 {
+        var step = 512;
+        while step >= 1 {
+            if y >= up(step) {
+                y = y * down(step);
+                e = e + step;
+            }
+            step = step / 2;
+        }
+    } else if y < 1.0 {
+        // Greedy over 512, 512, 256, …, 1: the most a subnormal needs is 1074.
+        if y * up(512) < 2.0 {
+            y = y * up(512);
+            e = e - 512;
+        }
+        var step = 512;
+        while step >= 1 {
+            if y * up(step) < 2.0 {
+                y = y * up(step);
+                e = e - step;
+            }
+            step = step / 2;
+        }
+    }
+    Parts { kind: 1, negative: negative, exponent: e, mantissa: (y * 4503599627370496.0) as Int }
+}
+
+fn hex_digits(mut out: String, take value: Int, take digits: Int) {
+    let alphabet = "0123456789abcdef";
+    var i = digits - 1;
+    while i >= 0 {
+        std::string::push_byte(out, std::str::byte_at(alphabet, (value >> (4 * i)) & 15));
+        i = i - 1;
+    }
+}
+
+/// The binary64 bit pattern of `x` as 16 lower-case hex digits, or "nan".
+///
+/// # Example
+/// ```tuo
+/// let h = numpy::ieee::hex64(1.0); // "3ff0000000000000"
+/// ```
+pub fn hex64(take x: Float) -> String {
+    let p = parts(x);
+    var out = std::string::empty();
+    if p.kind == 3 {
+        std::str::push(out, "nan");
+        return out;
+    }
+    var top = 0;
+    var frac = 0;
+    if p.kind == 2 {
+        top = 2047;
+    } else if p.kind == 1 {
+        if p.exponent >= 0 - 1022 {
+            top = p.exponent + 1023;
+            frac = p.mantissa - two52();
+        } else {
+            frac = p.mantissa >> (0 - 1022 - p.exponent);
+        }
+    }
+    if p.negative {
+        top = top + 2048;
+    }
+    hex_digits(out, top, 3);
+    hex_digits(out, frac, 13);
+    out
+}
+
+/// The binary32 bit pattern of `x`, which must be representable in
+/// binary32, as 8 lower-case hex digits, or "nan".
+///
+/// # Example
+/// ```tuo
+/// let h = numpy::ieee::hex32(1.0); // "3f800000"
+/// ```
+pub fn hex32(take x: Float) -> String {
+    let p = parts(x);
+    var out = std::string::empty();
+    if p.kind == 3 {
+        std::str::push(out, "nan");
+        return out;
+    }
+    var bits = 0;
+    if p.kind == 2 {
+        bits = 255 << 23;
+    } else if p.kind == 1 {
+        if p.exponent >= 0 - 126 {
+            bits = ((p.exponent + 127) << 23) + (p.mantissa >> 29) - 8388608;
+        } else {
+            bits = p.mantissa >> (29 + (0 - 126 - p.exponent));
+        }
+    }
+    if p.negative {
+        bits = bits + (1 << 31);
+    }
+    hex_digits(out, bits, 8);
+    out
+}
+
+fn nibble(take b: Int) -> Int {
+    if b >= 97 {
+        return b - 87;
+    }
+    if b >= 65 {
+        return b - 55;
+    }
+    b - 48
+}
+
+fn hex_value(in hex: Str, take from: Int, take count: Int) -> Int {
+    var v = 0;
+    var i = 0;
+    while i < count {
+        v = v * 16 + nibble(std::str::byte_at(hex, from + i));
+        i = i + 1;
+    }
+    v
+}
+
+/// The float whose sign, biased exponent, and fraction are given, for a
+/// format with `fraction_bits` of fraction and exponent bias `bias`.
+fn assemble(take negative: Bool, take biased: Int, take frac: Int, take fraction_bits: Int, take bias: Int, take all_ones: Int) -> Float {
+    var magnitude = 0.0;
+    if biased == all_ones {
+        if frac != 0 {
+            return nan();
+        }
+        magnitude = infinity();
+    } else if biased == 0 {
+        magnitude = scale(frac as Float, 1 - bias - fraction_bits);
+    } else {
+        magnitude = scale((frac + (1 << fraction_bits)) as Float, biased - bias - fraction_bits);
+    }
+    if negative {
+        return 0.0 - magnitude;
+    }
+    if magnitude == 0.0 {
+        return 0.0;
+    }
+    magnitude
+}
+
+/// The float whose binary64 pattern is the 16 hex digits of `hex`.
+///
+/// # Example
+/// ```tuo
+/// let one = numpy::ieee::from_hex64("3ff0000000000000");
+/// ```
+pub fn from_hex64(in hex: Str) -> Float {
+    let top = hex_value(hex, 0, 3);
+    let frac = hex_value(hex, 3, 13);
+    let negative = top >= 2048;
+    var biased = top;
+    if negative {
+        biased = top - 2048;
+    }
+    negate_zero(assemble(negative, biased, frac, 52, 1023, 2047), negative, biased, frac)
+}
+
+/// The float whose binary32 pattern is the 8 hex digits of `hex`.
+///
+/// # Example
+/// ```tuo
+/// let one = numpy::ieee::from_hex32("3f800000");
+/// ```
+pub fn from_hex32(in hex: Str) -> Float {
+    let bits = hex_value(hex, 0, 8);
+    let negative = bits >= (1 << 31);
+    var rest = bits;
+    if negative {
+        rest = bits - (1 << 31);
+    }
+    let biased = rest >> 23;
+    let frac = rest & 8388607;
+    negate_zero(assemble(negative, biased, frac, 23, 127, 255), negative, biased, frac)
+}
+
+/// `0.0 - 0.0` is +0.0; a pattern with the sign bit and nothing else is -0.0.
+fn negate_zero(take x: Float, take negative: Bool, take biased: Int, take frac: Int) -> Float {
+    if negative && biased == 0 && frac == 0 {
+        return -0.0;
+    }
+    x
+}
+
+/// `x` with its sign flipped, -0.0 for 0.0 included.
+///
+/// # Example
+/// ```tuo
+/// let z = numpy::ieee::negate(0.0); // -0.0
+/// ```
+pub fn negate(take x: Float) -> Float {
+    if x == 0.0 {
+        if signbit(x) {
+            return 0.0;
+        }
+        return -0.0;
+    }
+    0.0 - x
+}
+
+/// The correctly rounded square root: NaN for a negative `x`, `x` itself
+/// for a zero (keeping its sign), an infinity, or NaN.
+///
+/// The significand, made even in its exponent, is the radicand of a
+/// binary digit-by-digit root to 54 bits; the 54th bit rounds. A tie
+/// cannot occur: an odd 54-bit root would square to an odd radicand,
+/// and the radicand ends in 54 zero bits.
+///
+/// # Example
+/// ```tuo
+/// let r = numpy::ieee::sqrt(2.0); // 1.4142135623730951
+/// ```
+pub fn sqrt(take x: Float) -> Float {
+    if is_nan(x) || x == 0.0 {
+        return x;
+    }
+    if x < 0.0 {
+        return nan();
+    }
+    if x > max64() {
+        return x;
+    }
+    let p = parts(x);
+    var m = p.mantissa;
+    var e = p.exponent - 52;
+    if e % 2 != 0 {
+        m = m * 2;
+        e = e - 1;
+    }
+    var rem = 0;
+    var root = 0;
+    var i = 53;
+    while i >= 0 {
+        var pair = 0;
+        if 2 * i >= 54 {
+            pair = (m >> (2 * i - 54)) & 3;
+        }
+        rem = rem * 4 + pair;
+        let trial = root * 4 + 1;
+        if rem >= trial {
+            rem = rem - trial;
+            root = root * 2 + 1;
+        } else {
+            root = root * 2;
+        }
+        i = i - 1;
+    }
+    var q = root / 2;
+    if root % 2 == 1 {
+        q = q + 1;
+    }
+    scale(q as Float, (e - 54) / 2 + 1)
+}
+
+/// `x` rounded to an integer, ties to even, as C's `rint` does; the sign of
+/// a zero result is the sign of `x`.
+///
+/// # Example
+/// ```tuo
+/// let r = numpy::ieee::rint(2.5); // 2.0
+/// ```
+pub fn rint(take x: Float) -> Float {
+    if is_nan(x) {
+        return x;
+    }
+    let negative = signbit(x);
+    var a = x;
+    if negative {
+        a = 0.0 - x;
+    }
+    if a >= 4503599627370496.0 {
+        return x;
+    }
+    let r = (a + 4503599627370496.0) - 4503599627370496.0;
+    if negative {
+        return negate(r);
+    }
+    r
+}
+
+/// The largest integer not above `x`, as C's `floor` (and -0.0 stays -0.0).
+///
+/// # Example
+/// ```tuo
+/// let f = numpy::ieee::floor(0.0 - 0.5); // -1.0
+/// ```
+pub fn floor(take x: Float) -> Float {
+    let r = rint(x);
+    if r > x {
+        return r - 1.0;
+    }
+    r
+}
+
+/// The smallest integer not below `x`, as C's `ceil` (-0.5 gives -0.0).
+///
+/// # Example
+/// ```tuo
+/// let c = numpy::ieee::ceil(0.25); // 1.0
+/// ```
+pub fn ceil(take x: Float) -> Float {
+    let r = rint(x);
+    if r < x {
+        let up_one = r + 1.0;
+        if up_one == 0.0 {
+            return -0.0;
+        }
+        return up_one;
+    }
+    r
+}
+
+/// The integer `n` rounded to the nearest float with `precision` bits of
+/// significand (24 for float32, 53 for float64), ties to even — one
+/// rounding, as numpy's casts from int64 make.
+///
+/// # Example
+/// ```tuo
+/// let f = numpy::ieee::from_int(16777217, 24); // 16777216.0
+/// ```
+pub fn from_int(take n: Int, take precision: Int) -> Float {
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 0 - 9223372036854775807 - 1 {
+        return 0.0 - scale(1.0, 63);
+    }
+    let negative = n < 0;
+    var a = n;
+    if negative {
+        a = 0 - n;
+    }
+    var length = 0;
+    while length < 63 && (a >> length) > 0 {
+        length = length + 1;
+    }
+    var magnitude = 0.0;
+    if length <= precision {
+        magnitude = a as Float;
+    } else {
+        let shift = length - precision;
+        var q = a >> shift;
+        let rest = a - (q << shift);
+        let half = 1 << (shift - 1);
+        if rest > half || (rest == half && q % 2 == 1) {
+            q = q + 1;
+        }
+        magnitude = scale(q as Float, shift);
+    }
+    if negative {
+        return 0.0 - magnitude;
+    }
+    magnitude
+}
+
+spec "the power-of-two literals are the powers of two" {
+    then up(512) == scale(up(256), 256);
+    then up(256) == up(128) * up(128);
+    then up(128) == up(64) * up(64);
+    then up(64) == up(32) * up(32);
+    then down(512) == down(256) * down(256);
+    then down(256) == down(128) * down(128);
+    then down(128) == down(64) * down(64);
+    then down(64) == down(32) * down(32);
+    then down(32) == down(16) * down(16);
+    then down(512) * up(512) == 1.0;
+    then down(256) * up(256) == 1.0;
+}
+
+spec scale {
+    then scale(1.0, 0 - 1074) > 0.0;
+    then scale(1.0, 0 - 1075) == 0.0;
+    then scale(scale(1.0, 0 - 1074), 1074) == 1.0;
+    then scale(3.0, 1022) == 3.0 * scale(1.0, 1022);
+    then scale(1.0, 1024) > max64();
+}
+
+spec parts {
+    then parts(0.75).exponent == 0 - 1;
+    then parts(0.75).mantissa == 3 * 2251799813685248;
+    then parts(1.0).exponent == 0;
+    then parts(max64()).exponent == 1023;
+    then parts(scale(1.0, 0 - 1074)).exponent == 0 - 1074;
+    then parts(scale(1.0, 0 - 1074)).mantissa == 4503599627370496;
+    then parts(-0.0).negative;
+    then parts(-0.0).kind == 0;
+    then !parts(0.0).negative;
+    then parts(nan()).kind == 3;
+    then parts(0.0 - infinity()).kind == 2;
+}
+
+spec hex64 {
+    then std::string::as_str(hex64(1.0)) == "3ff0000000000000";
+    then std::string::as_str(hex64(-0.0)) == "8000000000000000";
+    then std::string::as_str(hex64(0.1)) == "3fb999999999999a";
+    then std::string::as_str(hex64(scale(1.0, 0 - 1074))) == "0000000000000001";
+    then std::string::as_str(hex64(max64())) == "7fefffffffffffff";
+    then std::string::as_str(hex64(0.0 - infinity())) == "fff0000000000000";
+    then std::string::as_str(hex64(nan())) == "nan";
+    then std::string::as_str(hex64(scale(3.0, 0 - 1030))) == "0000300000000000";
+}
+
+spec hex32 {
+    then std::string::as_str(hex32(1.0)) == "3f800000";
+    then std::string::as_str(hex32(round32(0.1))) == "3dcccccd";
+    then std::string::as_str(hex32(0.0 - 2.5)) == "c0200000";
+    then std::string::as_str(hex32(scale(1.0, 0 - 149))) == "00000001";
+    then std::string::as_str(hex32(scale(1.0, 0 - 126))) == "00800000";
+    then std::string::as_str(hex32(round32(max64()))) == "7f800000";
+    then std::string::as_str(hex32(-0.0)) == "80000000";
+}
+
+spec from_hex64 {
+    then from_hex64("3ff0000000000000") == 1.0;
+    then from_hex64("3fb999999999999a") == 0.1;
+    then from_hex64("0000000000000001") == scale(1.0, 0 - 1074);
+    then signbit(from_hex64("8000000000000000"));
+    then is_nan(from_hex64("7ff8000000000000"));
+    then from_hex64("fff0000000000000") < 0.0 - max64();
+    then std::string::as_str(hex64(from_hex64("800fffffffffffff"))) == "800fffffffffffff";
+}
+
+spec from_hex32 {
+    then from_hex32("3f800000") == 1.0;
+    then from_hex32("3dcccccd") == round32(0.1);
+    then from_hex32("00000001") == scale(1.0, 0 - 149);
+    then signbit(from_hex32("80000000"));
+    then is_nan(from_hex32("7fc00000"));
+    then std::string::as_str(hex32(from_hex32("807fffff"))) == "807fffff";
+}
+
+spec round32 {
+    then round32(1.0 / 3.0) == 0.3333333432674408;
+    then round32(16777217.0) == 16777216.0;
+    then round32(16777219.0) == 16777220.0;
+    then round32(scale(3.0, 0 - 151)) == scale(1.0, 0 - 149);
+    then round32(scale(1.0, 0 - 150)) == 0.0;
+    then round32(scale(1.0, 128)) > max64();
+}
+
+spec sqrt {
+    then sqrt(2.0) == 1.4142135623730951;
+    then sqrt(4.0) == 2.0;
+    then sqrt(0.01) == 0.1;
+    then sqrt(scale(1.0, 0 - 1074)) == scale(1.0, 0 - 537);
+    then sqrt(max64()) == 1.3407807929942596e154;
+    then signbit(sqrt(-0.0));
+    then is_nan(sqrt(0.0 - 1.0));
+    then sqrt(infinity()) > max64();
+    then round32(sqrt(2.0)) == round32(1.4142135623730951);
+}
+
+spec rint {
+    then rint(2.5) == 2.0;
+    then rint(3.5) == 4.0;
+    then rint(0.0 - 2.5) == 0.0 - 2.0;
+    then signbit(rint(0.0 - 0.4));
+    then rint(4503599627370497.0) == 4503599627370497.0;
+    then rint(0.49999999999999994) == 0.0;
+}
+
+spec floor {
+    then floor(0.0 - 0.5) == 0.0 - 1.0;
+    then signbit(floor(-0.0));
+    then floor(2.0) == 2.0;
+    then floor(1.0e300) == 1.0e300;
+}
+
+spec ceil {
+    then signbit(ceil(0.0 - 0.5));
+    then ceil(0.25) == 1.0;
+    then ceil(0.0 - 1.5) == 0.0 - 1.0;
+}
+
+spec from_int {
+    then from_int(16777217, 24) == 16777216.0;
+    then from_int(16777219, 24) == 16777220.0;
+    then from_int(9007199254740993, 53) == 9007199254740992.0;
+    then from_int(9007199254740995, 53) == 9007199254740996.0;
+    then from_int(0 - 9223372036854775807 - 1, 24) == 0.0 - scale(1.0, 63);
+    then from_int(9223372036854775807, 53) == scale(1.0, 63);
+    then from_int(0 - 3, 24) == 0.0 - 3.0;
+}
+
+spec negate {
+    then signbit(negate(0.0));
+    then !signbit(negate(-0.0));
+    then negate(2.0) == 0.0 - 2.0;
+}

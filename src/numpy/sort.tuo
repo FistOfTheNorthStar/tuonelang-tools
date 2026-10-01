@@ -1,0 +1,369 @@
+// numpy::sort — stable sorting along an axis, and taking by index.
+//
+// `sort` and `argsort` are numpy's `kind='stable'`: equal elements keep
+// their order — -0.0 and 0.0 are equal — and NaN sorts after everything,
+// infinities included. (numpy's default kind is an unstable introsort;
+// when elements tie, which index comes first is an accident of it, so the
+// stable order is the only one two implementations can share.) A merge
+// sort gives it.
+//
+// `take` and `take_along_axis` index with int64 arrays; negative indices
+// count from the end, and an index outside the axis is numpy's
+// IndexError, naming the first one met in C order.
+
+module numpy::sort;
+
+fn before_float(take x: Float, take y: Float) -> Bool {
+    x < y || (y != y && x == x)
+}
+
+/// Indices `0..n` of the fiber at `base`, `inner` apart, in stable sorted
+/// order of its elements.
+fn order(in a: numpy::ndarray::NdArray, take base: Int, take n: Int, take inner: Int) -> Array[Int] {
+    var idx = std::array::empty();
+    var tmp = std::array::empty();
+    var i = 0;
+    while i < n {
+        std::array::push(idx, i);
+        std::array::push(tmp, i);
+        i = i + 1;
+    }
+    let floats = numpy::dtype::is_float(a.dtype);
+    var width = 1;
+    while width < n {
+        var lo = 0;
+        while lo < n {
+            var mid = lo + width;
+            if mid > n {
+                mid = n;
+            }
+            var hi = lo + 2 * width;
+            if hi > n {
+                hi = n;
+            }
+            var l = lo;
+            var r = mid;
+            var k = lo;
+            while k < hi {
+                var take_right = false;
+                if l >= mid {
+                    take_right = true;
+                } else if r < hi {
+                    let li = std::array::get(idx, l);
+                    let ri = std::array::get(idx, r);
+                    if floats {
+                        take_right = before_float(std::array::get(a.floats, base + ri * inner), std::array::get(a.floats, base + li * inner));
+                    } else {
+                        take_right = std::array::get(a.ints, base + ri * inner) < std::array::get(a.ints, base + li * inner);
+                    }
+                }
+                if take_right {
+                    std::array::set(tmp, k, std::array::get(idx, r));
+                    r = r + 1;
+                } else {
+                    std::array::set(tmp, k, std::array::get(idx, l));
+                    l = l + 1;
+                }
+                k = k + 1;
+            }
+            lo = hi;
+        }
+        var c = 0;
+        while c < n {
+            std::array::set(idx, c, std::array::get(tmp, c));
+            c = c + 1;
+        }
+        width = width * 2;
+    }
+    idx
+}
+
+fn sorted(in a: numpy::ndarray::NdArray, in axis: numpy::ndarray::NdArray, take indices: Bool) -> numpy::ndarray::NdArray {
+    if !numpy::ndarray::ok(a) {
+        return numpy::ndarray::failed(a);
+    }
+    if !numpy::ndarray::ok(axis) {
+        return numpy::ndarray::failed(axis);
+    }
+    if numpy::ndarray::is_none(axis) {
+        return sorted(numpy::ndarray::ravel(a), numpy::ndarray::python_int(0), indices);
+    }
+    let requested = std::array::get(axis.ints, 0);
+    let nd = numpy::ndarray::ndim(a);
+    if !numpy::ndarray::axis_in(requested, nd) {
+        return numpy::ndarray::axis_error(requested, nd);
+    }
+    let k = numpy::ndarray::normal_axis(requested, nd);
+    var outer = 1;
+    var inner = 1;
+    var i = 0;
+    while i < nd {
+        if i < k {
+            outer = outer * numpy::ndarray::dim(a, i);
+        }
+        if i > k {
+            inner = inner * numpy::ndarray::dim(a, i);
+        }
+        i = i + 1;
+    }
+    let n = numpy::ndarray::dim(a, k);
+    var dtype = a.dtype;
+    if indices {
+        dtype = 1;
+    }
+    var out = numpy::ndarray::build(dtype, numpy::ndarray::copy_shape(a.shape), std::array::empty(), std::array::empty());
+    let total = numpy::ndarray::size(a);
+    i = 0;
+    while i < total {
+        if numpy::dtype::is_float(dtype) {
+            std::array::push(out.floats, 0.0);
+        } else {
+            std::array::push(out.ints, 0);
+        }
+        i = i + 1;
+    }
+    var o = 0;
+    while o < outer {
+        var j = 0;
+        while j < inner {
+            let base = o * n * inner + j;
+            let idx = order(a, base, n, inner);
+            var t = 0;
+            while t < n {
+                let from = std::array::get(idx, t);
+                let to = base + t * inner;
+                if indices {
+                    std::array::set(out.ints, to, from);
+                } else if numpy::dtype::is_float(dtype) {
+                    std::array::set(out.floats, to, std::array::get(a.floats, base + from * inner));
+                } else {
+                    std::array::set(out.ints, to, std::array::get(a.ints, base + from * inner));
+                }
+                t = t + 1;
+            }
+            j = j + 1;
+        }
+        o = o + 1;
+    }
+    out
+}
+
+/// `np.sort(a, axis, kind='stable')`; `axis` is a Python int or `None`
+/// (flattened first).
+///
+/// # Example
+/// ```tuo
+/// let s = numpy::sort::sort(a, numpy::ndarray::python_int(0 - 1));
+/// ```
+pub fn sort(in a: numpy::ndarray::NdArray, in axis: numpy::ndarray::NdArray) -> numpy::ndarray::NdArray {
+    sorted(a, axis, false)
+}
+
+/// `np.argsort(a, axis, kind='stable')`.
+///
+/// # Example
+/// ```tuo
+/// let order = numpy::sort::argsort(a, numpy::ndarray::python_int(0 - 1));
+/// ```
+pub fn argsort(in a: numpy::ndarray::NdArray, in axis: numpy::ndarray::NdArray) -> numpy::ndarray::NdArray {
+    sorted(a, axis, true)
+}
+
+fn out_of_bounds(take index: Int, take axis: Int, take size: Int) -> numpy::ndarray::NdArray {
+    var message = std::string::from_str("index ");
+    std::str::push_int(message, index);
+    std::str::push(message, " is out of bounds for axis ");
+    std::str::push_int(message, axis);
+    std::str::push(message, " with size ");
+    std::str::push_int(message, size);
+    numpy::ndarray::failure("IndexError", std::string::as_str(message))
+}
+
+fn push_element(mut out: numpy::ndarray::NdArray, in a: numpy::ndarray::NdArray, take i: Int) {
+    if numpy::dtype::is_float(a.dtype) {
+        std::array::push(out.floats, std::array::get(a.floats, i));
+    } else {
+        std::array::push(out.ints, std::array::get(a.ints, i));
+    }
+}
+
+/// `np.take(a, indices, axis)`: the elements of `a` at `indices` along
+/// `axis` (a Python int), or of `a` flattened when `axis` is `None`; the
+/// indices' shape takes the axis's place.
+///
+/// # Example
+/// ```tuo
+/// let first = numpy::sort::take_(a, numpy::ndarray::arange(5), numpy::ndarray::python_int(1));
+/// ```
+pub fn take_(in a: numpy::ndarray::NdArray, in indices: numpy::ndarray::NdArray, in axis: numpy::ndarray::NdArray) -> numpy::ndarray::NdArray {
+    if !numpy::ndarray::ok(a) {
+        return numpy::ndarray::failed(a);
+    }
+    if !numpy::ndarray::ok(indices) {
+        return numpy::ndarray::failed(indices);
+    }
+    if !numpy::ndarray::ok(axis) {
+        return numpy::ndarray::failed(axis);
+    }
+    if indices.dtype != 1 {
+        var message = std::string::from_str("Cannot cast array data from dtype('");
+        std::str::push(message, numpy::dtype::name(indices.dtype));
+        std::str::push(message, "') to dtype('int64') according to the rule 'same_kind'");
+        return numpy::ndarray::failure("TypeError", std::string::as_str(message));
+    }
+    if numpy::ndarray::is_none(axis) {
+        return take_(numpy::ndarray::ravel(a), indices, numpy::ndarray::python_int(0));
+    }
+    let requested = std::array::get(axis.ints, 0);
+    let nd = numpy::ndarray::ndim(a);
+    if !numpy::ndarray::axis_in(requested, nd) {
+        return numpy::ndarray::axis_error(requested, nd);
+    }
+    let k = numpy::ndarray::normal_axis(requested, nd);
+    var outer = 1;
+    var inner = 1;
+    var shape = std::array::empty();
+    var i = 0;
+    while i < nd {
+        let d = numpy::ndarray::dim(a, i);
+        if i < k {
+            outer = outer * d;
+            std::array::push(shape, d);
+        }
+        if i == k {
+            var t = 0;
+            while t < numpy::ndarray::ndim(indices) {
+                std::array::push(shape, numpy::ndarray::dim(indices, t));
+                t = t + 1;
+            }
+        }
+        if i > k {
+            inner = inner * d;
+            std::array::push(shape, d);
+        }
+        i = i + 1;
+    }
+    let n = numpy::ndarray::dim(a, k);
+    let count = numpy::ndarray::size(indices);
+    var out = numpy::ndarray::build(a.dtype, shape, std::array::empty(), std::array::empty());
+    var o = 0;
+    while o < outer {
+        var t = 0;
+        while t < count {
+            let raw = std::array::get(indices.ints, t);
+            var at = raw;
+            if at < 0 {
+                at = at + n;
+            }
+            if at < 0 || at >= n {
+                return out_of_bounds(raw, k, n);
+            }
+            var j = 0;
+            while j < inner {
+                push_element(out, a, (o * n + at) * inner + j);
+                j = j + 1;
+            }
+            t = t + 1;
+        }
+        o = o + 1;
+    }
+    out
+}
+
+/// `np.take_along_axis(a, indices, axis)`: along `axis`, the elements of
+/// `a` at `indices`, which has as many dimensions as `a` and broadcasts
+/// against it on every other axis.
+///
+/// # Example
+/// ```tuo
+/// let smallest = numpy::sort::take_along_axis(a, order, 1);
+/// ```
+pub fn take_along_axis(in a: numpy::ndarray::NdArray, in indices: numpy::ndarray::NdArray, take axis: Int) -> numpy::ndarray::NdArray {
+    if !numpy::ndarray::ok(a) {
+        return numpy::ndarray::failed(a);
+    }
+    if !numpy::ndarray::ok(indices) {
+        return numpy::ndarray::failed(indices);
+    }
+    let nd = numpy::ndarray::ndim(a);
+    if !numpy::ndarray::axis_in(axis, nd) {
+        return numpy::ndarray::axis_error(axis, nd);
+    }
+    if indices.dtype != 1 {
+        return numpy::ndarray::failure("IndexError", "`indices` must be an integer array");
+    }
+    if numpy::ndarray::ndim(indices) != nd {
+        return numpy::ndarray::failure("ValueError", "`indices` and `arr` must have the same number of dimensions");
+    }
+    let k = numpy::ndarray::normal_axis(axis, nd);
+    // Every other axis broadcasts; this one is the indices' own.
+    var shape = std::array::empty();
+    var i = 0;
+    while i < nd {
+        let da = numpy::ndarray::dim(a, i);
+        let di = numpy::ndarray::dim(indices, i);
+        if i == k || da == 1 {
+            std::array::push(shape, di);
+        } else if di == 1 || di == da {
+            std::array::push(shape, da);
+        } else {
+            var message = std::string::from_str("shape mismatch: indexing arrays could not be broadcast together with shapes ");
+            std::str::push(message, std::string::as_str(numpy::ndarray::shape_compact(indices.shape)));
+            return numpy::ndarray::failure("IndexError", std::string::as_str(message));
+        }
+        i = i + 1;
+    }
+    let n = numpy::ndarray::dim(a, k);
+    let total = numpy::ndarray::product(shape);
+    var out = numpy::ndarray::build(a.dtype, numpy::ndarray::copy_shape(shape), std::array::empty(), std::array::empty());
+    var w = numpy::ufunc::walk(shape, indices.shape, indices.shape, indices.shape);
+    var e = 0;
+    while e < total {
+        let raw = std::array::get(indices.ints, w.oa);
+        var at = raw;
+        if at < 0 {
+            at = at + n;
+        }
+        if at < 0 || at >= n {
+            return out_of_bounds(raw, k, n);
+        }
+        var offset = 0;
+        var d = 0;
+        while d < nd {
+            var coordinate = std::array::get(w.index, d);
+            if d == k {
+                coordinate = at;
+            } else if numpy::ndarray::dim(a, d) == 1 {
+                coordinate = 0;
+            }
+            offset = offset * numpy::ndarray::dim(a, d) + coordinate;
+            d = d + 1;
+        }
+        push_element(out, a, offset);
+        numpy::ufunc::advance(w);
+        e = e + 1;
+    }
+    out
+}
+
+fn values(take a: Float, take b: Float, take c: Float, take d: Float) -> numpy::ndarray::NdArray {
+    var v = std::array::empty();
+    std::array::push(v, a);
+    std::array::push(v, b);
+    std::array::push(v, c);
+    std::array::push(v, d);
+    numpy::ndarray::from_floats(3, v)
+}
+
+spec argsort {
+    then std::array::get(argsort(values(3.0, 1.0, 2.0, 1.0), numpy::ndarray::python_int(0)).ints, 0) == 1;
+    then std::array::get(argsort(values(3.0, 1.0, 2.0, 1.0), numpy::ndarray::python_int(0)).ints, 1) == 3;
+    then std::array::get(argsort(values(numpy::ieee::nan(), 1.0, numpy::ieee::infinity(), -0.0), numpy::ndarray::python_int(0)).ints, 0) == 3;
+    then std::array::get(argsort(values(numpy::ieee::nan(), 1.0, numpy::ieee::infinity(), -0.0), numpy::ndarray::python_int(0)).ints, 3) == 0;
+    then std::array::get(argsort(values(0.0, -0.0, 0.0, -0.0), numpy::ndarray::python_int(0)).ints, 1) == 1;
+}
+
+spec take_ {
+    then std::array::get(take_(values(5.0, 6.0, 7.0, 8.0), numpy::ndarray::python_int(0 - 1), numpy::ndarray::none()).floats, 0) == 8.0;
+    then std::string::as_str(take_(values(5.0, 6.0, 7.0, 8.0), numpy::ndarray::arange(5), numpy::ndarray::none()).error) == "index 4 is out of bounds for axis 0 with size 4";
+}

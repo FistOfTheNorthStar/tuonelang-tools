@@ -1,0 +1,642 @@
+// numpy::ndarray — the array, its shape, and the operations on shape alone.
+//
+// An `NdArray` is a dtype, a shape, and its elements in C order: floats in
+// `floats` (float32 elements already rounded to binary32), int64 and bool
+// elements in `ints` (bools as 0 and 1). It is always contiguous and owns
+// its elements; numpy's views — a reshape or an `expand_dims` that shares
+// memory with its base — are copies here, which no result can tell apart
+// as long as no array is written through two names, and nothing in this
+// port writes in place. (Transposes are left out for that reason: a
+// transposed view is not C-ordered, and numpy sums it in memory order,
+// which a copy would not reproduce.)
+//
+// A Python scalar is a 0-d array marked `weak` (see `numpy::dtype`); `None`
+// is an array of dtype `numpy::dtype::none()`. An exception is an array
+// with `error_type` set — "ValueError", "AxisError", "TypeError",
+// "IndexError" — and numpy's message in `error`; every operation passes the
+// first failed operand through, the way an exception propagates.
+
+module numpy::ndarray;
+
+/// An array, a Python scalar, `None`, or an exception (see the module notes).
+pub struct NdArray {
+    dtype: Int,
+    weak: Bool,
+    shape: Array[Int],
+    floats: Array[Float],
+    ints: Array[Int],
+    error_type: String,
+    error: String,
+}
+
+/// An array of `dtype` and `shape` holding `floats` (for a float dtype,
+/// rounded to it) or `ints` (for int64 and bool; a bool is any non-zero).
+///
+/// # Example
+/// ```tuo
+/// let a = numpy::ndarray::build(numpy::dtype::int64(), shape, std::array::empty(), values);
+/// ```
+pub fn build(take dtype: Int, take shape: Array[Int], take floats: Array[Float], take ints: Array[Int]) -> NdArray {
+    var fs = floats;
+    var is = ints;
+    if dtype == 2 {
+        var i = 0;
+        while i < std::array::len(fs) {
+            std::array::set(fs, i, numpy::ieee::round32(std::array::get(fs, i)));
+            i = i + 1;
+        }
+    }
+    if dtype == 0 {
+        var i = 0;
+        while i < std::array::len(is) {
+            if std::array::get(is, i) != 0 {
+                std::array::set(is, i, 1);
+            }
+            i = i + 1;
+        }
+    }
+    NdArray { dtype: dtype, weak: false, shape: shape, floats: fs, ints: is, error_type: std::string::empty(), error: std::string::empty() }
+}
+
+/// A 1-d float array of `dtype` (float32 or float64) holding `values`.
+///
+/// # Example
+/// ```tuo
+/// let a = numpy::ndarray::from_floats(numpy::dtype::float32(), values);
+/// ```
+pub fn from_floats(take dtype: Int, take values: Array[Float]) -> NdArray {
+    var shape = std::array::empty();
+    std::array::push(shape, std::array::len(values));
+    build(dtype, shape, values, std::array::empty())
+}
+
+/// A 1-d int64 or bool array holding `values`.
+///
+/// # Example
+/// ```tuo
+/// let a = numpy::ndarray::from_ints(numpy::dtype::int64(), values);
+/// ```
+pub fn from_ints(take dtype: Int, take values: Array[Int]) -> NdArray {
+    var shape = std::array::empty();
+    std::array::push(shape, std::array::len(values));
+    build(dtype, shape, std::array::empty(), values)
+}
+
+/// The Python `int` `n`, as an argument: a weak 0-d int64.
+///
+/// # Example
+/// ```tuo
+/// let two = numpy::ndarray::python_int(2);
+/// ```
+pub fn python_int(take n: Int) -> NdArray {
+    var ints = std::array::empty();
+    std::array::push(ints, n);
+    var a = build(1, std::array::empty(), std::array::empty(), ints);
+    a.weak = true;
+    a
+}
+
+/// The Python `float` `x`, as an argument: a weak 0-d float64.
+///
+/// # Example
+/// ```tuo
+/// let half = numpy::ndarray::python_float(0.5);
+/// ```
+pub fn python_float(take x: Float) -> NdArray {
+    var floats = std::array::empty();
+    std::array::push(floats, x);
+    var a = build(3, std::array::empty(), floats, std::array::empty());
+    a.weak = true;
+    a
+}
+
+/// A strong 0-d array — a numpy scalar — of `dtype` holding `x` (for a
+/// float dtype) or `n` (for int64 and bool).
+///
+/// # Example
+/// ```tuo
+/// let t = numpy::ndarray::scalar(numpy::dtype::bool_(), 0.0, 1);
+/// ```
+pub fn scalar(take dtype: Int, take x: Float, take n: Int) -> NdArray {
+    var floats = std::array::empty();
+    var ints = std::array::empty();
+    if numpy::dtype::is_float(dtype) {
+        std::array::push(floats, x);
+    } else {
+        std::array::push(ints, n);
+    }
+    build(dtype, std::array::empty(), floats, ints)
+}
+
+/// Python's `None`, as an argument.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::ndarray::none();
+/// ```
+pub fn none() -> NdArray {
+    build(numpy::dtype::none(), std::array::empty(), std::array::empty(), std::array::empty())
+}
+
+/// An exception of type `kind` with message `message`.
+///
+/// # Example
+/// ```tuo
+/// let e = numpy::ndarray::failure("ValueError", "bad");
+/// ```
+pub fn failure(in kind: Str, in message: Str) -> NdArray {
+    var a = none();
+    a.error_type = std::string::from_str(kind);
+    a.error = std::string::from_str(message);
+    a
+}
+
+/// A copy of the exception `a` carries.
+///
+/// # Example
+/// ```tuo
+/// let e = numpy::ndarray::failed(a);
+/// ```
+pub fn failed(in a: NdArray) -> NdArray {
+    failure(std::string::as_str(a.error_type), std::string::as_str(a.error))
+}
+
+/// Whether `a` is not an exception.
+///
+/// # Example
+/// ```tuo
+/// let fine = numpy::ndarray::ok(a);
+/// ```
+pub fn ok(in a: NdArray) -> Bool {
+    std::string::len(a.error_type) == 0
+}
+
+/// Whether `a` is `None`.
+///
+/// # Example
+/// ```tuo
+/// let yes = numpy::ndarray::is_none(numpy::ndarray::none());
+/// ```
+pub fn is_none(in a: NdArray) -> Bool {
+    ok(a) && a.dtype == numpy::dtype::none()
+}
+
+/// The number of dimensions.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::ndarray::ndim(a);
+/// ```
+pub fn ndim(in a: NdArray) -> Int {
+    std::array::len(a.shape)
+}
+
+/// The length of axis `axis`.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::ndarray::dim(a, 0);
+/// ```
+pub fn dim(in a: NdArray, take axis: Int) -> Int {
+    std::array::get(a.shape, axis)
+}
+
+/// The number of elements of an array of `shape`.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::ndarray::product(shape);
+/// ```
+pub fn product(in shape: Array[Int]) -> Int {
+    var n = 1;
+    var i = 0;
+    while i < std::array::len(shape) {
+        n = n * std::array::get(shape, i);
+        i = i + 1;
+    }
+    n
+}
+
+/// The number of elements.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::ndarray::size(a);
+/// ```
+pub fn size(in a: NdArray) -> Int {
+    product(a.shape)
+}
+
+/// A copy of `shape`.
+///
+/// # Example
+/// ```tuo
+/// let s = numpy::ndarray::copy_shape(a.shape);
+/// ```
+pub fn copy_shape(in shape: Array[Int]) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < std::array::len(shape) {
+        std::array::push(out, std::array::get(shape, i));
+        i = i + 1;
+    }
+    out
+}
+
+/// `a` with its elements, dtype, and weakness, under `shape`.
+fn with_shape(in a: NdArray, take shape: Array[Int]) -> NdArray {
+    var out = build(a.dtype, shape, std::array::empty(), std::array::empty());
+    var i = 0;
+    while i < std::array::len(a.floats) {
+        std::array::push(out.floats, std::array::get(a.floats, i));
+        i = i + 1;
+    }
+    i = 0;
+    while i < std::array::len(a.ints) {
+        std::array::push(out.ints, std::array::get(a.ints, i));
+        i = i + 1;
+    }
+    out.weak = a.weak;
+    out
+}
+
+/// A copy of `a`, exception and all.
+///
+/// # Example
+/// ```tuo
+/// let b = numpy::ndarray::copy(a);
+/// ```
+pub fn copy(in a: NdArray) -> NdArray {
+    if !ok(a) {
+        return failed(a);
+    }
+    with_shape(a, copy_shape(a.shape))
+}
+
+/// A shape as Python writes a tuple: "(2, 3)", "(4,)", "()".
+///
+/// # Example
+/// ```tuo
+/// let t = numpy::ndarray::shape_tuple(a.shape);
+/// ```
+pub fn shape_tuple(in shape: Array[Int]) -> String {
+    shape_text(shape, ", ")
+}
+
+/// A shape as numpy writes one in its messages: "(2,3)", "(4,)", "()".
+///
+/// # Example
+/// ```tuo
+/// let t = numpy::ndarray::shape_compact(a.shape);
+/// ```
+pub fn shape_compact(in shape: Array[Int]) -> String {
+    shape_text(shape, ",")
+}
+
+fn shape_text(in shape: Array[Int], in sep: Str) -> String {
+    var out = std::string::from_str("(");
+    var i = 0;
+    while i < std::array::len(shape) {
+        if i > 0 {
+            std::str::push(out, sep);
+        }
+        let d = std::array::get(shape, i);
+        if d < 0 {
+            std::str::push(out, "newaxis");
+        } else {
+            std::str::push_int(out, d);
+        }
+        i = i + 1;
+    }
+    if std::array::len(shape) == 1 {
+        std::str::push(out, ",");
+    }
+    std::str::push(out, ")");
+    out
+}
+
+/// Whether `axis` names an axis of an array of `ndim` dimensions (negative
+/// axes count from the end).
+///
+/// # Example
+/// ```tuo
+/// let fine = numpy::ndarray::axis_in(0 - 1, 2);
+/// ```
+pub fn axis_in(take axis: Int, take ndim: Int) -> Bool {
+    axis >= 0 - ndim && axis < ndim
+}
+
+/// `axis`, counted from the front.
+///
+/// # Example
+/// ```tuo
+/// let a = numpy::ndarray::normal_axis(0 - 1, 2); // 1
+/// ```
+pub fn normal_axis(take axis: Int, take ndim: Int) -> Int {
+    if axis < 0 {
+        return axis + ndim;
+    }
+    axis
+}
+
+/// numpy's AxisError for `axis` on an array of `ndim` dimensions.
+///
+/// # Example
+/// ```tuo
+/// let e = numpy::ndarray::axis_error(2, 2);
+/// ```
+pub fn axis_error(take axis: Int, take ndim: Int) -> NdArray {
+    var message = std::string::from_str("axis ");
+    std::str::push_int(message, axis);
+    std::str::push(message, " is out of bounds for array of dimension ");
+    std::str::push_int(message, ndim);
+    failure("AxisError", std::string::as_str(message))
+}
+
+/// `a` under a new shape of the same size; one length may be -1, to be
+/// worked out — `np.reshape`.
+///
+/// # Example
+/// ```tuo
+/// let b = numpy::ndarray::reshape(a, shape);
+/// ```
+pub fn reshape(in a: NdArray, in shape: Array[Int]) -> NdArray {
+    if !ok(a) {
+        return failed(a);
+    }
+    var unknown = 0 - 1;
+    var known = 1;
+    var i = 0;
+    while i < std::array::len(shape) {
+        let d = std::array::get(shape, i);
+        if d < 0 {
+            if unknown >= 0 {
+                return failure("ValueError", "can only specify one unknown dimension");
+            }
+            unknown = i;
+        } else {
+            known = known * d;
+        }
+        i = i + 1;
+    }
+    var out = copy_shape(shape);
+    let n = size(a);
+    if unknown >= 0 {
+        if known != 0 && n % known == 0 {
+            std::array::set(out, unknown, n / known);
+            return with_shape(a, out);
+        }
+    } else if known == n {
+        return with_shape(a, out);
+    }
+    var message = std::string::from_str("cannot reshape array of size ");
+    std::str::push_int(message, n);
+    std::str::push(message, " into shape ");
+    std::str::push(message, std::string::as_str(shape_compact(shape)));
+    failure("ValueError", std::string::as_str(message))
+}
+
+/// `a` flattened to one dimension — `np.ravel`.
+///
+/// # Example
+/// ```tuo
+/// let flat = numpy::ndarray::ravel(a);
+/// ```
+pub fn ravel(in a: NdArray) -> NdArray {
+    if !ok(a) {
+        return failed(a);
+    }
+    var shape = std::array::empty();
+    std::array::push(shape, size(a));
+    with_shape(a, shape)
+}
+
+/// `a` with a new axis of length one at `axis` of the result —
+/// `np.expand_dims`.
+///
+/// # Example
+/// ```tuo
+/// let row = numpy::ndarray::expand_dims(a, 0);
+/// ```
+pub fn expand_dims(in a: NdArray, take axis: Int) -> NdArray {
+    if !ok(a) {
+        return failed(a);
+    }
+    let n = ndim(a) + 1;
+    if !axis_in(axis, n) {
+        return axis_error(axis, n);
+    }
+    let at = normal_axis(axis, n);
+    var shape = std::array::empty();
+    var i = 0;
+    var j = 0;
+    while i < n {
+        if i == at {
+            std::array::push(shape, 1);
+        } else {
+            std::array::push(shape, dim(a, j));
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    with_shape(a, shape)
+}
+
+/// `a` without its axes of length one, or (when `axis` is not `None`) just
+/// that one — `np.squeeze`.
+///
+/// # Example
+/// ```tuo
+/// let b = numpy::ndarray::squeeze(a, numpy::ndarray::none());
+/// ```
+pub fn squeeze(in a: NdArray, in axis: NdArray) -> NdArray {
+    if !ok(a) {
+        return failed(a);
+    }
+    if !ok(axis) {
+        return failed(axis);
+    }
+    var shape = std::array::empty();
+    if is_none(axis) {
+        var i = 0;
+        while i < ndim(a) {
+            if dim(a, i) != 1 {
+                std::array::push(shape, dim(a, i));
+            }
+            i = i + 1;
+        }
+        return with_shape(a, shape);
+    }
+    let k = std::array::get(axis.ints, 0);
+    if !axis_in(k, ndim(a)) {
+        return axis_error(k, ndim(a));
+    }
+    let at = normal_axis(k, ndim(a));
+    if dim(a, at) != 1 {
+        return failure("ValueError", "cannot select an axis to squeeze out which has size not equal to one");
+    }
+    var i = 0;
+    while i < ndim(a) {
+        if i != at {
+            std::array::push(shape, dim(a, i));
+        }
+        i = i + 1;
+    }
+    with_shape(a, shape)
+}
+
+/// Element `i` of `a` as a value of the float dtype `target`: an integer
+/// rounded once to it, a float64 rounded to float32.
+///
+/// # Example
+/// ```tuo
+/// let x = numpy::ndarray::float_at(a, 0, numpy::dtype::float64());
+/// ```
+pub fn float_at(in a: NdArray, take i: Int, take target: Int) -> Float {
+    if numpy::dtype::is_float(a.dtype) {
+        let x = std::array::get(a.floats, i);
+        if target == 2 && a.dtype == 3 {
+            return numpy::ieee::round32(x);
+        }
+        return x;
+    }
+    var precision = 53;
+    if target == 2 {
+        precision = 24;
+    }
+    numpy::ieee::from_int(std::array::get(a.ints, i), precision)
+}
+
+/// Element `i` of `a` as an int64: a float truncated toward zero (numpy
+/// leaves NaN and out-of-range floats undefined; this saturates).
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::ndarray::int_at(a, 0);
+/// ```
+pub fn int_at(in a: NdArray, take i: Int) -> Int {
+    if numpy::dtype::is_float(a.dtype) {
+        return std::array::get(a.floats, i) as Int;
+    }
+    std::array::get(a.ints, i)
+}
+
+/// Whether element `i` of `a` is true: non-zero, and NaN is.
+///
+/// # Example
+/// ```tuo
+/// let t = numpy::ndarray::truth_at(a, 0);
+/// ```
+pub fn truth_at(in a: NdArray, take i: Int) -> Bool {
+    if numpy::dtype::is_float(a.dtype) {
+        return std::array::get(a.floats, i) != 0.0;
+    }
+    std::array::get(a.ints, i) != 0
+}
+
+/// Pushes element `i` of `a`, converted to `dtype`, onto `out`.
+///
+/// # Example
+/// ```tuo
+/// numpy::ndarray::push_converted(out, a, 0);
+/// ```
+pub fn push_converted(mut out: NdArray, in a: NdArray, take i: Int) {
+    let dtype = out.dtype;
+    if numpy::dtype::is_float(dtype) {
+        std::array::push(out.floats, float_at(a, i, dtype));
+    } else if dtype == 0 {
+        if truth_at(a, i) {
+            std::array::push(out.ints, 1);
+        } else {
+            std::array::push(out.ints, 0);
+        }
+    } else {
+        std::array::push(out.ints, int_at(a, i));
+    }
+}
+
+/// `a` converted to `dtype` — `a.astype(dtype)`.
+///
+/// # Example
+/// ```tuo
+/// let b = numpy::ndarray::astype(a, numpy::dtype::float32());
+/// ```
+pub fn astype(in a: NdArray, take dtype: Int) -> NdArray {
+    if !ok(a) {
+        return failed(a);
+    }
+    var out = build(dtype, copy_shape(a.shape), std::array::empty(), std::array::empty());
+    var i = 0;
+    while i < size(a) {
+        push_converted(out, a, i);
+        i = i + 1;
+    }
+    out
+}
+
+/// The int64 array `[0, 1, …, n - 1]` — `np.arange(n)`.
+///
+/// # Example
+/// ```tuo
+/// let idx = numpy::ndarray::arange(5);
+/// ```
+pub fn arange(take n: Int) -> NdArray {
+    var ints = std::array::empty();
+    var i = 0;
+    while i < n {
+        std::array::push(ints, i);
+        i = i + 1;
+    }
+    from_ints(1, ints)
+}
+
+fn shape_of(take a: Int, take b: Int) -> Array[Int] {
+    var s = std::array::empty();
+    std::array::push(s, a);
+    std::array::push(s, b);
+    s
+}
+
+fn floats_of(take n: Int) -> NdArray {
+    var fs = std::array::empty();
+    var i = 0;
+    while i < n {
+        std::array::push(fs, (i as Float) + 0.5);
+        i = i + 1;
+    }
+    from_floats(3, fs)
+}
+
+spec reshape {
+    then std::string::as_str(shape_tuple(reshape(floats_of(6), shape_of(2, 3)).shape)) == "(2, 3)";
+    then std::string::as_str(shape_tuple(reshape(floats_of(6), shape_of(0 - 1, 2)).shape)) == "(3, 2)";
+    then std::string::as_str(reshape(floats_of(6), shape_of(4, 0 - 1)).error) == "cannot reshape array of size 6 into shape (4,newaxis)";
+    then std::string::as_str(reshape(floats_of(6), shape_of(0 - 1, 0 - 1)).error) == "can only specify one unknown dimension";
+    then std::string::as_str(reshape(floats_of(6), shape_of(4, 2)).error) == "cannot reshape array of size 6 into shape (4,2)";
+    then std::array::get(reshape(floats_of(6), shape_of(3, 2)).floats, 5) == 5.5;
+}
+
+spec expand_dims {
+    then std::string::as_str(shape_tuple(expand_dims(floats_of(3), 0).shape)) == "(1, 3)";
+    then std::string::as_str(shape_tuple(expand_dims(floats_of(3), 0 - 1).shape)) == "(3, 1)";
+    then std::string::as_str(expand_dims(floats_of(3), 2).error) == "axis 2 is out of bounds for array of dimension 2";
+}
+
+spec squeeze {
+    then std::string::as_str(shape_tuple(squeeze(expand_dims(floats_of(3), 0), none()).shape)) == "(3,)";
+    then std::string::as_str(shape_tuple(squeeze(reshape(floats_of(3), shape_of(3, 1)), python_int(0 - 1)).shape)) == "(3,)";
+    then std::string::as_str(squeeze(floats_of(3), python_int(0)).error) == "cannot select an axis to squeeze out which has size not equal to one";
+}
+
+spec astype {
+    then std::array::get(astype(floats_of(3), 1).ints, 2) == 2;
+    then std::array::get(astype(floats_of(3), 2).floats, 1) == 1.5;
+    then std::array::get(astype(arange(3), 0).ints, 2) == 1;
+}
+
+spec shape_compact {
+    then std::string::as_str(shape_compact(shape_of(2, 3))) == "(2,3)";
+    then std::string::as_str(shape_compact(shape_of(4, 0 - 1))) == "(4,newaxis)";
+    then std::string::as_str(shape_compact(std::array::empty())) == "()";
+    then std::string::as_str(shape_tuple(shape_of(4, 0 - 1))) == "(4, newaxis)";
+}
