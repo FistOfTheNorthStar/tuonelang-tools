@@ -1,0 +1,360 @@
+// zip::text — file names as CPython decodes and prints them.
+//
+// A zip entry's name is bytes: UTF-8 when general-purpose flag bit 11 is
+// set, and otherwise code page 437, the IBM PC's, which `zipfile` decodes
+// with its `cp437` codec. Strings here are UTF-8, so a cp437 name is
+// re-encoded byte by byte through the codec's table, and a UTF-8 name is
+// checked as CPython's decoder checks it — overlong forms, surrogates,
+// and code points past U+10FFFF refused — failing with its exact
+// `UnicodeDecodeError` text: `'utf-8' codec can't decode byte 0xff in
+// position 2: invalid start byte`, `… bytes in position 2-3: unexpected
+// end of data`, `… invalid continuation byte`.
+//
+// zipfile's messages quote names with `%r`, so `repr` is here too: of a
+// `str` (single quotes unless the text holds a `'` and no `"`; `\\`, the
+// quote, `\t`, `\n`, `\r` escaped; unprintable characters as `\xNN`,
+// `\uNNNN`, `\UNNNNNNNN`) and of `bytes` (`b'…'`, everything outside
+// printable ASCII as `\xNN`). CPython asks the Unicode database what is
+// printable; this port escapes the C0 and C1 controls, U+00AD, the
+// Unicode spaces and format characters (U+2000–U+200F, U+2028–U+202F,
+// U+205F–U+206F, U+3000, U+FEFF, U+FFF9–U+FFFB), surrogates, and private
+// use, and prints any other code point — including unassigned ones,
+// which CPython would escape.
+
+module zip::text;
+
+/// A decode: the text, or CPython's `UnicodeDecodeError` message.
+pub struct Decoded {
+    ok: Bool,
+    text: String,
+    error: String,
+}
+
+fn cp437_table() -> Array[Int] {
+    let parts = std::str::split("199,252,233,226,228,224,229,231,234,235,232,239,238,236,196,197,201,230,198,244,246,242,251,249,255,214,220,162,163,165,8359,402,225,237,243,250,241,209,170,186,191,8976,172,189,188,161,171,187,9617,9618,9619,9474,9508,9569,9570,9558,9557,9571,9553,9559,9565,9564,9563,9488,9492,9524,9516,9500,9472,9532,9566,9567,9562,9556,9577,9574,9568,9552,9580,9575,9576,9572,9573,9561,9560,9554,9555,9579,9578,9496,9484,9608,9604,9612,9616,9600,945,223,915,960,931,963,181,964,934,920,937,948,8734,966,949,8745,8801,177,8805,8804,8992,8993,247,8776,176,8729,183,8730,8319,178,9632,160", ",");
+    var out = std::array::empty();
+    var i = 0;
+    while i < std::array::len(parts) {
+        let n = match std::str::parse_int(std::string::as_str(std::array::get(parts, i))) {
+            Ok { value } => value,
+            Err { error } => 0,
+        };
+        std::array::push(out, n);
+        i = i + 1;
+    }
+    out
+}
+
+/// Append code point `c` to `out` as UTF-8.
+///
+/// # Example
+/// ```tuo
+/// zip::text::push_code_point(out, 233); // "é"
+/// ```
+pub fn push_code_point(mut out: String, take c: Int) {
+    if c < 128 {
+        std::string::push_byte(out, c);
+    } else if c < 2048 {
+        std::string::push_byte(out, 192 + c / 64);
+        std::string::push_byte(out, 128 + c % 64);
+    } else if c < 65536 {
+        std::string::push_byte(out, 224 + c / 4096);
+        std::string::push_byte(out, 128 + (c / 64) % 64);
+        std::string::push_byte(out, 128 + c % 64);
+    } else {
+        std::string::push_byte(out, 240 + c / 262144);
+        std::string::push_byte(out, 128 + (c / 4096) % 64);
+        std::string::push_byte(out, 128 + (c / 64) % 64);
+        std::string::push_byte(out, 128 + c % 64);
+    }
+}
+
+/// `raw.decode("cp437")`, as UTF-8.
+///
+/// # Example
+/// ```tuo
+/// let t = zip::text::cp437("caf\u{82}"); // not reachable from a literal; see the specs
+/// ```
+pub fn cp437(in raw: Str) -> String {
+    let table = cp437_table();
+    var out = std::string::empty();
+    var i = 0;
+    while i < std::str::len(raw) {
+        let b = std::str::byte_at(raw, i);
+        if b < 128 {
+            std::string::push_byte(out, b);
+        } else {
+            push_code_point(out, std::array::get(table, b - 128));
+        }
+        i = i + 1;
+    }
+    out
+}
+
+fn hex2(take b: Int) -> String {
+    let digits = "0123456789abcdef";
+    var out = std::string::empty();
+    std::string::push_byte(out, std::str::byte_at(digits, b / 16));
+    std::string::push_byte(out, std::str::byte_at(digits, b % 16));
+    out
+}
+
+fn is_continuation(take b: Int) -> Bool {
+    b >= 128 && b < 192
+}
+
+fn decode_error(in raw: Str, take start: Int, take end: Int, in reason: Str) -> Decoded {
+    var e = std::string::from_str("'utf-8' codec can't decode ");
+    if end - start == 1 {
+        std::str::push(e, "byte 0x");
+        std::str::push(e, std::string::as_str(hex2(std::str::byte_at(raw, start))));
+        std::str::push(e, " in position ");
+        std::str::push_int(e, start);
+    } else {
+        std::str::push(e, "bytes in position ");
+        std::str::push_int(e, start);
+        std::str::push(e, "-");
+        std::str::push_int(e, end - 1);
+    }
+    std::str::push(e, ": ");
+    std::str::push(e, reason);
+    Decoded { ok: false, text: std::string::empty(), error: e }
+}
+
+/// `raw.decode("utf-8")`: the text, or CPython's error.
+///
+/// # Example
+/// ```tuo
+/// let d = zip::text::utf8("caf\u{e9}"); // ok
+/// ```
+pub fn utf8(in raw: Str) -> Decoded {
+    let n = std::str::len(raw);
+    var i = 0;
+    while i < n {
+        let b = std::str::byte_at(raw, i);
+        var need = 0;
+        if b < 128 {
+            need = 0;
+        } else if b >= 194 && b <= 223 {
+            need = 1;
+        } else if b >= 224 && b <= 239 {
+            need = 2;
+        } else if b >= 240 && b <= 244 {
+            need = 3;
+        } else {
+            return decode_error(raw, i, i + 1, "invalid start byte");
+        }
+        var k = 1;
+        while k <= need {
+            if i + k >= n {
+                return decode_error(raw, i, n, "unexpected end of data");
+            }
+            let c = std::str::byte_at(raw, i + k);
+            var ok = is_continuation(c);
+            if k == 1 {
+                if b == 224 {
+                    ok = c >= 160 && c < 192;
+                } else if b == 237 {
+                    ok = c >= 128 && c < 160;
+                } else if b == 240 {
+                    ok = c >= 144 && c < 192;
+                } else if b == 244 {
+                    ok = c >= 128 && c < 144;
+                }
+            }
+            if !ok {
+                return decode_error(raw, i, i + k, "invalid continuation byte");
+            }
+            k = k + 1;
+        }
+        i = i + need + 1;
+    }
+    Decoded { ok: true, text: std::string::from_str(raw), error: std::string::empty() }
+}
+
+/// The code point at byte `i` of valid UTF-8 `s`, and its length in bytes
+/// as `code * 8 + length`.
+fn code_point_at(in s: Str, take i: Int) -> Int {
+    let b = std::str::byte_at(s, i);
+    if b < 128 {
+        return b * 8 + 1;
+    }
+    if b < 224 {
+        return ((b % 32) * 64 + std::str::byte_at(s, i + 1) % 64) * 8 + 2;
+    }
+    if b < 240 {
+        return ((b % 16) * 4096 + (std::str::byte_at(s, i + 1) % 64) * 64 + std::str::byte_at(s, i + 2) % 64) * 8 + 3;
+    }
+    ((b % 8) * 262144 + (std::str::byte_at(s, i + 1) % 64) * 4096 + (std::str::byte_at(s, i + 2) % 64) * 64 + std::str::byte_at(s, i + 3) % 64) * 8 + 4
+}
+
+fn printable(take c: Int) -> Bool {
+    if c < 32 || (c >= 127 && c <= 160) || c == 173 {
+        return false;
+    }
+    if (c >= 8192 && c <= 8207) || (c >= 8232 && c <= 8239) || (c >= 8287 && c <= 8303) {
+        return false;
+    }
+    if c == 12288 || c == 65279 || (c >= 65529 && c <= 65531) {
+        return false;
+    }
+    if (c >= 55296 && c <= 63743) || (c >= 983040) {
+        return false;
+    }
+    true
+}
+
+fn push_hex(mut out: String, take value: Int, take digits: Int) {
+    let hex = "0123456789abcdef";
+    var shift = digits - 1;
+    while shift >= 0 {
+        var d = value;
+        var k = 0;
+        while k < shift {
+            d = d / 16;
+            k = k + 1;
+        }
+        std::string::push_byte(out, std::str::byte_at(hex, d % 16));
+        shift = shift - 1;
+    }
+}
+
+/// `repr(s)` of a `str` holding the UTF-8 text `s`.
+///
+/// # Example
+/// ```tuo
+/// let r = zip::text::repr("a.txt"); // "'a.txt'"
+/// ```
+pub fn repr(in s: Str) -> String {
+    let quote = if std::str::contains_byte(s, 39) && !std::str::contains_byte(s, 34) {
+        34
+    } else {
+        39
+    };
+    var out = std::string::empty();
+    std::string::push_byte(out, quote);
+    var i = 0;
+    while i < std::str::len(s) {
+        let cp = code_point_at(s, i);
+        let c = cp / 8;
+        if c == 92 || c == quote {
+            std::string::push_byte(out, 92);
+            std::string::push_byte(out, c);
+        } else if c == 9 {
+            std::str::push(out, "\\t");
+        } else if c == 10 {
+            std::str::push(out, "\\n");
+        } else if c == 13 {
+            std::str::push(out, "\\r");
+        } else if printable(c) {
+            push_code_point(out, c);
+        } else if c < 256 {
+            std::str::push(out, "\\x");
+            push_hex(out, c, 2);
+        } else if c < 65536 {
+            std::str::push(out, "\\u");
+            push_hex(out, c, 4);
+        } else {
+            std::str::push(out, "\\U");
+            push_hex(out, c, 8);
+        }
+        i = i + cp % 8;
+    }
+    std::string::push_byte(out, quote);
+    out
+}
+
+/// `repr(b)` of the `bytes` `raw`.
+///
+/// # Example
+/// ```tuo
+/// let r = zip::text::bytes_repr("a.txt"); // "b'a.txt'"
+/// ```
+pub fn bytes_repr(in raw: Str) -> String {
+    let quote = if std::str::contains_byte(raw, 39) && !std::str::contains_byte(raw, 34) {
+        34
+    } else {
+        39
+    };
+    var out = std::string::from_str("b");
+    std::string::push_byte(out, quote);
+    var i = 0;
+    while i < std::str::len(raw) {
+        let c = std::str::byte_at(raw, i);
+        if c == 92 || c == quote {
+            std::string::push_byte(out, 92);
+            std::string::push_byte(out, c);
+        } else if c == 9 {
+            std::str::push(out, "\\t");
+        } else if c == 10 {
+            std::str::push(out, "\\n");
+        } else if c == 13 {
+            std::str::push(out, "\\r");
+        } else if c < 32 || c >= 127 {
+            std::str::push(out, "\\x");
+            push_hex(out, c, 2);
+        } else {
+            std::string::push_byte(out, c);
+        }
+        i = i + 1;
+    }
+    std::string::push_byte(out, quote);
+    out
+}
+
+// ----------------------------------------------------------------------------
+// Specs.
+// ----------------------------------------------------------------------------
+
+fn bytes_of(in hex: Str) -> String {
+    var out = std::string::empty();
+    var i = 0;
+    while i + 1 < std::str::len(hex) {
+        let hi = std::str::byte_at(hex, i);
+        let lo = std::str::byte_at(hex, i + 1);
+        let h = if hi >= 97 {
+            hi - 87
+        } else {
+            hi - 48
+        };
+        let l = if lo >= 97 {
+            lo - 87
+        } else {
+            lo - 48
+        };
+        std::string::push_byte(out, h * 16 + l);
+        i = i + 2;
+    }
+    out
+}
+
+fn decode_error_of(in hex: Str) -> String {
+    let d = utf8(std::string::as_str(bytes_of(hex)));
+    d.error
+}
+
+spec utf8 {
+    then utf8("caf\u{e9}").ok;
+    then utf8("\u{65e5}\u{672c}").ok;
+    then std::string::as_str(decode_error_of("6162ff")) == "'utf-8' codec can't decode byte 0xff in position 2: invalid start byte";
+    then std::string::as_str(decode_error_of("6162e228a1")) == "'utf-8' codec can't decode byte 0xe2 in position 2: invalid continuation byte";
+    then std::string::as_str(decode_error_of("6162e282")) == "'utf-8' codec can't decode bytes in position 2-3: unexpected end of data";
+    then std::string::as_str(decode_error_of("c0af")) == "'utf-8' codec can't decode byte 0xc0 in position 0: invalid start byte";
+    then std::string::as_str(decode_error_of("eda080")) == "'utf-8' codec can't decode byte 0xed in position 0: invalid continuation byte";
+    then std::string::as_str(decode_error_of("f0908041")) == "'utf-8' codec can't decode bytes in position 0-2: invalid continuation byte";
+}
+
+spec cp437 {
+    then std::string::as_str(cp437(std::string::as_str(bytes_of("636166822081")))) == "caf\u{e9} \u{fc}";
+    then std::string::as_str(cp437(std::string::as_str(bytes_of("b0ff")))) == "\u{2591}\u{a0}";
+}
+
+spec repr {
+    then std::string::as_str(repr("a.txt")) == "'a.txt'";
+    then std::string::as_str(repr("it's")) == "\"it's\"";
+    then std::string::as_str(repr("both'\"")) == "'both\\'\"'";
+    then std::string::as_str(repr("tab\tnul\u{0}")) == "'tab\\tnul\\x00'";
+    then std::string::as_str(repr("caf\u{e9}\u{a0}\u{200b}")) == "'caf\u{e9}\\xa0\\u200b'";
+    then std::string::as_str(bytes_repr("a.txt")) == "b'a.txt'";
+    then std::string::as_str(bytes_repr(std::string::as_str(bytes_of("63c3a9ff")))) == "b'c\\xc3\\xa9\\xff'";
+}

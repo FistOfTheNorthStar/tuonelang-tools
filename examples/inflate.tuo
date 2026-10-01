@@ -1,0 +1,74 @@
+// examples/inflate — every captured deflate stream, natively.
+//
+// The specs decompress the streams the fixture holds inline, a few at a
+// time within the sandbox's fuel. This program decompresses all 82 as
+// native code, reading the seven largest from examples/zip-test/inflate/,
+// and prints what differs; then decodes the largest with bounded output.
+//
+//     tuo run examples/inflate.tuo src/inflate/*.tuo src/std_fs.tuo src/std_str.tuo
+//
+// No network. One line per check; exit is the failure count.
+
+module inflate_check;
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn show(in label: Str, in text: Str) {
+    var line = std::string::from_str("      ");
+    std::str::push(line, label);
+    std::str::push(line, ": ");
+    std::str::push(line, text);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+}
+
+fn input_of(take i: Int) -> String {
+    let path = inflate::fixture::input_file(i);
+    if std::str::len(path) == 0 {
+        return inflate::demo::from_hex(inflate::fixture::input_hex(i));
+    }
+    match std::fs::read(path) {
+        Ok { value } => value,
+        Err { error } => std::string::empty(),
+    }
+}
+
+fn main() -> Int {
+    var failed = 0;
+    var i = 0;
+    while i < inflate::fixture::count() {
+        let input = input_of(i);
+        let same = inflate::demo::agrees(i, std::string::as_str(input));
+        var label = std::string::from_str(inflate::fixture::name(i));
+        if std::str::len(inflate::fixture::input_file(i)) > 0 {
+            std::str::push(label, " (from its file)");
+        }
+        failed = failed + report(std::string::as_str(label), same);
+        if !same {
+            show("got ", std::string::as_str(inflate::demo::output(i, std::string::as_str(input))));
+            show("want", std::string::as_str(inflate::demo::expected(i)));
+        }
+        i = i + 1;
+    }
+    // A 100 KB stream decoded keeping 1000 bytes: the window is trimmed
+    // twice on the way, and the copies must still reach back correctly.
+    let big = input_of(inflate::demo::named("text_100000_level6"));
+    failed = failed + report("bounded: 100000 bytes decoded keeping 1000, the tail trimmed along the way", inflate::demo::bounded_agrees(std::string::as_str(big), 1000));
+    failed = failed + report("bounded: keeping 70000, past two trims", inflate::demo::bounded_agrees(std::string::as_str(big), 70000));
+    failed
+}

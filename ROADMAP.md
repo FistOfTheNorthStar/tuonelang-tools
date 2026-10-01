@@ -26,9 +26,11 @@ SHA-256/HMAC/PBKDF2, `std::bignum`, `std::json`, `std::fs`, `std::sync`,
 | this repo, `tls` | `ssl` (client side) | TLS 1.3 client on the catalog's stack; RFC 8448 reproduced; handshakes with `std::tls` and OpenSSL; `https://` to Stripe, Sentry, Cloudflare |
 | this repo, `web` | `fastapi`, `pydantic`, `starlette` (the request path) | routing, models as data, lax validation, the 422 body; 107 captured FastAPI responses reproduced byte for byte |
 | this repo, `dotenv` + `settings` | `python-dotenv`, `pydantic-settings` | `.env` parsing with interpolation; `BaseSettings` as data; 29 `.env` texts and 33 instantiations of the backend's `Settings` reproduced |
+| this repo, `inflate` + `zip` | `zlib` (decompression), `zipfile` (reading) | deflate with zlib's errors; archives read as zipfile reads them; 82 streams and 54 archives reproduced; bounded memory on archives that expand past their stated size |
+| this repo, `ratelimit` | `slowapi`, `limits` | the grammar, keys, and fixed window in memory and Redis; slowapi's check and 429; 63 strings, 16 Redis exchanges, and 103 slowapi responses reproduced |
 | this repo, `x509` + `ec` + `rsa` | the trust half of `ssl`, `certifi` | X.509 parsing and chain validation, a root store, ECDSA P-256/P-384, RSA v1.5/PSS; 380 specs; real chains validated |
 
-All ten prove the thesis: the *engine* of a Python library is pure logic, and pure
+All twelve prove the thesis: the *engine* of a Python library is pure logic, and pure
 logic is what tuonelang specs pin best.
 
 ---
@@ -140,8 +142,8 @@ Achievable on v0 as it stands, in rough order of value-per-effort.
 | **S3 client** — ✅ done | `boto3` | You only use Cloudflare R2. SigV4 signing is pure HMAC-SHA256 — already available. A tiny, targeted client beats all of boto3. Done 2026-09-22 as `s3`: the seven calls the backend makes, pinned to 22 requests captured from boto3 with a frozen clock, and a 35-check live oracle against MinIO. |
 | **Template engine** — ✅ done | `jinja2` + `markupsafe` | Parser + renderer; escaping is a correctness property that specs pin beautifully. Done 2026-09-24 as `jinja`: the subset the 30 email templates use, pinned to 100 renders by Jinja2 3.1.6 of those very templates. |
 | **Config / env loading** — ✅ done | `pydantic-settings`, `python-dotenv` | Done 2026-09-28 as `dotenv` and `settings`: python-dotenv's grammar and interpolation, pinned to 29 `.env` texts; the sources, aliases, JSON lists, lax binding, and forbidden extras, pinned to 33 instantiations of the backend's own `Settings`. The runtime has no `getenv` (docs/RUNTIME-FINDING-2.md), so the environment is an argument. |
-| **CSV / XLSX reading** | `openpyxl` | XLSX is a zip of XML — needs a deflate decompressor first (worth having anyway). |
-| **Rate limiting** | `slowapi` | Pure algorithm: token bucket / sliding window. Ideal spec target. |
+| **CSV / XLSX reading** — ◐ the zip layer is done | `openpyxl` | XLSX is a zip of XML — needs a deflate decompressor first (worth having anyway). Done 2026-09-29 as `inflate` and `zip`: deflate decoded as zlib decodes it, every error included, and archives read as `zipfile` reads them — the layer under uploaded batches, workbooks, and `.docx` text alike. Still to come: the workbook itself (shared strings, sheets, cell types, `data_only` values) as the backend's `_workbook_csv` reads it. |
+| **Rate limiting** — ✅ done | `slowapi`, `limits` | Pure algorithm: token bucket / sliding window. Ideal spec target. Done 2026-09-29 as `ratelimit`: the fixed window the backend configures, in memory and as `limits`' Redis conversation (pinned to 16 exchanges with a real server, byte for byte), and slowapi's check, 429, and headers, pinned to 103 requests through FastAPI. It surfaced a `redis::resp` bug (`:-2` refused) and a deployment one: behind Caddy, every client shares one bucket. |
 | **Test runner assertions** | `pytest` | Largely **already solved** — colocated `spec` blocks *are* the replacement. Only fixtures and parametrization are missing. |
 | **Formatter / linter / typechecker** | `black`, `flake8`, `mypy` | **Already solved.** `tuo fmt` is canonical and zero-config; the type and ownership checkers subsume mypy and flake8 entirely. |
 
@@ -177,7 +179,9 @@ Be honest about these rather than half-porting them.
 8. ✅ **Structured logging + Sentry**.
 9. ✅ **Template engine** (JWT dropped: the backend has no JWTs).
 10. ✅ **Config and `.env` loading**.
-   **Next:** rate limiting.
+11. ✅ **Rate limiting**.
+12. ✅ **Deflate and zip reading**.
+   **Next:** XLSX reading on top of them, then `.docx` text.
 
 The application itself — shallowflaws's routers, services, and models —
 stays in Python and is **out of scope** here. It is the oracle these

@@ -1,0 +1,140 @@
+// ratelimit::client — the fixed window on a live Redis.
+//
+// `ratelimit::redis` holds each storage call as a conversation that never
+// touches a socket; this module runs one over a connection from
+// `redis::client`, reply by reply, and runs slowapi's check the way
+// `ratelimit::limiter::check` runs it on a memory store: the same plan,
+// each limit spent in order until one fails. A call that gets no answer
+// or an answer it cannot use finishes `failed`, and so does a check that
+// meets one — slowapi, without `swallow_errors`, would have raised.
+//
+// Connect with `open`, which takes the backend's `REDIS_URL` shape
+// (`redis://[:password@]host:port/db`; no TLS in v0).
+//
+// Effectful, so no specs (`R0007`); pinned by `examples/ratelimit.tuo`
+// against a live server.
+
+module ratelimit::client;
+
+/// EFFECT: connect to the storage at `url`; the descriptor, or negative.
+///
+/// # Example
+/// ```tuo
+/// let fd = ratelimit::client::open("redis://127.0.0.1:6380/15", 5000);
+/// ```
+pub fn open(in url: Str, take timeout_ms: Int) -> Int {
+    redis::client::open_url(url, timeout_ms)
+}
+
+/// EFFECT: run `c` to its end over `fd`.
+///
+/// # Example
+/// ```tuo
+/// var c = ratelimit::redis::check();
+/// ratelimit::client::run(fd, c, 5000);
+/// ```
+pub fn run(take fd: Int, mut c: ratelimit::redis::Call, take timeout_ms: Int) {
+    while !c.done {
+        let reply = redis::client::call(fd, std::string::from_str(std::string::as_str(c.next)), timeout_ms);
+        ratelimit::redis::feed(c, std::string::as_str(reply));
+    }
+}
+
+/// EFFECT: whether the storage answers: `check`.
+///
+/// # Example
+/// ```tuo
+/// let up = ratelimit::client::healthy(fd, 5000);
+/// ```
+pub fn healthy(take fd: Int, take timeout_ms: Int) -> Bool {
+    var c = ratelimit::redis::check();
+    run(fd, c, timeout_ms);
+    c.passed
+}
+
+/// EFFECT: spend `cost` of `it` under `key`: `hit`. The finished call
+/// holds `passed` and `count`, or `failed`.
+///
+/// # Example
+/// ```tuo
+/// let c = ratelimit::client::hit(fd, it, "LIMITER/a/5/1/minute", 1, 5000);
+/// ```
+pub fn hit(take fd: Int, in it: ratelimit::item::Item, in key: Str, take cost: Int, take timeout_ms: Int) -> ratelimit::redis::Call {
+    var c = ratelimit::redis::hit(it, key, cost);
+    run(fd, c, timeout_ms);
+    c
+}
+
+/// EFFECT: whether `cost` more of `it` would fit under `key`: `test`.
+///
+/// # Example
+/// ```tuo
+/// let c = ratelimit::client::test(fd, it, "LIMITER/a/5/1/minute", 1, 5000);
+/// ```
+pub fn test(take fd: Int, in it: ratelimit::item::Item, in key: Str, take cost: Int, take timeout_ms: Int) -> ratelimit::redis::Call {
+    var c = ratelimit::redis::test(it, key, cost);
+    run(fd, c, timeout_ms);
+    c
+}
+
+/// EFFECT: the window of `it` under `key` at `now`: `get_window_stats`.
+///
+/// # Example
+/// ```tuo
+/// let c = ratelimit::client::stats(fd, it, "LIMITER/a/5/1/minute", now, 5000);
+/// ```
+pub fn stats(take fd: Int, in it: ratelimit::item::Item, in key: Str, take now: Int, take timeout_ms: Int) -> ratelimit::redis::Call {
+    var c = ratelimit::redis::stats(it, key, now);
+    run(fd, c, timeout_ms);
+    c
+}
+
+/// EFFECT: close the window under `key`: `clear`.
+///
+/// # Example
+/// ```tuo
+/// let c = ratelimit::client::clear(fd, "LIMITER/a/5/1/minute", 5000);
+/// ```
+pub fn clear(take fd: Int, in key: Str, take timeout_ms: Int) -> ratelimit::redis::Call {
+    var c = ratelimit::redis::clear(key);
+    run(fd, c, timeout_ms);
+    c
+}
+
+/// EFFECT: check a request to `route` against the storage, spending what
+/// it costs: `ratelimit::limiter::check` on Redis.
+///
+/// # Example
+/// ```tuo
+/// let d = ratelimit::client::check(fd, l, "app.login", "POST", "/login", "203.0.113.7", 5000);
+/// ```
+pub fn check(take fd: Int, in l: ratelimit::limiter::Limiter, in route: Str, in method: Str, in path: Str, in host: Str, take timeout_ms: Int) -> ratelimit::limiter::Decision {
+    var d = ratelimit::limiter::decision();
+    let hits = ratelimit::limiter::plan(l, route, method, path, host);
+    var i = 0;
+    while i < std::array::len(hits) {
+        let h = std::array::get(hits, i);
+        let c = hit(fd, h.item, std::string::as_str(h.key), h.cost, timeout_ms);
+        if c.failed {
+            d.failed = true;
+            return d;
+        }
+        ratelimit::limiter::record(d, h, c.passed);
+        if !c.passed {
+            return d;
+        }
+        i = i + 1;
+    }
+    d
+}
+
+/// EFFECT: the window of `d`'s view at `now`.
+///
+/// # Example
+/// ```tuo
+/// let st = ratelimit::client::view_stats(fd, d, now, 5000);
+/// ```
+pub fn view_stats(take fd: Int, in d: ratelimit::limiter::Decision, take now: Int, take timeout_ms: Int) -> ratelimit::item::Stats {
+    let c = stats(fd, d.view.item, std::string::as_str(d.view.key), now, timeout_ms);
+    ratelimit::item::Stats { reset: c.stats.reset, remaining: c.stats.remaining }
+}

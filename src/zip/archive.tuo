@@ -1,0 +1,608 @@
+// zip::archive — a zip archive, read as `zipfile` reads it.
+//
+// OPENING (`ZipFile(path)`) looks for the end-of-central-directory record
+// first where it is when the archive has no comment — the last 22 bytes,
+// signed and with a zero comment length — and otherwise searches the last
+// 64 KiB + 22 bytes for the last `PK\5\6`. Before it may sit a ZIP64
+// locator, which points at a ZIP64 end record whose counts, sizes, and
+// offsets replace the plain ones. The central directory is then read from
+// where the end record says it is, shifted by whatever sits in front of
+// the archive (a self-extracting stub): the difference between where the
+// end record was found and where the directory's own offset and size say
+// it should be. Each entry's name is UTF-8 or cp437 by flag bit 11
+// (`zip::text`), cut at the first NUL, and replaced by a Unicode path
+// extra field (0x7075) whose CRC matches the raw name; ZIP64 extra fields
+// supply sizes and offsets the entry left at 0xFFFFFFFF. An extract
+// version past 6.3 is refused, as is an extra field longer than what
+// holds it.
+//
+// READING (`zf.read(name)`) takes the last entry of that name, and then,
+// in zipfile's order: reads the local header at the entry's offset
+// (`Truncated file header`, `Bad magic number for file header`); refuses
+// flag bits 5 and 6; decodes the local name and requires it to equal the
+// directory's (`File name in directory … and header … differ.`); refuses
+// data that would run past the next entry's header (`Overlapped entries`
+// — unless the two share a header, which zipfile only warns about);
+// refuses encryption without a password and every method but stored and
+// deflated. The data is then the stored bytes or the inflated stream,
+// cut to the entry's size; its CRC-32 must match (`Bad CRC-32 for
+// file …`). zipfile checks nothing else: a deflate stream cut short, or
+// data shorter than the stated size, reads without complaint when the CRC
+// agrees, and fails on the CRC otherwise.
+//
+// Failures carry zipfile's exception type — `BadZipFile`,
+// `NotImplementedError`, `RuntimeError`, `KeyError`, `OSError` (a negative
+// header offset, which a file on disk refuses to seek to),
+// `UnicodeDecodeError`, `EOFError`, or zlib's `error` — and its message
+// exactly.
+//
+// Not ported: passwords (traditional PKWARE encryption), bzip2, LZMA,
+// and Zstandard members (zipfile reads them; this port reports
+// `NotImplementedError` with a message of its own), multi-disk archives,
+// `metadata_encoding`, and Windows' backslash-to-slash name rewriting.
+// ZIP64 fields saturate (`wide`): an entry reports 2^60 for any size or
+// offset from there up, and 2^60 + 1 past 2^63.
+
+module zip::archive;
+
+/// One entry of the central directory, as `ZipInfo` holds it.
+pub struct Entry {
+    filename: String,
+    orig_filename: String,
+    create_version: Int,
+    create_system: Int,
+    extract_version: Int,
+    flag_bits: Int,
+    compress_type: Int,
+    raw_time: Int,
+    raw_date: Int,
+    crc: Int,
+    compress_size: Int,
+    file_size: Int,
+    header_offset: Int,
+    end_offset: Int,
+    comment: String,
+    extra: String,
+}
+
+/// An opened archive, or the exception `ZipFile` raised.
+pub struct Archive {
+    ok: Bool,
+    error_type: String,
+    error: String,
+    comment: String,
+    entries: Array[Entry],
+    start_dir: Int,
+    concat: Int,
+}
+
+/// What `zf.read(name)` returned or raised.
+pub struct Read {
+    ok: Bool,
+    data: String,
+    error_type: String,
+    error: String,
+}
+
+// ----------------------------------------------------------------------------
+// Little-endian fields.
+// ----------------------------------------------------------------------------
+
+fn u16(in s: Str, take at: Int) -> Int {
+    std::str::byte_at(s, at) + std::str::byte_at(s, at + 1) * 256
+}
+
+fn u32(in s: Str, take at: Int) -> Int {
+    u16(s, at) + u16(s, at + 2) * 65536
+}
+
+/// Where 64-bit fields saturate: `Int` is a trapping signed 64-bit
+/// integer, and a crafted ZIP64 field of 0xFFFFFFFFFFFFFFFF must refuse
+/// cleanly rather than overflow. A value from 2^60 up to 2^63 reads as
+/// 2^60 — no archive a program can hold is that large, so every
+/// comparison zipfile makes comes out the same — and a value of 2^63 or
+/// more, which CPython cannot even seek to, as 2^60 + 1.
+///
+/// # Example
+/// ```tuo
+/// let cap = zip::archive::wide(); // 1152921504606846976
+/// ```
+pub fn wide() -> Int {
+    1152921504606846976
+}
+
+fn u64(in s: Str, take at: Int) -> Int {
+    let high = u32(s, at + 4);
+    if high >= 2147483648 {
+        return wide() + 1;
+    }
+    if high >= 268435456 {
+        return wide();
+    }
+    u32(s, at) + high * 4294967296
+}
+
+/// `PK` and the two bytes `third`, `fourth` at `at`.
+fn magic_at(in s: Str, take at: Int, take third: Int, take fourth: Int) -> Bool {
+    at >= 0 && at + 4 <= std::str::len(s) && std::str::byte_at(s, at) == 80 && std::str::byte_at(s, at + 1) == 75 && std::str::byte_at(s, at + 2) == third && std::str::byte_at(s, at + 3) == fourth
+}
+
+/// The common signatures `PK\1\2`, `PK\3\4`, `PK\5\6`.
+fn signature_at(in s: Str, take at: Int, take kind: Int) -> Bool {
+    magic_at(s, at, kind, kind + 1)
+}
+
+fn slice(in s: Str, take from: Int, take to: Int) -> String {
+    var a = from;
+    var b = to;
+    let n = std::str::len(s);
+    if a < 0 {
+        a = 0;
+    }
+    if b > n {
+        b = n;
+    }
+    if b <= a {
+        return std::string::empty();
+    }
+    std::string::from_str(std::str::slice(s, a, b))
+}
+
+fn refused(in kind: Str, in message: Str) -> Archive {
+    Archive { ok: false, error_type: std::string::from_str(kind), error: std::string::from_str(message), comment: std::string::empty(), entries: std::array::empty(), start_dir: 0, concat: 0 }
+}
+
+fn bad(in message: Str) -> Archive {
+    refused("BadZipFile", message)
+}
+
+// ----------------------------------------------------------------------------
+// The end record.
+// ----------------------------------------------------------------------------
+
+/// `_EndRecData`: the end record's fields, or `found` false.
+struct End {
+    found: Bool,
+    failed: Bool,
+    error: String,
+    count: Int,
+    size: Int,
+    offset: Int,
+    location: Int,
+    comment: String,
+}
+
+fn no_end() -> End {
+    End { found: false, failed: false, error: std::string::empty(), count: 0, size: 0, offset: 0, location: 0, comment: std::string::empty() }
+}
+
+fn end_failed(in message: Str) -> End {
+    var e = no_end();
+    e.failed = true;
+    e.error = std::string::from_str(message);
+    e
+}
+
+fn end_record(in data: Str) -> End {
+    let n = std::str::len(data);
+    if n < 22 {
+        return no_end();
+    }
+    var at = 0 - 1;
+    var comment = std::string::empty();
+    if signature_at(data, n - 22, 5) && u16(data, n - 2) == 0 {
+        at = n - 22;
+    } else {
+        var start = n - 65535 - 22;
+        if start < 0 {
+            start = 0;
+        }
+        var k = n - 4;
+        while k >= start && at < 0 {
+            if signature_at(data, k, 5) {
+                at = k;
+            }
+            k = k - 1;
+        }
+        if at < 0 || at + 22 > n {
+            return no_end();
+        }
+        comment = slice(data, at + 22, at + 22 + u16(data, at + 20));
+    }
+    var e = End { found: true, failed: false, error: std::string::empty(), count: u16(data, at + 10), size: u32(data, at + 12), offset: u32(data, at + 16), location: at, comment: comment };
+    // `_EndRecData64`: a ZIP64 locator just before the end record.
+    let loc = at - 20;
+    if loc < 0 || !magic_at(data, loc, 6, 7) {
+        return e;
+    }
+    if u32(data, loc + 4) != 0 || u32(data, loc + 16) > 1 {
+        return end_failed("zipfiles that span multiple disks are not supported");
+    }
+    let reloff = u64(data, loc + 8);
+    let expected = loc - 56;
+    if reloff > expected {
+        return end_failed("Corrupt zip64 end of central directory locator");
+    }
+    var rec = reloff;
+    var extrasz = expected - reloff;
+    if !magic_at(data, rec, 6, 6) && reloff != expected {
+        rec = expected;
+        extrasz = 0;
+    }
+    if !magic_at(data, rec, 6, 6) || rec + 56 > std::str::len(data) {
+        return end_failed("Zip64 end of central directory record not found");
+    }
+    let sz = u64(data, rec + 4);
+    let dirsize = u64(data, rec + 40);
+    let diroffset = u64(data, rec + 48);
+    if diroffset + dirsize != reloff || sz + 12 != 56 + extrasz {
+        return end_failed("Corrupt zip64 end of central directory record");
+    }
+    e.count = u64(data, rec + 32);
+    e.size = dirsize;
+    e.offset = diroffset;
+    e.location = expected - extrasz;
+    e
+}
+
+// ----------------------------------------------------------------------------
+// The central directory.
+// ----------------------------------------------------------------------------
+
+/// A raw name, decoded by its flag bits; the error is CPython's.
+fn decode_name(in raw: Str, take flags: Int) -> zip::text::Decoded {
+    if (flags / 2048) % 2 == 1 {
+        return zip::text::utf8(raw);
+    }
+    zip::text::Decoded { ok: true, text: zip::text::cp437(raw), error: std::string::empty() }
+}
+
+/// `_sanitize_filename`: cut at the first NUL.
+fn sanitize(in name: Str) -> String {
+    var i = 0;
+    while i < std::str::len(name) {
+        if std::str::byte_at(name, i) == 0 {
+            return std::string::from_str(std::str::slice(name, 0, i));
+        }
+        i = i + 1;
+    }
+    std::string::from_str(name)
+}
+
+/// `_decodeExtra`, applied to `e`; empty, or the `BadZipFile` message.
+fn decode_extra(mut e: Entry, take name_crc: Int) -> String {
+    let extra = std::string::from_str(std::string::as_str(e.extra));
+    let x = std::string::as_str(extra);
+    let n = std::str::len(x);
+    var at = 0;
+    while n - at >= 4 {
+        let tp = u16(x, at);
+        let ln = u16(x, at + 2);
+        if ln + 4 > n - at {
+            var m = std::string::from_str("Corrupt extra field ");
+            let digits = "0123456789abcdef";
+            var shift = 4096;
+            while shift > 0 {
+                std::string::push_byte(m, std::str::byte_at(digits, (tp / shift) % 16));
+                shift = shift / 16;
+            }
+            std::str::push(m, " (size=");
+            std::str::push_int(m, ln);
+            std::str::push(m, ")");
+            return m;
+        }
+        let body = at + 4;
+        let stop = at + 4 + ln;
+        if tp == 1 {
+            var p = body;
+            if e.file_size == 4294967295 {
+                if p + 8 > stop {
+                    return std::string::from_str("Corrupt zip64 extra field. File size not found.");
+                }
+                e.file_size = u64(x, p);
+                p = p + 8;
+            }
+            if e.compress_size == 4294967295 {
+                if p + 8 > stop {
+                    return std::string::from_str("Corrupt zip64 extra field. Compress size not found.");
+                }
+                e.compress_size = u64(x, p);
+                p = p + 8;
+            }
+            if e.header_offset == 4294967295 {
+                if p + 8 > stop {
+                    return std::string::from_str("Corrupt zip64 extra field. Header offset not found.");
+                }
+                e.header_offset = u64(x, p);
+            }
+        } else if tp == 28789 {
+            if ln < 5 {
+                return std::string::from_str("Corrupt unicode path extra field (0x7075)");
+            }
+            if std::str::byte_at(x, body) == 1 && u32(x, body + 1) == name_crc {
+                let d = zip::text::utf8(std::str::slice(x, body + 5, stop));
+                if !d.ok {
+                    return std::string::from_str("Corrupt unicode path extra field (0x7075): invalid utf-8 bytes");
+                }
+                if std::string::len(d.text) > 0 {
+                    e.filename = sanitize(std::string::as_str(d.text));
+                }
+            }
+        }
+        at = stop;
+    }
+    std::string::empty()
+}
+
+/// Open the archive `data`: `zipfile.ZipFile`.
+///
+/// # Example
+/// ```tuo
+/// let a = zip::archive::open(bytes);
+/// ```
+pub fn open(in data: Str) -> Archive {
+    let end = end_record(data);
+    if end.failed {
+        return bad(std::string::as_str(end.error));
+    }
+    if !end.found {
+        return bad("File is not a zip file");
+    }
+    let concat = end.location - end.size - end.offset;
+    let start_dir = end.offset + concat;
+    if start_dir < 0 {
+        return bad("Bad offset for central directory");
+    }
+    let cd = slice(data, start_dir, start_dir + end.size);
+    let c = std::string::as_str(cd);
+    let size = std::str::len(c);
+    var entries = std::array::empty();
+    var total = 0;
+    while total < end.size {
+        if total + 46 > size {
+            return bad("Truncated central directory");
+        }
+        if !signature_at(c, total, 1) {
+            return bad("Bad magic number for central directory");
+        }
+        let name_len = u16(c, total + 28);
+        let extra_len = u16(c, total + 30);
+        let comment_len = u16(c, total + 32);
+        let raw_name = slice(c, total + 46, total + 46 + name_len);
+        let flags = u16(c, total + 8);
+        let decoded = decode_name(std::string::as_str(raw_name), flags);
+        if !decoded.ok {
+            return refused("UnicodeDecodeError", std::string::as_str(decoded.error));
+        }
+        let extra_from = total + 46 + name_len;
+        var e = Entry { filename: sanitize(std::string::as_str(decoded.text)), orig_filename: std::string::from_str(std::string::as_str(decoded.text)), create_version: std::str::byte_at(c, total + 4), create_system: std::str::byte_at(c, total + 5), extract_version: std::str::byte_at(c, total + 6), flag_bits: flags, compress_type: u16(c, total + 10), raw_time: u16(c, total + 12), raw_date: u16(c, total + 14), crc: u32(c, total + 16), compress_size: u32(c, total + 20), file_size: u32(c, total + 24), header_offset: u32(c, total + 42), end_offset: 0, comment: slice(c, extra_from + extra_len, extra_from + extra_len + comment_len), extra: slice(c, extra_from, extra_from + extra_len) };
+        if e.extract_version > 63 {
+            var m = std::string::from_str("zip file version ");
+            std::str::push_int(m, e.extract_version / 10);
+            std::str::push(m, ".");
+            std::str::push_int(m, e.extract_version % 10);
+            return refused("NotImplementedError", std::string::as_str(m));
+        }
+        let problem = decode_extra(e, inflate::zlib::crc32(std::string::as_str(raw_name)));
+        if std::string::len(problem) > 0 {
+            return bad(std::string::as_str(problem));
+        }
+        e.header_offset = e.header_offset + concat;
+        std::array::push(entries, e);
+        total = total + 46 + name_len + extra_len + comment_len;
+    }
+    // Each entry ends where the next header (by offset) begins; the last
+    // where the central directory does. Ties keep directory order, as
+    // Python's stable sort does, and the later of two entries sharing a
+    // header ends where the earlier's header begins.
+    let count = std::array::len(entries);
+    var order = std::array::empty();
+    var i = 0;
+    while i < count {
+        std::array::push(order, i);
+        i = i + 1;
+    }
+    i = 1;
+    while i < count {
+        let key = std::array::get(order, i);
+        let offset = std::array::get(entries, key).header_offset;
+        var j = i - 1;
+        while j >= 0 && std::array::get(entries, std::array::get(order, j)).header_offset > offset {
+            std::array::set(order, j + 1, std::array::get(order, j));
+            j = j - 1;
+        }
+        std::array::set(order, j + 1, key);
+        i = i + 1;
+    }
+    var end_offset = start_dir;
+    i = count - 1;
+    while i >= 0 {
+        let k = std::array::get(order, i);
+        var e = std::array::get(entries, k);
+        e.end_offset = end_offset;
+        end_offset = e.header_offset;
+        std::array::set(entries, k, e);
+        i = i - 1;
+    }
+    Archive { ok: true, error_type: std::string::empty(), error: std::string::empty(), comment: std::string::from_str(std::string::as_str(end.comment)), entries: entries, start_dir: start_dir, concat: concat }
+}
+
+/// How many entries `a` holds: `len(zf.infolist())`.
+///
+/// # Example
+/// ```tuo
+/// let n = zip::archive::count(a);
+/// ```
+pub fn count(in a: Archive) -> Int {
+    std::array::len(a.entries)
+}
+
+/// Entry `i`.
+///
+/// # Example
+/// ```tuo
+/// let e = zip::archive::entry(a, 0);
+/// ```
+pub fn entry(in a: Archive, take i: Int) -> Entry {
+    std::array::get(a.entries, i)
+}
+
+/// Whether entry `e` is a directory: its name ends with `/`.
+///
+/// # Example
+/// ```tuo
+/// let d = zip::archive::is_dir(zip::archive::entry(a, 1));
+/// ```
+pub fn is_dir(in e: Entry) -> Bool {
+    std::str::ends_with(std::string::as_str(e.filename), "/")
+}
+
+/// The entry `zf.getinfo(name)` returns — the last of that name — or -1.
+///
+/// # Example
+/// ```tuo
+/// let i = zip::archive::find(a, "docs/notes.txt");
+/// ```
+pub fn find(in a: Archive, in name: Str) -> Int {
+    var i = count(a) - 1;
+    while i >= 0 {
+        if std::string::as_str(std::array::get(a.entries, i).filename) == name {
+            return i;
+        }
+        i = i - 1;
+    }
+    0 - 1
+}
+
+// ----------------------------------------------------------------------------
+// Reading.
+// ----------------------------------------------------------------------------
+
+fn failed_read(in kind: Str, in message: Str) -> Read {
+    Read { ok: false, data: std::string::empty(), error_type: std::string::from_str(kind), error: std::string::from_str(message) }
+}
+
+fn quoted(in before: Str, in name: Str, in after: Str) -> String {
+    var m = std::string::from_str(before);
+    std::str::push(m, std::string::as_str(zip::text::repr(name)));
+    std::str::push(m, after);
+    m
+}
+
+/// Read entry `index` of `a` from `data`, reporting it as `name` — the
+/// name `zf.read` was called with.
+///
+/// # Example
+/// ```tuo
+/// let r = zip::archive::read_entry(a, bytes, 0, "readme.txt");
+/// ```
+pub fn read_entry(in a: Archive, in data: Str, take index: Int, in name: Str) -> Read {
+    let e = std::array::get(a.entries, index);
+    let n = std::str::len(data);
+    let at = e.header_offset;
+    if at - a.concat > wide() {
+        return failed_read("ValueError", "cannot fit 'int' into an offset-sized integer");
+    }
+    if at < 0 {
+        return failed_read("OSError", "[Errno 22] Invalid argument");
+    }
+    if at + 30 > n {
+        return failed_read("BadZipFile", "Truncated file header");
+    }
+    if !signature_at(data, at, 3) {
+        return failed_read("BadZipFile", "Bad magic number for file header");
+    }
+    let local_flags = u16(data, at + 6);
+    let name_len = u16(data, at + 26);
+    let extra_len = u16(data, at + 28);
+    let fname = slice(data, at + 30, at + 30 + name_len);
+    if (e.flag_bits / 32) % 2 == 1 {
+        return failed_read("NotImplementedError", "compressed patched data (flag bit 5)");
+    }
+    if (e.flag_bits / 64) % 2 == 1 {
+        return failed_read("NotImplementedError", "strong encryption (flag bit 6)");
+    }
+    let local = decode_name(std::string::as_str(fname), local_flags);
+    if !local.ok {
+        return failed_read("UnicodeDecodeError", std::string::as_str(local.error));
+    }
+    if std::string::as_str(local.text) != std::string::as_str(e.orig_filename) {
+        var m = std::string::from_str("File name in directory ");
+        std::str::push(m, std::string::as_str(zip::text::repr(std::string::as_str(e.orig_filename))));
+        std::str::push(m, " and header ");
+        std::str::push(m, std::string::as_str(zip::text::bytes_repr(std::string::as_str(fname))));
+        std::str::push(m, " differ.");
+        return failed_read("BadZipFile", std::string::as_str(m));
+    }
+    let start = at + 30 + name_len + extra_len;
+    if start + e.compress_size > e.end_offset && e.end_offset != e.header_offset {
+        return failed_read("BadZipFile", std::string::as_str(quoted("Overlapped entries: ", std::string::as_str(e.orig_filename), " (possible zip bomb)")));
+    }
+    if e.flag_bits % 2 == 1 {
+        return failed_read("RuntimeError", std::string::as_str(quoted("File ", name, " is encrypted, password required for extraction")));
+    }
+    if e.compress_type != 0 && e.compress_type != 8 {
+        if e.compress_type == 12 || e.compress_type == 14 || e.compress_type == 93 {
+            return failed_read("NotImplementedError", "bzip2, LZMA, and Zstandard members are not ported");
+        }
+        return failed_read("NotImplementedError", "That compression method is not supported");
+    }
+    let compressed = slice(data, start, start + e.compress_size);
+    let complete = std::string::len(compressed) == e.compress_size;
+    var out = std::string::empty();
+    var produced = 0;
+    var finished = complete;
+    if e.compress_type == 0 {
+        out = slice(std::string::as_str(compressed), 0, e.file_size);
+        produced = std::string::len(compressed);
+    } else {
+        // zipfile inflates in chunks of up to 2^31 - 1 bytes of output and
+        // stops after the chunk that reaches the entry's size, so an error
+        // in a stream that runs on past its size is still seen within that
+        // chunk. Only the size's worth is kept; the rest costs a window.
+        let chunk = 2147483647;
+        var stop = chunk;
+        if e.file_size > 0 {
+            stop = (e.file_size + chunk - 1) / chunk * chunk;
+        }
+        let got = inflate::raw::decompress_bounded(std::string::as_str(compressed), 0, e.file_size, stop);
+        if got.status == inflate::raw::status_data_error() {
+            return failed_read("error", std::string::as_str(inflate::raw::error_text(got)));
+        }
+        if got.status == 0 && !got.paused {
+            finished = true;
+        }
+        produced = got.total;
+        out = got.data;
+    }
+    if produced >= e.file_size {
+        finished = true;
+    }
+    if !finished {
+        return failed_read("EOFError", "");
+    }
+    if inflate::zlib::crc32(std::string::as_str(out)) != e.crc {
+        return failed_read("BadZipFile", std::string::as_str(quoted("Bad CRC-32 for file ", std::string::as_str(e.filename), "")));
+    }
+    Read { ok: true, data: out, error_type: std::string::empty(), error: std::string::empty() }
+}
+
+/// `zf.read(name)`.
+///
+/// # Example
+/// ```tuo
+/// let r = zip::archive::read(a, bytes, "docs/notes.txt");
+/// ```
+pub fn read(in a: Archive, in data: Str, in name: Str) -> Read {
+    let i = find(a, name);
+    if i < 0 {
+        let inner = quoted("There is no item named ", name, " in the archive");
+        return failed_read("KeyError", std::string::as_str(zip::text::repr(std::string::as_str(inner))));
+    }
+    read_entry(a, data, i, name)
+}
+
+spec "fields are little-endian" {
+    then u16("\u{1}\u{2}", 0) == 513;
+    then u32("\u{1}\u{0}\u{0}\u{1}", 0) == 16777217;
+}

@@ -1,0 +1,133 @@
+// inflate::zlib — `zlib.decompress(data, wbits)`.
+//
+// A negative `wbits` is a raw deflate stream (`zipfile` uses -15). A
+// positive one is the zlib format of RFC 1950 around it: a two-byte
+// header — compression method 8, a window size of at most `wbits`, a
+// check that the pair is a multiple of 31, and a flag for a preset
+// dictionary — then the stream, then the Adler-32 of the output, big
+// endian. zlib checks the header in that order (`incorrect header
+// check`, `unknown compression method`, `invalid window size`), stops at a
+// preset dictionary with its `Z_NEED_DICT` (status 2, which CPython
+// reports with no message), and compares the checksum last (`incorrect
+// data check`). Anything after the stream, or after the checksum, is
+// ignored, as `zlib.decompress` ignores it.
+
+module inflate::zlib;
+
+/// Adler-32 of `data` (RFC 1950 §8.2).
+///
+/// # Example
+/// ```tuo
+/// let a = inflate::zlib::adler32("Wikipedia"); // 0x11E60398
+/// ```
+pub fn adler32(in data: Str) -> Int {
+    var a = 1;
+    var b = 0;
+    var i = 0;
+    while i < std::str::len(data) {
+        a = (a + std::str::byte_at(data, i)) % 65521;
+        b = (b + a) % 65521;
+        i = i + 1;
+    }
+    b * 65536 + a
+}
+
+/// CRC-32 of `data` (ISO 3309, as `zlib.crc32` and zip archives compute
+/// it): the reflected polynomial 0xEDB88320, inverted before and after.
+///
+/// # Example
+/// ```tuo
+/// let c = inflate::zlib::crc32("123456789"); // 0xCBF43926
+/// ```
+pub fn crc32(in data: Str) -> Int {
+    var table = std::array::empty();
+    var n = 0;
+    while n < 256 {
+        var c = n;
+        var k = 0;
+        while k < 8 {
+            if c % 2 == 1 {
+                c = 3988292384 ^ (c / 2);
+            } else {
+                c = c / 2;
+            }
+            k = k + 1;
+        }
+        std::array::push(table, c);
+        n = n + 1;
+    }
+    var c = 4294967295;
+    var i = 0;
+    while i < std::str::len(data) {
+        c = std::array::get(table, (c ^ std::str::byte_at(data, i)) % 256) ^ (c / 256);
+        i = i + 1;
+    }
+    c ^ 4294967295
+}
+
+fn failure(take status: Int, in message: Str, take end: Int) -> inflate::raw::Inflated {
+    inflate::raw::Inflated { status: status, message: std::string::from_str(message), data: std::string::empty(), total: 0, paused: false, end: end }
+}
+
+/// `zlib.decompress(src, wbits)`: a raw stream for negative `wbits`,
+/// zlib-wrapped for positive.
+///
+/// # Example
+/// ```tuo
+/// let got = inflate::zlib::decompress(data, 15);
+/// ```
+pub fn decompress(in src: Str, take wbits: Int) -> inflate::raw::Inflated {
+    if wbits < 0 {
+        return inflate::raw::decompress(src, 0);
+    }
+    let n = std::str::len(src);
+    if n < 2 {
+        return failure(inflate::raw::status_truncated(), "", n);
+    }
+    let cmf = std::str::byte_at(src, 0);
+    let flg = std::str::byte_at(src, 1);
+    if (cmf * 256 + flg) % 31 != 0 {
+        return failure(inflate::raw::status_data_error(), "incorrect header check", 0);
+    }
+    if cmf % 16 != 8 {
+        return failure(inflate::raw::status_data_error(), "unknown compression method", 0);
+    }
+    let window = cmf / 16 + 8;
+    if window > 15 || window > wbits {
+        return failure(inflate::raw::status_data_error(), "invalid window size", 0);
+    }
+    if (flg / 32) % 2 == 1 {
+        if n < 6 {
+            return failure(inflate::raw::status_truncated(), "", n);
+        }
+        return failure(2, "", 6);
+    }
+    var got = inflate::raw::decompress(src, 2);
+    if got.status != 0 {
+        return got;
+    }
+    if got.end + 4 > n {
+        return failure(inflate::raw::status_truncated(), "", n);
+    }
+    var sum = 0;
+    var i = 0;
+    while i < 4 {
+        sum = sum * 256 + std::str::byte_at(src, got.end + i);
+        i = i + 1;
+    }
+    if sum != adler32(std::string::as_str(got.data)) {
+        return failure(inflate::raw::status_data_error(), "incorrect data check", got.end);
+    }
+    got.end = got.end + 4;
+    got
+}
+
+spec crc32 {
+    then crc32("123456789") == 3421780262;
+    then crc32("") == 0;
+}
+
+spec adler32 {
+    then adler32("Wikipedia") == 300286872;
+    then adler32("") == 1;
+}

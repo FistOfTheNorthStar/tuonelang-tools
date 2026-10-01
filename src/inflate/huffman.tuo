@@ -1,0 +1,331 @@
+// inflate::huffman — canonical Huffman codes, as zlib accepts them.
+//
+// A deflate block describes each code by the bit length of every symbol's
+// code (RFC 1951 §3.2.2); the codes themselves follow from the lengths.
+// A code is kept here as `puff` keeps it — how many codes there are of
+// each length, and the symbols in canonical order — and decoded a bit at
+// a time: codes of one length are consecutive integers, so a prefix read
+// so far either falls in the run of that length or moves on to the next.
+//
+// Which sets of lengths a block may send is zlib's `inflate_table`: an
+// over-subscribed set is always refused; an incomplete one is refused for
+// the code-length code, and for the literal/length and distance codes
+// unless it is a single code of one bit; a set with no codes at all is
+// accepted, and every attempt to decode with it reads one bit and finds
+// no symbol. Decoding a bit pattern an incomplete code leaves unassigned
+// reads as many bits as the longest code and finds no symbol too.
+
+module inflate::huffman;
+
+/// A code: `counts[n]` codes of length `n` (1 to 15), `symbols` in
+/// canonical order, the longest length (0 for no codes), and `fast`: for
+/// each of the 512 ways the next nine bits of input can fall, `(symbol + 1)
+/// * 16 + length` when they begin with a code of at most nine bits, else 0.
+pub struct Code {
+    counts: Array[Int],
+    symbols: Array[Int],
+    longest: Int,
+    fast: Array[Int],
+}
+
+/// How many bits `fast` looks up at once.
+///
+/// # Example
+/// ```tuo
+/// let n = inflate::huffman::fast_bits(); // 9
+/// ```
+pub fn fast_bits() -> Int {
+    9
+}
+
+/// The lookup table for a code: every code of at most `fast_bits` bits,
+/// bit-reversed (the stream carries codes most significant bit first, and
+/// bits are read least significant first), under every way the bits after
+/// it can fall.
+fn fast_table(in counts: Array[Int], in symbols: Array[Int], take longest: Int) -> Array[Int] {
+    var table = std::array::empty();
+    var i = 0;
+    while i < 512 {
+        std::array::push(table, 0);
+        i = i + 1;
+    }
+    var code = 0;
+    var index = 0;
+    var len = 1;
+    while len <= fast_bits() && len <= longest {
+        let count = std::array::get(counts, len);
+        var k = 0;
+        while k < count {
+            let sym = std::array::get(symbols, index + k);
+            let c = code + k;
+            var rev = 0;
+            var b = 0;
+            while b < len {
+                rev = rev * 2 + (c >> b) % 2;
+                b = b + 1;
+            }
+            let step = 1 << len;
+            var at = rev;
+            while at < 512 {
+                std::array::set(table, at, (sym + 1) * 16 + len);
+                at = at + step;
+            }
+            k = k + 1;
+        }
+        index = index + count;
+        code = (code + count) * 2;
+        len = len + 1;
+    }
+    table
+}
+
+/// The code-length code, which may not be incomplete.
+///
+/// # Example
+/// ```tuo
+/// let k = inflate::huffman::kind_code_lengths(); // 0
+/// ```
+pub fn kind_code_lengths() -> Int {
+    0
+}
+
+/// A literal/length or distance code, which may be a lone one-bit code.
+///
+/// # Example
+/// ```tuo
+/// let k = inflate::huffman::kind_symbols(); // 1
+/// ```
+pub fn kind_symbols() -> Int {
+    1
+}
+
+/// What `decode` returns for a pattern that names no symbol.
+///
+/// # Example
+/// ```tuo
+/// let none = inflate::huffman::no_symbol(); // -1
+/// ```
+pub fn no_symbol() -> Int {
+    0 - 1
+}
+
+/// Whether `lengths[from..from + n]` make a code zlib accepts as `kind`.
+///
+/// # Example
+/// ```tuo
+/// let ok = inflate::huffman::acceptable(lengths, 0, 288, inflate::huffman::kind_symbols());
+/// ```
+pub fn acceptable(in lengths: Array[Int], take from: Int, take n: Int, take kind: Int) -> Bool {
+    var counts = std::array::empty();
+    var k = 0;
+    while k < 16 {
+        std::array::push(counts, 0);
+        k = k + 1;
+    }
+    var i = 0;
+    while i < n {
+        let len = std::array::get(lengths, from + i);
+        std::array::set(counts, len, std::array::get(counts, len) + 1);
+        i = i + 1;
+    }
+    var longest = 15;
+    while longest >= 1 && std::array::get(counts, longest) == 0 {
+        longest = longest - 1;
+    }
+    if longest == 0 {
+        return true;
+    }
+    var left = 1;
+    var len = 1;
+    while len <= 15 {
+        left = left * 2 - std::array::get(counts, len);
+        if left < 0 {
+            return false;
+        }
+        len = len + 1;
+    }
+    !(left > 0 && (kind == kind_code_lengths() || longest != 1))
+}
+
+/// The code `lengths[from..from + n]` describe. Check `acceptable` first.
+///
+/// # Example
+/// ```tuo
+/// let c = inflate::huffman::build(lengths, 0, 288);
+/// ```
+pub fn build(in lengths: Array[Int], take from: Int, take n: Int) -> Code {
+    var counts = std::array::empty();
+    var k = 0;
+    while k < 16 {
+        std::array::push(counts, 0);
+        k = k + 1;
+    }
+    var i = 0;
+    while i < n {
+        let len = std::array::get(lengths, from + i);
+        std::array::set(counts, len, std::array::get(counts, len) + 1);
+        i = i + 1;
+    }
+    std::array::set(counts, 0, 0);
+    var longest = 15;
+    while longest >= 1 && std::array::get(counts, longest) == 0 {
+        longest = longest - 1;
+    }
+    // Where each length's symbols start in canonical order.
+    var offsets = std::array::empty();
+    std::array::push(offsets, 0);
+    std::array::push(offsets, 0);
+    var len = 1;
+    while len < 15 {
+        std::array::push(offsets, std::array::get(offsets, len) + std::array::get(counts, len));
+        len = len + 1;
+    }
+    var symbols = std::array::empty();
+    i = 0;
+    while i < n {
+        std::array::push(symbols, 0);
+        i = i + 1;
+    }
+    i = 0;
+    while i < n {
+        let l = std::array::get(lengths, from + i);
+        if l != 0 {
+            let at = std::array::get(offsets, l);
+            std::array::set(symbols, at, i);
+            std::array::set(offsets, l, at + 1);
+        }
+        i = i + 1;
+    }
+    let fast = fast_table(counts, symbols, longest);
+    Code { counts: counts, symbols: symbols, longest: longest, fast: fast }
+}
+
+/// The fixed literal/length code of RFC 1951 §3.2.6, all 288 symbols.
+///
+/// # Example
+/// ```tuo
+/// let c = inflate::huffman::fixed_literals();
+/// ```
+pub fn fixed_literals() -> Code {
+    var lengths = std::array::empty();
+    var i = 0;
+    while i < 288 {
+        if i < 144 {
+            std::array::push(lengths, 8);
+        } else if i < 256 {
+            std::array::push(lengths, 9);
+        } else if i < 280 {
+            std::array::push(lengths, 7);
+        } else {
+            std::array::push(lengths, 8);
+        }
+        i = i + 1;
+    }
+    build(lengths, 0, 288)
+}
+
+/// The fixed distance code: 32 five-bit codes.
+///
+/// # Example
+/// ```tuo
+/// let c = inflate::huffman::fixed_distances();
+/// ```
+pub fn fixed_distances() -> Code {
+    var lengths = std::array::empty();
+    var i = 0;
+    while i < 32 {
+        std::array::push(lengths, 5);
+        i = i + 1;
+    }
+    build(lengths, 0, 32)
+}
+
+/// The step of a bit-at-a-time decode: after reading `bits` bits spelling
+/// `code`, with `first` the first code and `index` the first symbol of
+/// length `bits`, the symbol when the prefix is a whole code, `-2` to
+/// read another bit, or `no_symbol`.
+///
+/// # Example
+/// ```tuo
+/// let s = inflate::huffman::step(c, 1, 0, 0, 0);
+/// ```
+pub fn step(in c: Code, take bits: Int, take code: Int, take first: Int, take index: Int) -> Int {
+    let count = std::array::get(c.counts, bits);
+    if code < first + count {
+        return std::array::get(c.symbols, index + code - first);
+    }
+    if bits >= c.longest {
+        return no_symbol();
+    }
+    0 - 2
+}
+
+// ----------------------------------------------------------------------------
+// Specs.
+// ----------------------------------------------------------------------------
+
+fn lengths_of(in text: Str) -> Array[Int] {
+    var out = std::array::empty();
+    var i = 0;
+    while i < std::str::len(text) {
+        std::array::push(out, std::str::byte_at(text, i) - 48);
+        i = i + 1;
+    }
+    out
+}
+
+fn ok(in text: Str, take kind: Int) -> Bool {
+    let l = lengths_of(text);
+    acceptable(l, 0, std::array::len(l), kind)
+}
+
+spec acceptable {
+    // RFC 1951's example: A–H with lengths 3 3 3 3 3 2 4 4.
+    then ok("33333244", kind_symbols());
+    then ok("33333244", kind_code_lengths());
+    // Over-subscribed is never accepted.
+    then !ok("111", kind_symbols());
+    // Incomplete: only a lone one-bit literal or distance code.
+    then ok("1", kind_symbols());
+    then ok("0010", kind_symbols());
+    then !ok("1", kind_code_lengths());
+    then !ok("22", kind_symbols());
+    // No codes at all is accepted.
+    then ok("000", kind_symbols());
+    then ok("000", kind_code_lengths());
+}
+
+spec build {
+    // A=010 … E=110, F=00, G=1110, H=1111 (RFC 1951 §3.2.2).
+    then std::array::get(build(lengths_of("33333244"), 0, 8).symbols, 0) == 5;
+    then std::array::get(build(lengths_of("33333244"), 0, 8).symbols, 1) == 0;
+    then std::array::get(build(lengths_of("33333244"), 0, 8).symbols, 7) == 7;
+    then build(lengths_of("33333244"), 0, 8).longest == 4;
+    then std::array::get(build(lengths_of("33333244"), 0, 8).counts, 3) == 5;
+    then fixed_literals().longest == 9;
+    then fixed_distances().longest == 5;
+}
+
+spec fast_table {
+    // F is 00 (two bits, 0 reversed is 0): every ninth-bit pattern ending
+    // in 00 — indices 0, 4, 8, … — names F with length 2.
+    then std::array::get(build(lengths_of("33333244"), 0, 8).fast, 0) == 6 * 16 + 2;
+    then std::array::get(build(lengths_of("33333244"), 0, 8).fast, 508) == 6 * 16 + 2;
+    // A is 010: read least significant first that is 0, 1, 0 — index 2.
+    then std::array::get(build(lengths_of("33333244"), 0, 8).fast, 2) == 1 * 16 + 3;
+    // G is 1110, reversed 0111 = 7.
+    then std::array::get(build(lengths_of("33333244"), 0, 8).fast, 7) == 7 * 16 + 4;
+    // A lone one-bit code leaves the other pattern unassigned.
+    then std::array::get(build(lengths_of("1"), 0, 1).fast, 1) == 0;
+    then std::array::get(build(lengths_of("1"), 0, 1).fast, 0) == 1 * 16 + 1;
+    // Fixed literal 0 is 00110000 (eight bits).
+    then std::array::get(fixed_literals().fast, 12) == 1 * 16 + 8;
+}
+
+spec step {
+    // F is 00: after two bits spelling 0, the first code of length 2.
+    then step(build(lengths_of("33333244"), 0, 8), 2, 0, 0, 0) == 5;
+    // A lone code: bit 1 names nothing, and there is no longer code.
+    then step(build(lengths_of("1"), 0, 1), 1, 1, 0, 0) == no_symbol();
+    then step(build(lengths_of("1"), 0, 1), 1, 0, 0, 0) == 0;
+}

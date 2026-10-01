@@ -1,0 +1,291 @@
+// ratelimit::memory — `limits`' MemoryStorage and the fixed window on it.
+//
+// `MemoryStorage` keeps a counter and an expiry time per key. Reading a
+// key whose expiry has come (at or before now) forgets it first, so an
+// expired window reads as zero; incrementing reads first, adds, and when
+// the counter then equals what was just added — a window that was empty,
+// or had been opened by a hit of cost zero — sets its expiry to now plus
+// the window's length. The window therefore starts at its first hit, not
+// on a clock boundary, and a hit that fails still counts: the counter
+// runs past the amount until the window closes.
+//
+// `expiry_of` does not forget an expired key, just as `get_expiry` does
+// not; `limits` also sweeps expired keys from a background timer, which
+// can only be observed by asking for an expiry without reading the key
+// first — the strategy never does. Times are milliseconds since the
+// epoch, passed in: the runtime has no wall clock.
+//
+// `hit`, `test`, `stats`, and `clear` are `FixedWindowRateLimiter`'s four
+// calls, taking the key `ratelimit::item::key_for` built.
+
+module ratelimit::memory;
+
+/// The counters: keys, their counts, and when each window closes.
+pub struct Store {
+    keys: Array[String],
+    counts: Array[Int],
+    expirations: Array[Int],
+}
+
+/// An empty store.
+///
+/// # Example
+/// ```tuo
+/// var s = ratelimit::memory::new();
+/// ```
+pub fn new() -> Store {
+    Store { keys: std::array::empty(), counts: std::array::empty(), expirations: std::array::empty() }
+}
+
+/// How many keys the store holds, expired ones included until read.
+///
+/// # Example
+/// ```tuo
+/// let n = ratelimit::memory::size(ratelimit::memory::new()); // 0
+/// ```
+pub fn size(in s: Store) -> Int {
+    std::array::len(s.keys)
+}
+
+fn index_of(in s: Store, in key: Str) -> Int {
+    var i = 0;
+    while i < std::array::len(s.keys) {
+        if std::string::as_str(std::array::get(s.keys, i)) == key {
+            return i;
+        }
+        i = i + 1;
+    }
+    0 - 1
+}
+
+/// Drop entry `i` by moving the last entry into its place.
+fn remove(mut s: Store, take i: Int) {
+    let last = std::array::len(s.keys) - 1;
+    if i != last {
+        std::array::set(s.keys, i, std::string::from_str(std::string::as_str(std::array::get(s.keys, last))));
+        std::array::set(s.counts, i, std::array::get(s.counts, last));
+        std::array::set(s.expirations, i, std::array::get(s.expirations, last));
+    }
+    let _ = std::array::pop(s.keys);
+    let _ = std::array::pop(s.counts);
+    let _ = std::array::pop(s.expirations);
+}
+
+/// The count of `key` at `now`, forgetting it first if its window has
+/// closed: `get`.
+///
+/// # Example
+/// ```tuo
+/// let n = ratelimit::memory::get(s, "LIMITER/a/5/1/minute", now);
+/// ```
+pub fn get(mut s: Store, in key: Str, take now: Int) -> Int {
+    let i = index_of(s, key);
+    if i < 0 {
+        return 0;
+    }
+    if std::array::get(s.expirations, i) <= now {
+        remove(s, i);
+        return 0;
+    }
+    std::array::get(s.counts, i)
+}
+
+/// Add `amount` to `key` at `now`, opening a window of `expiry` seconds
+/// when the key was empty; the count after: `incr`.
+///
+/// # Example
+/// ```tuo
+/// let n = ratelimit::memory::incr(s, "LIMITER/a/5/1/minute", 60, 1, now);
+/// ```
+pub fn incr(mut s: Store, in key: Str, take expiry: Int, take amount: Int, take now: Int) -> Int {
+    let _ = get(s, key, now);
+    var i = index_of(s, key);
+    if i < 0 {
+        std::array::push(s.keys, std::string::from_str(key));
+        std::array::push(s.counts, 0);
+        std::array::push(s.expirations, 0);
+        i = std::array::len(s.keys) - 1;
+    }
+    let count = std::array::get(s.counts, i) + amount;
+    std::array::set(s.counts, i, count);
+    if count == amount {
+        std::array::set(s.expirations, i, now + expiry * 1000);
+    }
+    count
+}
+
+/// When `key`'s window closes, or `now` when there is none: `get_expiry`.
+///
+/// # Example
+/// ```tuo
+/// let at = ratelimit::memory::expiry_of(s, "LIMITER/a/5/1/minute", now);
+/// ```
+pub fn expiry_of(in s: Store, in key: Str, take now: Int) -> Int {
+    let i = index_of(s, key);
+    if i < 0 {
+        return now;
+    }
+    std::array::get(s.expirations, i)
+}
+
+/// Forget `key`.
+///
+/// # Example
+/// ```tuo
+/// ratelimit::memory::forget(s, "LIMITER/a/5/1/minute");
+/// ```
+pub fn forget(mut s: Store, in key: Str) {
+    let i = index_of(s, key);
+    if i >= 0 {
+        remove(s, i);
+    }
+}
+
+// ----------------------------------------------------------------------------
+// The fixed window.
+// ----------------------------------------------------------------------------
+
+/// Spend `cost` of `it` under `key` at `now`; whether it fit: `hit`.
+///
+/// # Example
+/// ```tuo
+/// let ok = ratelimit::memory::hit(s, it, "LIMITER/a/5/1/minute", 1, now);
+/// ```
+pub fn hit(mut s: Store, in it: ratelimit::item::Item, in key: Str, take cost: Int, take now: Int) -> Bool {
+    ratelimit::item::allows(it, incr(s, key, ratelimit::item::expiry(it), cost, now))
+}
+
+/// Whether `cost` more of `it` would fit under `key` at `now`, spending
+/// nothing: `test`.
+///
+/// # Example
+/// ```tuo
+/// let ok = ratelimit::memory::test(s, it, "LIMITER/a/5/1/minute", 1, now);
+/// ```
+pub fn test(mut s: Store, in it: ratelimit::item::Item, in key: Str, take cost: Int, take now: Int) -> Bool {
+    ratelimit::item::would_allow(it, get(s, key, now), cost)
+}
+
+/// The window of `it` under `key` at `now`: `get_window_stats`.
+///
+/// # Example
+/// ```tuo
+/// let st = ratelimit::memory::stats(s, it, "LIMITER/a/5/1/minute", now);
+/// ```
+pub fn stats(mut s: Store, in it: ratelimit::item::Item, in key: Str, take now: Int) -> ratelimit::item::Stats {
+    let count = get(s, key, now);
+    ratelimit::item::stats(it, count, expiry_of(s, key, now))
+}
+
+/// Close the window of `key`: `clear`.
+///
+/// # Example
+/// ```tuo
+/// ratelimit::memory::clear(s, "LIMITER/a/5/1/minute");
+/// ```
+pub fn clear(mut s: Store, in key: Str) {
+    forget(s, key);
+}
+
+// ----------------------------------------------------------------------------
+// Specs: the captured scripts, replayed.
+// ----------------------------------------------------------------------------
+
+fn bool_text(take b: Bool) -> String {
+    if b {
+        std::string::from_str("true")
+    } else {
+        std::string::from_str("false")
+    }
+}
+
+/// Run fixture call `i` on `s`, in the fixture's terms.
+fn run(mut s: Store, take i: Int) -> String {
+    let it = ratelimit::item::at(ratelimit::item::parse_many(ratelimit::fixture::memory_limit(i)), 0);
+    let key = ratelimit::item::key_for(it, std::str::split(ratelimit::fixture::memory_ids(i), "\n"));
+    let k = std::string::as_str(key);
+    let op = ratelimit::fixture::memory_op(i);
+    let now = ratelimit::fixture::memory_at(i);
+    let cost = ratelimit::fixture::memory_cost(i);
+    if op == "hit" {
+        return bool_text(hit(s, it, k, cost, now));
+    }
+    if op == "test" {
+        return bool_text(test(s, it, k, cost, now));
+    }
+    if op == "stats" {
+        let st = stats(s, it, k, now);
+        var out = std::string::empty();
+        std::str::push_int(out, st.reset);
+        std::str::push(out, ",");
+        std::str::push_int(out, st.remaining);
+        return out;
+    }
+    clear(s, k);
+    std::string::empty()
+}
+
+/// Whether every captured call of script `script` came back as `limits`
+/// returned it.
+///
+/// # Example
+/// ```tuo
+/// let same = ratelimit::memory::script_agrees(0);
+/// ```
+pub fn script_agrees(take script: Int) -> Bool {
+    var s = new();
+    var i = 0;
+    while i < ratelimit::fixture::memory_count() {
+        if ratelimit::fixture::memory_script(i) == script {
+            if std::string::as_str(run(s, i)) != ratelimit::fixture::memory_result(i) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    true
+}
+
+/// A window's life: opened by the first hit, counted, closed on time.
+fn window_lifecycle() -> Bool {
+    var s = new();
+    let first = incr(s, "k", 60, 1, 1000);
+    let second = incr(s, "k", 60, 2, 2000);
+    let closes = expiry_of(s, "k", 5000);
+    let before = get(s, "k", 60999);
+    let at = get(s, "k", 61000);
+    first == 1 && second == 3 && closes == 61000 && before == 3 && at == 0 && size(s) == 0 && expiry_of(s, "k", 70000) == 70000
+}
+
+/// Forgetting one key keeps the others whole.
+fn forget_keeps_others() -> Bool {
+    var s = new();
+    let _ = incr(s, "a", 1, 1, 0);
+    let _ = incr(s, "b", 1, 1, 0);
+    let _ = incr(s, "c", 1, 4, 0);
+    forget(s, "a");
+    let left = size(s);
+    let c = get(s, "c", 10);
+    let a = get(s, "a", 10);
+    left == 2 && c == 4 && a == 0
+}
+
+spec incr {
+    then window_lifecycle();
+}
+
+spec forget {
+    then forget_keeps_others();
+}
+
+spec "every captured MemoryStorage script reproduced" {
+    then script_agrees(0);
+    then script_agrees(1);
+    then script_agrees(2);
+    then script_agrees(3);
+    then script_agrees(4);
+    then script_agrees(5);
+    then script_agrees(6);
+    then script_agrees(7);
+    then script_agrees(8);
+}

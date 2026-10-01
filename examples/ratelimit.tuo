@@ -1,0 +1,128 @@
+// examples/ratelimit — every captured limits and slowapi case, natively.
+//
+// The specs replay the fixture in the interpreter; this program replays
+// all of it again as native code — the 63 `parse_many` strings, the 9
+// MemoryStorage scripts, the 16 RedisStorage calls against the bytes
+// redis-py exchanged with a real server, and the 103 requests through the
+// four slowapi applications — and prints what differs. Native code is
+// where the one class of bug the interpreter cannot see lives (see
+// docs/COMPILER-FINDING-3.md).
+//
+//     tuo run examples/ratelimit.tuo src/ratelimit/*.tuo src/redis/*.tuo src/web/*.tuo src/http/message.tuo src/http/fixture.tuo src/http/url.tuo src/std_str.tuo src/std_bits.tuo src/std_net.tuo
+//
+// No network. One line per check; exit is the failure count.
+
+module ratelimit_check;
+
+fn report(in label: Str, take ok: Bool) -> Int {
+    var line = std::string::empty();
+    if ok {
+        std::str::push(line, "ok    ");
+    } else {
+        std::str::push(line, "FAIL  ");
+    }
+    std::str::push(line, label);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+    if ok {
+        0
+    } else {
+        1
+    }
+}
+
+fn show(in label: Str, in text: Str) {
+    var line = std::string::from_str("      ");
+    std::str::push(line, label);
+    std::str::push(line, ": ");
+    std::str::push(line, text);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+}
+
+fn labelled(in prefix: Str, take n: Int) -> String {
+    var label = std::string::from_str(prefix);
+    std::str::push_int(label, n);
+    label
+}
+
+fn main() -> Int {
+    var failed = 0;
+    var i = 0;
+    var bad = 0;
+    while i < ratelimit::fixture::parse_count() {
+        if !ratelimit::item::parse_agrees(i) {
+            bad = bad + 1;
+            show("differs", ratelimit::fixture::parse_text(i));
+            show("got ", std::string::as_str(ratelimit::item::parse_output(i)));
+        }
+        i = i + 1;
+    }
+    var plabel = labelled("parse_many: ", ratelimit::fixture::parse_count());
+    std::str::push(plabel, " captured strings");
+    failed = failed + report(std::string::as_str(plabel), bad == 0);
+
+    var script = 0;
+    while script < 9 {
+        var label = std::string::from_str("MemoryStorage script ");
+        std::str::push(label, ratelimit::fixture::memory_script_name(first_call_of(script)));
+        failed = failed + report(std::string::as_str(label), ratelimit::memory::script_agrees(script));
+        script = script + 1;
+    }
+
+    i = 0;
+    while i < ratelimit::fixture::redis_count() {
+        var label = std::string::from_str("RedisStorage call ");
+        std::str::push_int(label, i);
+        std::str::push(label, ": ");
+        std::str::push(label, ratelimit::fixture::redis_op(i));
+        failed = failed + report(std::string::as_str(label), ratelimit::redis::call_agrees(i));
+        i = i + 1;
+    }
+
+    var index = 0;
+    while index < 4 {
+        var a = ratelimit::demo::app(index);
+        var label = std::string::from_str("slowapi application ");
+        var count = 0;
+        bad = 0;
+        i = 0;
+        while i < ratelimit::fixture::app_count() {
+            if ratelimit::fixture::app_index(i) == index {
+                if count == 0 {
+                    std::str::push(label, ratelimit::fixture::app_name(i));
+                }
+                count = count + 1;
+                let got = ratelimit::demo::replay(a, i);
+                let want = ratelimit::demo::expected(i);
+                if std::string::as_str(got) != std::string::as_str(want) {
+                    bad = bad + 1;
+                    var what = std::string::from_str(ratelimit::fixture::app_method(i));
+                    std::str::push(what, " ");
+                    std::str::push(what, ratelimit::fixture::app_path(i));
+                    show("differs", std::string::as_str(what));
+                    show("got ", std::string::as_str(got));
+                    show("want", std::string::as_str(want));
+                }
+            }
+            i = i + 1;
+        }
+        std::str::push(label, ": ");
+        std::str::push_int(label, count);
+        std::str::push(label, " captured requests");
+        failed = failed + report(std::string::as_str(label), bad == 0);
+        index = index + 1;
+    }
+    failed
+}
+
+fn first_call_of(take script: Int) -> Int {
+    var i = 0;
+    while i < ratelimit::fixture::memory_count() {
+        if ratelimit::fixture::memory_script(i) == script {
+            return i;
+        }
+        i = i + 1;
+    }
+    0
+}

@@ -1,0 +1,236 @@
+// zip::demo — the captured archives, opened and read again.
+//
+// `examples/zip_oracle.py` opened 54 archives with `zipfile.ZipFile` and
+// read every member; `zip::fixture` holds what it reported. The specs open
+// each archive with `zip::archive::open`, compare the outcome, the archive
+// comment, and every entry's fields, then read every name zipfile read and
+// compare the data or the exception, type and message.
+
+module zip::demo;
+
+fn entry_fields(in e: zip::archive::Entry) -> String {
+    var out = std::string::empty();
+    std::str::push_int(out, e.compress_type);
+    std::str::push(out, "|");
+    std::str::push_int(out, e.flag_bits);
+    std::str::push(out, "|");
+    std::str::push_int(out, e.crc);
+    std::str::push(out, "|");
+    std::str::push_int(out, e.compress_size);
+    std::str::push(out, "|");
+    std::str::push_int(out, e.file_size);
+    std::str::push(out, "|");
+    std::str::push_int(out, e.header_offset);
+    std::str::push(out, "|");
+    std::str::push_int(out, e.raw_date / 512 + 1980);
+    std::str::push(out, ",");
+    std::str::push_int(out, (e.raw_date / 32) % 16);
+    std::str::push(out, ",");
+    std::str::push_int(out, e.raw_date % 32);
+    std::str::push(out, ",");
+    std::str::push_int(out, e.raw_time / 2048);
+    std::str::push(out, ",");
+    std::str::push_int(out, (e.raw_time / 32) % 64);
+    std::str::push(out, ",");
+    std::str::push_int(out, (e.raw_time % 32) * 2);
+    std::str::push(out, "|");
+    std::str::push(out, std::string::as_str(inflate::demo::to_hex(std::string::as_str(e.comment))));
+    std::str::push(out, "|");
+    std::str::push_int(out, std::string::len(e.extra));
+    std::str::push(out, "|");
+    if zip::archive::is_dir(e) {
+        std::str::push(out, "dir");
+    } else {
+        std::str::push(out, "file");
+    }
+    out
+}
+
+/// Archive `k`, opened, in the fixture's terms: the outcome and comment,
+/// then each entry as three lines.
+///
+/// # Example
+/// ```tuo
+/// let out = zip::demo::opened(0);
+/// ```
+pub fn opened(take k: Int) -> String {
+    let bytes = inflate::demo::from_hex(zip::fixture::archive_hex(k));
+    let a = zip::archive::open(std::string::as_str(bytes));
+    var out = std::string::empty();
+    if !a.ok {
+        std::str::push(out, std::string::as_str(a.error_type));
+        std::str::push(out, ": ");
+        std::str::push(out, std::string::as_str(a.error));
+        return out;
+    }
+    std::str::push(out, "ok ");
+    std::str::push(out, std::string::as_str(inflate::demo::to_hex(std::string::as_str(a.comment))));
+    var i = 0;
+    while i < zip::archive::count(a) {
+        let e = zip::archive::entry(a, i);
+        std::str::push(out, "\n");
+        std::str::push(out, std::string::as_str(e.filename));
+        std::str::push(out, "\n");
+        std::str::push(out, std::string::as_str(e.orig_filename));
+        std::str::push(out, "\n");
+        std::str::push(out, std::string::as_str(entry_fields(e)));
+        i = i + 1;
+    }
+    out
+}
+
+/// What zipfile reported on opening archive `k`, in `opened`'s terms.
+///
+/// # Example
+/// ```tuo
+/// let want = zip::demo::expected_open(0);
+/// ```
+pub fn expected_open(take k: Int) -> String {
+    var out = std::string::empty();
+    if !zip::fixture::archive_ok(k) {
+        std::str::push(out, zip::fixture::archive_error_type(k));
+        std::str::push(out, ": ");
+        std::str::push(out, zip::fixture::archive_error(k));
+        return out;
+    }
+    std::str::push(out, "ok ");
+    std::str::push(out, zip::fixture::archive_comment_hex(k));
+    var j = 0;
+    while j < zip::fixture::entry_count() {
+        if zip::fixture::entry_archive(j) == k {
+            std::str::push(out, "\n");
+            std::str::push(out, zip::fixture::entry_filename(j));
+            std::str::push(out, "\n");
+            std::str::push(out, zip::fixture::entry_orig_filename(j));
+            std::str::push(out, "\n");
+            std::str::push(out, zip::fixture::entry_fields(j));
+        }
+        j = j + 1;
+    }
+    out
+}
+
+fn read_text(in r: zip::archive::Read) -> String {
+    var out = std::string::empty();
+    if !r.ok {
+        std::str::push(out, std::string::as_str(r.error_type));
+        std::str::push(out, ": ");
+        std::str::push(out, std::string::as_str(r.error));
+        return out;
+    }
+    let d = std::string::as_str(r.data);
+    std::str::push_int(out, std::str::len(d));
+    std::str::push(out, " ");
+    std::str::push_int(out, inflate::zlib::crc32(d));
+    if std::str::len(d) <= 256 {
+        std::str::push(out, " ");
+        std::str::push(out, std::string::as_str(inflate::demo::to_hex(d)));
+    }
+    out
+}
+
+fn expected_read(take j: Int) -> String {
+    var out = std::string::empty();
+    if !zip::fixture::read_ok(j) {
+        std::str::push(out, zip::fixture::read_error_type(j));
+        std::str::push(out, ": ");
+        std::str::push(out, zip::fixture::read_error(j));
+        return out;
+    }
+    std::str::push_int(out, zip::fixture::read_length(j));
+    std::str::push(out, " ");
+    std::str::push_int(out, zip::fixture::read_crc(j));
+    if zip::fixture::read_length(j) <= 256 {
+        std::str::push(out, " ");
+        std::str::push(out, zip::fixture::read_data_hex(j));
+    }
+    out
+}
+
+/// Every read of archive `k` zipfile made, made again, in the fixture's
+/// terms, one per line.
+///
+/// # Example
+/// ```tuo
+/// let got = zip::demo::reads(0);
+/// ```
+pub fn reads(take k: Int) -> String {
+    let bytes = inflate::demo::from_hex(zip::fixture::archive_hex(k));
+    let b = std::string::as_str(bytes);
+    let a = zip::archive::open(b);
+    var out = std::string::empty();
+    var j = 0;
+    while j < zip::fixture::read_count() {
+        if zip::fixture::read_archive(j) == k {
+            std::str::push(out, std::string::as_str(read_text(zip::archive::read(a, b, zip::fixture::read_name(j)))));
+            std::str::push(out, "\n");
+        }
+        j = j + 1;
+    }
+    out
+}
+
+/// What zipfile's reads of archive `k` returned, in `reads`' terms.
+///
+/// # Example
+/// ```tuo
+/// let want = zip::demo::expected_reads(0);
+/// ```
+pub fn expected_reads(take k: Int) -> String {
+    var out = std::string::empty();
+    var j = 0;
+    while j < zip::fixture::read_count() {
+        if zip::fixture::read_archive(j) == k {
+            std::str::push(out, std::string::as_str(expected_read(j)));
+            std::str::push(out, "\n");
+        }
+        j = j + 1;
+    }
+    out
+}
+
+/// Whether archive `k` opened, listed, and read as zipfile did.
+///
+/// # Example
+/// ```tuo
+/// let same = zip::demo::agrees(0);
+/// ```
+pub fn agrees(take k: Int) -> Bool {
+    if std::string::as_str(opened(k)) != std::string::as_str(expected_open(k)) {
+        return false;
+    }
+    !zip::fixture::archive_ok(k) || std::string::as_str(reads(k)) == std::string::as_str(expected_reads(k))
+}
+
+/// Whether archives `from` to `to` all agree.
+///
+/// # Example
+/// ```tuo
+/// let same = zip::demo::range_agrees(0, 10);
+/// ```
+pub fn range_agrees(take from: Int, take to: Int) -> Bool {
+    var k = from;
+    while k < to && k < zip::fixture::archive_count() {
+        if !agrees(k) {
+            return false;
+        }
+        k = k + 1;
+    }
+    true
+}
+
+spec "archives zipfile wrote: stored and deflated, comments, duplicates, data descriptors" {
+    then range_agrees(0, 4);
+}
+
+spec "archives zipfile wrote: a prepended stub, ZIP64 records, no members" {
+    then range_agrees(4, 8);
+}
+
+spec "archives Info-ZIP zip and macOS ditto wrote" {
+    then range_agrees(8, 11);
+}
+
+spec "cp437 and Unicode path names, NUL, extra fields, and every malformed archive" {
+    then range_agrees(11, zip::fixture::archive_count());
+}

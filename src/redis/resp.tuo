@@ -338,18 +338,18 @@ pub fn parse_node(in raw: Str, take at: Int, take parent: Int, mut nodes: Array[
         push_node(nodes, kind_error(), end - (at + 1), at + 1, parent);
         return end + 2;
     }
-    let number = match line_int(raw, at + 1, end) {
-        Some { value } => value,
-        None => 0 - 2,
+    let parsed = line_int(raw, at + 1, end);
+    let is_number = match parsed {
+        Some { value } => true,
+        None => false,
     };
-    if number == 0 - 2 {
-        // Not a number at all (`-2` cannot be a real length, count, or the
-        // only negative either accepts).
-        if t == 58 {
-            return 0 - 1;
-        }
+    if !is_number {
         return 0 - 1;
     }
+    let number = match parsed {
+        Some { value } => value,
+        None => 0,
+    };
     if t == 58 {
         push_node(nodes, kind_integer(), number, at + 1, parent);
         return end + 2;
@@ -748,6 +748,12 @@ spec parse {
     then root_int(":0\r\n") == 0;
     then root_int(":42\r\n") == 42;
     then root_int(":100\r\n") == 100;
+    // `TTL` of a missing key and of a key without an expiry.
+    then root_kind(":-2\r\n") == kind_integer();
+    then root_int(":-2\r\n") == 0 - 2;
+    then root_int(":-1\r\n") == 0 - 1;
+    // A negative bulk length other than the null's is malformed.
+    then parse("$-2\r\n").status == status_malformed();
     // `GET` of a missing key is null; `GET` of a value is a bulk of that length.
     then root_kind("$-1\r\n") == kind_null();
     then is_null(parse("$-1\r\n"), root());

@@ -1,0 +1,322 @@
+// ratelimit::demo — the captured slowapi applications, again.
+//
+// `examples/ratelimit_oracle.py` put slowapi in front of four FastAPI
+// applications and drove 103 requests through them with a frozen clock:
+// the backend's shape (its five limit strings on routes at its paths,
+// keyed by address, no headers), one exercising the rest of `limit` and
+// `shared_limit` with headers on and a key prefix, one keyed by endpoint,
+// and one disabled. This module declares the same routes on `web::route`
+// and the same limits on `ratelimit::limiter`, answers each request from
+// a `ratelimit::memory::Store`, and the specs hold every status, body,
+// rate-limit header, and `view_rate_limit` with its window stats to what
+// FastAPI and slowapi produced.
+//
+// Endpoint names are `__main__.<function>` because the oracle's endpoints
+// were defined in its `__main__`; the name is the key's scope under
+// `key_style="endpoint"` and otherwise only groups a route's limits.
+
+module ratelimit::demo;
+
+/// One application: its limiter, routes, and store. Slot `i + 1` of the
+/// routes is endpoint `names[i]`, answering `bodies[i]` — or, when that
+/// is empty, echoing its method or path parameter.
+pub struct App {
+    limiter: ratelimit::limiter::Limiter,
+    routes: web::route::Routes,
+    names: Array[String],
+    bodies: Array[String],
+    store: ratelimit::memory::Store,
+}
+
+/// What one request came to: the raw response, the decision, and the
+/// view's window after it.
+pub struct Outcome {
+    raw: String,
+    decision: ratelimit::limiter::Decision,
+    stats: ratelimit::item::Stats,
+}
+
+fn empty_app() -> App {
+    App { limiter: ratelimit::limiter::new(), routes: web::route::new(), names: std::array::empty(), bodies: std::array::empty(), store: ratelimit::memory::new() }
+}
+
+/// Add an endpoint answering `method` at `pattern`; its slot.
+fn endpoint(mut a: App, in method: Str, in pattern: Str, in name: Str, in body: Str) -> Int {
+    std::array::push(a.names, std::string::from_str(name));
+    std::array::push(a.bodies, std::string::from_str(body));
+    let slot = std::array::len(a.names);
+    web::route::add(a.routes, method, pattern, slot);
+    slot
+}
+
+fn backend() -> App {
+    var a = empty_app();
+    let _ = endpoint(a, "POST", "/api/v1/job_applicant/auth/login", "__main__.applicant_login", "{\"ok\":true}");
+    let _ = endpoint(a, "POST", "/api/v1/employer/auth/login", "__main__.employer_login", "{\"ok\":true}");
+    let _ = endpoint(a, "POST", "/api/v1/job_applicant/auth/request_password_reset", "__main__.request_password_reset", "{\"success\":true}");
+    let _ = endpoint(a, "POST", "/api/v1/employer/auth/verify_email", "__main__.verify_email", "{\"success\":true}");
+    let _ = endpoint(a, "POST", "/api/v1/employer/documents/extract_text", "__main__.extract_text", "{\"text\":\"\"}");
+    let _ = endpoint(a, "GET", "/jobs/{job_id}", "__main__.job", "");
+    let _ = endpoint(a, "GET", "/open", "__main__.open_route", "{\"open\":true}");
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.applicant_login", "5/minute");
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.employer_login", "5/minute");
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.request_password_reset", "3/hour");
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.verify_email", "5/hour");
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.extract_text", "30/minute");
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.job", "2/minute");
+    a
+}
+
+fn knobs() -> App {
+    var a = empty_app();
+    a.limiter.headers_enabled = true;
+    a.limiter.key_prefix = std::string::from_str("app");
+    let _ = endpoint(a, "GET", "/multi", "__main__.multi", "{\"multi\":true}");
+    let _ = endpoint(a, "GET", "/stacked", "__main__.stacked", "{\"stacked\":true}");
+    let _ = endpoint(a, "GET", "/shared/a", "__main__.shared_a", "{\"a\":true}");
+    let _ = endpoint(a, "GET", "/shared/b", "__main__.shared_b", "{\"b\":true}");
+    let method = endpoint(a, "GET", "/method", "__main__.per_method", "");
+    web::route::add(a.routes, "POST", "/method", method);
+    let only_post = endpoint(a, "GET", "/only_post", "__main__.only_post", "");
+    web::route::add(a.routes, "POST", "/only_post", only_post);
+    let _ = endpoint(a, "GET", "/costly", "__main__.costly", "{\"costly\":true}");
+    let _ = endpoint(a, "GET", "/custom", "__main__.custom", "{\"custom\":true}");
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.multi", "2/second;5/minute");
+    // Decorators apply innermost first: `@limit("3/minute")` over
+    // `@limit("1/second")` registers the second-rate limit first.
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.stacked", "1/second");
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.stacked", "3/minute");
+    let _ = ratelimit::limiter::shared_limit(a.limiter, "__main__.shared_a", "3/minute", "pair");
+    let _ = ratelimit::limiter::shared_limit(a.limiter, "__main__.shared_b", "3/minute", "pair");
+    var per = ratelimit::limiter::options();
+    per.per_method = true;
+    let _ = ratelimit::limiter::limit_with(a.limiter, "__main__.per_method", "2/minute", per);
+    var post = ratelimit::limiter::options();
+    std::array::push(post.methods, std::string::from_str("POST"));
+    let _ = ratelimit::limiter::limit_with(a.limiter, "__main__.only_post", "1/minute", post);
+    var costly = ratelimit::limiter::options();
+    costly.cost = 2;
+    let _ = ratelimit::limiter::limit_with(a.limiter, "__main__.costly", "5/minute", costly);
+    var custom = ratelimit::limiter::options();
+    custom.message = std::string::from_str("Slow down");
+    let _ = ratelimit::limiter::limit_with(a.limiter, "__main__.custom", "1/minute", custom);
+    a
+}
+
+fn by_endpoint() -> App {
+    var a = empty_app();
+    a.limiter.by_endpoint = true;
+    let _ = endpoint(a, "GET", "/jobs/{job_id}", "__main__.job", "");
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.job", "2/minute");
+    a
+}
+
+fn disabled() -> App {
+    var a = empty_app();
+    a.limiter.enabled = false;
+    let _ = endpoint(a, "POST", "/api/v1/job_applicant/auth/login", "__main__.applicant_login", "{\"ok\":true}");
+    let _ = ratelimit::limiter::limit(a.limiter, "__main__.applicant_login", "1/minute");
+    a
+}
+
+/// Application `index` of the fixture: 0 the backend's shape, 1 the
+/// knobs, 2 keyed by endpoint, 3 disabled.
+///
+/// # Example
+/// ```tuo
+/// var a = ratelimit::demo::app(0);
+/// ```
+pub fn app(take index: Int) -> App {
+    if index == 1 {
+        return knobs();
+    }
+    if index == 2 {
+        return by_endpoint();
+    }
+    if index == 3 {
+        return disabled();
+    }
+    backend()
+}
+
+fn zero_stats() -> ratelimit::item::Stats {
+    ratelimit::item::Stats { reset: 0, remaining: 0 }
+}
+
+/// The body endpoint `slot` answers.
+fn body_for(in a: App, in m: web::route::Match, in method: Str) -> String {
+    let fixed = std::array::get(a.bodies, m.slot - 1);
+    if std::string::len(fixed) > 0 {
+        return std::string::from_str(std::string::as_str(fixed));
+    }
+    let job = web::route::param(m, "job_id");
+    if std::string::len(job) > 0 {
+        var out = std::string::from_str("{\"job_id\":");
+        std::str::push(out, std::string::as_str(job));
+        std::str::push(out, "}");
+        return out;
+    }
+    var out = std::string::from_str("{\"method\":");
+    web::json::push_string(out, method);
+    std::str::push(out, "}");
+    out
+}
+
+/// Answer one request from `host` at `now`.
+///
+/// # Example
+/// ```tuo
+/// let out = ratelimit::demo::handle(a, "POST", "/api/v1/job_applicant/auth/login", "203.0.113.7", now);
+/// ```
+pub fn handle(mut a: App, in method: Str, in path: Str, in host: Str, take now: Int) -> Outcome {
+    let m = web::route::resolve(a.routes, method, path);
+    if m.kind != web::route::found() {
+        return Outcome { raw: web::response::unrouted(m), decision: ratelimit::limiter::decision(), stats: zero_stats() };
+    }
+    let route = std::string::from_str(std::string::as_str(std::array::get(a.names, m.slot - 1)));
+    let r = std::string::as_str(route);
+    var d = ratelimit::limiter::decision();
+    if ratelimit::limiter::is_limited(a.limiter, r) {
+        d = ratelimit::limiter::check(a.limiter, a.store, r, method, path, host, now);
+    }
+    var st = zero_stats();
+    if d.has_view {
+        st = ratelimit::limiter::view_stats(a.store, d, now);
+    }
+    if d.exceeded {
+        let raw = ratelimit::limiter::exceeded_response(a.limiter, d, st, now);
+        return Outcome { raw: raw, decision: d, stats: st };
+    }
+    let body = body_for(a, m, method);
+    let raw = ratelimit::limiter::passed_response(a.limiter, r, d, st, now, 200, std::string::as_str(body));
+    Outcome { raw: raw, decision: d, stats: st }
+}
+
+// ----------------------------------------------------------------------------
+// Specs: every captured request, replayed.
+// ----------------------------------------------------------------------------
+
+/// The headers the oracle recorded, from a raw response: each as
+/// `name: value`, repeated values joined with `, `.
+///
+/// # Example
+/// ```tuo
+/// let h = ratelimit::demo::recorded_headers(raw);
+/// ```
+pub fn recorded_headers(in raw: Str) -> String {
+    let head = http::message::parse_head(raw, true);
+    var out = std::string::empty();
+    let names = std::str::split("content-type,x-ratelimit-limit,x-ratelimit-remaining,x-ratelimit-reset,retry-after", ",");
+    var n = 0;
+    while n < std::array::len(names) {
+        let name = std::string::as_str(std::array::get(names, n));
+        var joined = std::string::empty();
+        var found = false;
+        var i = 0;
+        while i < std::array::len(head.names) {
+            if http::message::eq_ignore_case(std::string::as_str(std::array::get(head.names, i)), name) {
+                if found {
+                    std::str::push(joined, ", ");
+                }
+                std::str::push(joined, std::string::as_str(std::array::get(head.values, i)));
+                found = true;
+            }
+            i = i + 1;
+        }
+        if found {
+            std::str::push(out, name);
+            std::str::push(out, ": ");
+            std::str::push(out, std::string::as_str(joined));
+            std::str::push(out, "\n");
+        }
+        n = n + 1;
+    }
+    out
+}
+
+/// Replay fixture request `i` on `a`, in the fixture's terms: status,
+/// headers, body, and view, one per line.
+///
+/// # Example
+/// ```tuo
+/// let out = ratelimit::demo::replay(a, 0);
+/// ```
+pub fn replay(mut a: App, take i: Int) -> String {
+    let o = handle(a, ratelimit::fixture::app_method(i), ratelimit::fixture::app_path(i), ratelimit::fixture::app_host(i), ratelimit::fixture::app_at(i));
+    let raw = std::string::as_str(o.raw);
+    var out = std::string::empty();
+    std::str::push_int(out, web::response::status_of(raw));
+    std::str::push(out, "\n");
+    std::str::push(out, std::string::as_str(recorded_headers(raw)));
+    std::str::push(out, std::string::as_str(web::response::body_of(raw)));
+    std::str::push(out, "\n");
+    if o.decision.has_view {
+        std::str::push(out, std::string::as_str(ratelimit::item::describe(o.decision.view.item)));
+        std::str::push(out, "|");
+        std::str::push(out, std::string::as_str(o.decision.view.args));
+        std::str::push(out, "|");
+        std::str::push_int(out, o.stats.reset);
+        std::str::push(out, "|");
+        std::str::push_int(out, o.stats.remaining);
+    }
+    out
+}
+
+/// What the oracle recorded for request `i`, in `replay`'s terms.
+///
+/// # Example
+/// ```tuo
+/// let want = ratelimit::demo::expected(0);
+/// ```
+pub fn expected(take i: Int) -> String {
+    var out = std::string::empty();
+    std::str::push_int(out, ratelimit::fixture::app_status(i));
+    std::str::push(out, "\n");
+    std::str::push(out, ratelimit::fixture::app_headers(i));
+    std::str::push(out, ratelimit::fixture::app_body(i));
+    std::str::push(out, "\n");
+    if ratelimit::fixture::app_has_view(i) {
+        std::str::push(out, ratelimit::fixture::app_view_limit(i));
+        std::str::push(out, "|");
+        std::str::push(out, ratelimit::fixture::app_view_args(i));
+        std::str::push(out, "|");
+        std::str::push_int(out, ratelimit::fixture::app_view_reset(i));
+        std::str::push(out, "|");
+        std::str::push_int(out, ratelimit::fixture::app_view_remaining(i));
+    }
+    out
+}
+
+/// Whether every request to application `index` came out as FastAPI and
+/// slowapi answered it, replayed in order on one fresh application.
+///
+/// # Example
+/// ```tuo
+/// let same = ratelimit::demo::app_agrees(0);
+/// ```
+pub fn app_agrees(take index: Int) -> Bool {
+    var a = app(index);
+    var i = 0;
+    while i < ratelimit::fixture::app_count() {
+        if ratelimit::fixture::app_index(i) == index {
+            if std::string::as_str(replay(a, i)) != std::string::as_str(expected(i)) {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    true
+}
+
+spec "every captured request to the backend-shaped application reproduced" {
+    then app_agrees(0);
+}
+
+spec "every captured request exercising limit's knobs and the headers reproduced" {
+    then app_agrees(1);
+}
+
+spec "every captured request keyed by endpoint, and to a disabled limiter, reproduced" {
+    then app_agrees(2);
+    then app_agrees(3);
+}
