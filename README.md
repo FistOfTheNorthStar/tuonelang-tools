@@ -474,6 +474,55 @@ impacts are bit-identical, checked by calling the backend's function.
 torch.topk's tie order is not specified, so for tied impacts it can list
 the indices differently from a stable `argsort`.
 
+### Speed
+
+`examples/numpy_bench.tuo` and `examples/numpy_bench.py` run the same
+workloads on the same inputs. Each prints a checksum of its result, and
+the checksums agree. These are best-of-three times in microseconds, with
+the port and numpy run interleaved on the same loaded machine. The port
+was compiled with `tuo --release` from tuonelang `ed6e090`; torch is
+2.14, on one thread.
+
+| Workload | Port | numpy | torch, `matching.py` |
+|---|---|---|---|
+| sum, 1M float32 | 423 | 111 | |
+| add, 1M + 1M float32 | 1,488 | 97 | |
+| sqrt, 1M float32 | 13,944 | 127 | |
+| multiply, 1000×1000 by a row, float64 | 1,580 | 297 | |
+| sum along axis 0, 1000×1000 float32 | 527 | 66 | |
+| stable argsort, 100k float64 | 9,945 | 6,352 | |
+| matching, 6 applicants × 12 questions | **9** | 15 | 57 |
+| matching, 1,000 × 50 | 5,274 | 1,241 | 6,373 |
+| matching, 10,000 × 50 | 54,821 | 13,322 | 66,503 |
+
+On the backend's real workload the port is faster than the torch code it
+would replace at every size. At the size a job posting usually has it is
+faster than numpy too, because numpy's per-call overhead dominates there.
+On large arrays numpy's SIMD loops win by 4 to 15 times, and by about 100
+on `sqrt`:
+- **`sqrt`.** tuonelang has no square-root instruction, and the
+  catalog's `std::math::sqrt` is not exact. Each root is therefore a
+  Newton estimate plus an exact integer correction: about 14 ns, where
+  `fsqrt` takes under 1. `examples/numpy_sqrt.tuo` checks it against the
+  digit-by-digit reference (`sqrt_digits`, five times slower) on 43
+  million roots: every float32, every float32 subnormal, and 18 million
+  doubles, some built next to a rounding midpoint.
+- **Elementwise loops.** These walk the output a row at a time: the
+  broadcasting odometer moves once per row, and operands in the
+  operation's own dtype are read without conversion. float32 is still
+  stored as 8-byte floats.
+- **Sums.** Sums along an outer axis run in memory order, which adds to
+  each output in the same order as walking its column.
+- **`argsort`.** Its two index buffers are reused from row to row, runs
+  of 16 are sorted by insertion, and merges alternate between the
+  buffers.
+
+The rest belongs to the compiler. tuonelang `41dc662` (real GEPs in LLVM
+lowering) took a `push(get + get)` loop from 3,450 to 739 µs per million
+elements, faster than a C `realloc` loop. What remains is a
+correctly rounded `sqrt` intrinsic, float bit casts, the cost of a struct
+advanced through a `mut` parameter in a hot loop, and `Array[F32]`.
+
 ### A finding in the backend
 
 `matching.py` scales the applicant's answers by `sqrt(employer_weight *
@@ -1678,6 +1727,9 @@ src/numpy/sort.tuo       stable sort and argsort, take, take_along_axis
 src/numpy/fixture.tuo    488 expressions and what numpy made of them (generated)
 src/numpy/demo.tuo       the expression syntax, evaluated by the port
 examples/numpy.tuo       the native oracle: every captured expression
+examples/numpy_sqrt.tuo  sqrt against its digit-by-digit reference, 43 million roots
+examples/numpy_bench.tuo the port timed natively (--release)
+examples/numpy_bench.py  the same workloads with numpy, and matching.py with torch
 examples/numpy_oracle.py numpy 2.5.3, recorded
 examples/numpy_fixture.py numpy_oracle.json to src/numpy/fixture.tuo
 

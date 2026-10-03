@@ -308,6 +308,19 @@ else
   check 1 "numpy oracle"
 fi
 
+# numpy::ieee::sqrt against its digit-by-digit reference: every float32 and
+# float32 subnormal, and 18 million doubles, some built next to a rounding
+# midpoint. 43 million roots — the one oracle built with --release.
+step "Numpy: sqrt against its reference (43 million roots)"
+"$TUO" run --release examples/numpy_sqrt.tuo src/numpy/ieee.tuo src/std_str.tuo
+rc=$?
+if [ "$rc" -eq 0 ]; then
+  check 0 "numpy sqrt (all roots agreed)"
+else
+  echo "numpy sqrt exited $rc — that many roots disagreed"
+  check 1 "numpy sqrt"
+fi
+
 # The HTTP server and client prove each other over loopback, in one process.
 step "HTTP: loopback oracle (server and client in one process)"
 "$TUO" run examples/http.tuo "${HTTP_SRC[@]}"

@@ -1,0 +1,258 @@
+// examples/numpy_bench — the numpy port timed, natively.
+//
+//     tuo run --release examples/numpy_bench.tuo src/numpy/*.tuo src/std_str.tuo
+//
+// The same workloads as examples/numpy_bench.py, on the same inputs (the
+// oracle's LCG): one line per workload with the best time of several runs
+// in microseconds, and a checksum of the result — the bit pattern of an
+// element, or of a sum — which the Python side prints too, so a time is
+// only compared when the two computed the same thing.
+
+module numpy_bench;
+
+/// The oracle's LCG.
+struct Lcg {
+    x: Int,
+}
+
+fn next(mut g: Lcg) -> Int {
+    g.x = (g.x * 1103515245 + 12345) % 2147483648;
+    g.x >> 16
+}
+
+fn floats(take n: Int, take seed: Int, take dtype: Int) -> numpy::ndarray::NdArray {
+    var g = Lcg { x: seed };
+    var v = std::array::empty();
+    var i = 0;
+    while i < n {
+        std::array::push(v, (next(g) as Float) / 32768.0 * 2.0 - 1.0);
+        i = i + 1;
+    }
+    numpy::ndarray::from_floats(dtype, v)
+}
+
+fn choices(take n: Int, take seed: Int, in table: Array[Float]) -> numpy::ndarray::NdArray {
+    var g = Lcg { x: seed };
+    var v = std::array::empty();
+    var i = 0;
+    while i < n {
+        std::array::push(v, std::array::get(table, next(g) % std::array::len(table)));
+        i = i + 1;
+    }
+    numpy::ndarray::from_floats(2, v)
+}
+
+fn shape2(take a: Int, take b: Int) -> Array[Int] {
+    var s = std::array::empty();
+    std::array::push(s, a);
+    std::array::push(s, b);
+    s
+}
+
+fn report(in name: Str, take nanos: Int, in check: Str) {
+    var line = std::string::from_str(name);
+    std::str::push(line, "\t");
+    std::str::push_int(line, nanos / 1000);
+    std::str::push(line, ".");
+    std::str::push_int(line, (nanos % 1000) / 100);
+    std::str::push(line, "\t");
+    std::str::push(line, check);
+    std::str::push(line, "\n");
+    let _ = std::rt::write_string(1, line);
+}
+
+fn check_of(in a: numpy::ndarray::NdArray) -> String {
+    if a.dtype == 2 {
+        return numpy::ieee::hex32(std::array::get(a.floats, 0));
+    }
+    if a.dtype == 3 {
+        return numpy::ieee::hex64(std::array::get(a.floats, 0));
+    }
+    std::str::to_string(std::array::get(a.ints, 0))
+}
+
+fn last_check(in a: numpy::ndarray::NdArray) -> String {
+    let n = numpy::ndarray::size(a) - 1;
+    if a.dtype == 2 {
+        return numpy::ieee::hex32(std::array::get(a.floats, n));
+    }
+    if a.dtype == 3 {
+        return numpy::ieee::hex64(std::array::get(a.floats, n));
+    }
+    std::str::to_string(std::array::get(a.ints, n))
+}
+
+/// The questionnaire score and the five smallest and largest impacts, as
+/// matching.py computes them, written with the port. Returns the scores;
+/// the top-five indices are computed and dropped, as the timing should
+/// include them.
+fn matching(in e: numpy::ndarray::NdArray, in w: numpy::ndarray::NdArray, in m: numpy::ndarray::NdArray, in a: numpy::ndarray::NdArray, in v: numpy::ndarray::NdArray) -> numpy::ndarray::NdArray {
+    let two = numpy::ndarray::python_float(2.0);
+    let one = numpy::ndarray::python_float(1.0);
+    let emp_vec = numpy::ufunc::where_(m, two, e);
+    let emp_w = numpy::ufunc::where_(m, one, w);
+    let expanded = numpy::ufunc::where_(numpy::ufunc::binary(a, e, 6), numpy::ndarray::scalar(2, 2.0, 0), numpy::ndarray::scalar(2, 0.0 - 2.0, 0));
+    let app = numpy::ufunc::where_(m, expanded, a);
+    let app_w = numpy::ufunc::where_(m, one, v);
+    let combined = numpy::ufunc::multiply(emp_w, app_w);
+    let diff = numpy::ufunc::subtract(numpy::ufunc::multiply(app, numpy::ufunc::unary(combined, 2)), numpy::ufunc::multiply(emp_vec, numpy::ufunc::unary(emp_w, 2)));
+    let axis = numpy::ndarray::python_int(1);
+    let dist = numpy::ufunc::unary(numpy::reduce::sum(numpy::ufunc::unary(diff, 3), axis, false), 2);
+    let max_dist = numpy::ufunc::unary(numpy::reduce::sum(numpy::ufunc::multiply(combined, numpy::ndarray::python_float(16.0)), axis, false), 2);
+    let floor = numpy::ufunc::clip(max_dist, numpy::ndarray::python_float(0.00000001), numpy::ndarray::none());
+    let ratio = numpy::ufunc::subtract(one, numpy::ufunc::divide(dist, floor));
+    let scores = numpy::ufunc::clip(numpy::ufunc::multiply(ratio, numpy::ndarray::python_float(100.0)), numpy::ndarray::python_float(0.0), numpy::ndarray::python_float(100.0));
+    let impact = numpy::ufunc::multiply(numpy::ufunc::divide(numpy::ufunc::unary(numpy::ufunc::subtract(app, emp_vec), 1), numpy::ndarray::python_float(4.0)), combined);
+    let five = numpy::ndarray::arange(5);
+    let last = numpy::ndarray::python_int(0 - 1);
+    let best = numpy::sort::take_(numpy::sort::argsort(impact, last), five, axis);
+    let worst = numpy::sort::take_(numpy::sort::argsort(numpy::ufunc::unary(impact, 0), last), five, axis);
+    if numpy::ndarray::size(best) + numpy::ndarray::size(worst) < 0 {
+        return best;
+    }
+    scores
+}
+
+fn bench_matching(in name: Str, take n: Int, take q: Int, take reps: Int) {
+    var weights = std::array::empty();
+    std::array::push(weights, 0.5);
+    std::array::push(weights, 1.0);
+    std::array::push(weights, 2.0);
+    var answers = std::array::empty();
+    var k = 0 - 2;
+    while k <= 2 {
+        std::array::push(answers, k as Float);
+        k = k + 1;
+    }
+    let e = choices(q, 101, answers);
+    let w = choices(q, 102, weights);
+    var g = Lcg { x: 103 };
+    var flags = std::array::empty();
+    var i = 0;
+    while i < q {
+        if next(g) % 4 == 0 {
+            std::array::push(flags, 1);
+        } else {
+            std::array::push(flags, 0);
+        }
+        i = i + 1;
+    }
+    let m = numpy::ndarray::from_ints(0, flags);
+    let a = numpy::ndarray::reshape(choices(n * q, 104, answers), shape2(n, q));
+    let v = numpy::ndarray::reshape(choices(n * q, 105, weights), shape2(n, q));
+    var best = 9223372036854775807;
+    var r = 0;
+    var check = std::string::empty();
+    while r < reps {
+        let t0 = std::rt::now_nanos();
+        let scores = matching(e, w, m, a, v);
+        let t1 = std::rt::now_nanos();
+        if t1 - t0 < best {
+            best = t1 - t0;
+        }
+        check = last_check(scores);
+        r = r + 1;
+    }
+    report(name, best, std::string::as_str(check));
+}
+
+fn main() -> Int {
+    let none = numpy::ndarray::none();
+    let million32 = floats(1000000, 1, 2);
+    let other32 = floats(1000000, 2, 2);
+    var best = 9223372036854775807;
+    var r = 0;
+    var check = std::string::empty();
+    while r < 5 {
+        let t0 = std::rt::now_nanos();
+        let s = numpy::reduce::sum(million32, none, false);
+        let t1 = std::rt::now_nanos();
+        if t1 - t0 < best {
+            best = t1 - t0;
+        }
+        check = check_of(s);
+        r = r + 1;
+    }
+    report("sum float32 [1e6]", best, std::string::as_str(check));
+
+    best = 9223372036854775807;
+    r = 0;
+    while r < 5 {
+        let t0 = std::rt::now_nanos();
+        let s = numpy::ufunc::add(million32, other32);
+        let t1 = std::rt::now_nanos();
+        if t1 - t0 < best {
+            best = t1 - t0;
+        }
+        check = last_check(s);
+        r = r + 1;
+    }
+    report("add float32 [1e6] + [1e6]", best, std::string::as_str(check));
+
+    best = 9223372036854775807;
+    r = 0;
+    while r < 5 {
+        let t0 = std::rt::now_nanos();
+        let s = numpy::ufunc::unary(million32, 2);
+        let t1 = std::rt::now_nanos();
+        if t1 - t0 < best {
+            best = t1 - t0;
+        }
+        check = last_check(s);
+        r = r + 1;
+    }
+    report("sqrt float32 [1e6]", best, std::string::as_str(check));
+
+    let matrix = numpy::ndarray::reshape(floats(1000000, 3, 3), shape2(1000, 1000));
+    let row = floats(1000, 4, 3);
+    best = 9223372036854775807;
+    r = 0;
+    while r < 5 {
+        let t0 = std::rt::now_nanos();
+        let s = numpy::ufunc::multiply(matrix, row);
+        let t1 = std::rt::now_nanos();
+        if t1 - t0 < best {
+            best = t1 - t0;
+        }
+        check = last_check(s);
+        r = r + 1;
+    }
+    report("multiply float64 [1000,1000] * [1000]", best, std::string::as_str(check));
+
+    let square32 = numpy::ndarray::reshape(floats(1000000, 5, 2), shape2(1000, 1000));
+    let zero = numpy::ndarray::python_int(0);
+    best = 9223372036854775807;
+    r = 0;
+    while r < 5 {
+        let t0 = std::rt::now_nanos();
+        let s = numpy::reduce::sum(square32, zero, false);
+        let t1 = std::rt::now_nanos();
+        if t1 - t0 < best {
+            best = t1 - t0;
+        }
+        check = last_check(s);
+        r = r + 1;
+    }
+    report("sum float32 [1000,1000] axis 0", best, std::string::as_str(check));
+
+    let many = floats(100000, 6, 3);
+    let last = numpy::ndarray::python_int(0 - 1);
+    best = 9223372036854775807;
+    r = 0;
+    while r < 5 {
+        let t0 = std::rt::now_nanos();
+        let s = numpy::sort::argsort(many, last);
+        let t1 = std::rt::now_nanos();
+        if t1 - t0 < best {
+            best = t1 - t0;
+        }
+        check = check_of(s);
+        r = r + 1;
+    }
+    report("argsort float64 [1e5]", best, std::string::as_str(check));
+
+    bench_matching("matching, 6 applicants x 12 questions", 6, 12, 2000);
+    bench_matching("matching, 1000 applicants x 50 questions", 1000, 50, 20);
+    bench_matching("matching, 10000 applicants x 50 questions", 10000, 50, 5);
+    0
+}
