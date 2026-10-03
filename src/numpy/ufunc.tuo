@@ -325,6 +325,48 @@ pub fn walk(in out: Array[Int], in a: Array[Int], in b: Array[Int], in c: Array[
     Walk { shape: numpy::ndarray::copy_shape(out), index: index, sa: strides(a, out), sb: strides(b, out), sc: strides(c, out), oa: 0, ob: 0, oc: 0 }
 }
 
+/// A walk over the rows of `out` — every axis but the last — carrying the
+/// operands' full strides, so that within a row an operand advances by its
+/// last stride (0 or 1) and the odometer moves once per row.
+///
+/// # Example
+/// ```tuo
+/// var w = numpy::ufunc::rows(out_shape, a.shape, b.shape, c.shape);
+/// ```
+pub fn rows(in out: Array[Int], in a: Array[Int], in b: Array[Int], in c: Array[Int]) -> Walk {
+    var shape = std::array::empty();
+    var index = std::array::empty();
+    var i = 0;
+    while i + 1 < std::array::len(out) {
+        std::array::push(shape, std::array::get(out, i));
+        std::array::push(index, 0);
+        i = i + 1;
+    }
+    Walk { shape: shape, index: index, sa: strides(a, out), sb: strides(b, out), sc: strides(c, out), oa: 0, ob: 0, oc: 0 }
+}
+
+/// The length of a row of `out`: its last axis, or 1 for a 0-d result.
+///
+/// # Example
+/// ```tuo
+/// let n = numpy::ufunc::row_length(out_shape);
+/// ```
+pub fn row_length(in out: Array[Int]) -> Int {
+    let n = std::array::len(out);
+    if n == 0 {
+        return 1;
+    }
+    std::array::get(out, n - 1)
+}
+
+fn last_of(in xs: Array[Int]) -> Int {
+    let n = std::array::len(xs);
+    if n == 0 {
+        return 0;
+    }
+    std::array::get(xs, n - 1)
+}
+
 /// Steps `w` to the next output element in C order.
 ///
 /// # Example
@@ -487,30 +529,73 @@ pub fn binary(in a: numpy::ndarray::NdArray, in b: numpy::ndarray::NdArray, take
     var out = numpy::ndarray::build(out_dtype, numpy::ndarray::copy_shape(shape), std::array::empty(), std::array::empty());
     let n = numpy::ndarray::product(shape);
     let none = std::array::empty();
-    var w = walk(shape, a.shape, b.shape, none);
+    var w = rows(shape, a.shape, b.shape, none);
+    let inner = row_length(shape);
+    let ia = last_of(w.sa);
+    let ib = last_of(w.sb);
+    // Float operands already in the operation's dtype — the common case —
+    // are read directly, in a loop with nothing else to decide.
+    if numpy::dtype::is_float(dtype) && !is_comparison(op) && a.dtype == dtype && b.dtype == dtype {
+        var k = 0;
+        while k < n {
+            var j = 0;
+            while j < inner {
+                let x = std::array::get(a.floats, w.oa + j * ia);
+                let y = std::array::get(b.floats, w.ob + j * ib);
+                var r = 0.0;
+                if op == 0 {
+                    r = x + y;
+                } else if op == 1 {
+                    r = x - y;
+                } else if op == 2 {
+                    r = x * y;
+                } else if op == 3 {
+                    r = x / y;
+                } else if op == 4 {
+                    r = float_max(x, y);
+                } else {
+                    r = float_min(x, y);
+                }
+                if dtype == 2 {
+                    r = numpy::ieee::round32(r);
+                }
+                std::array::push(out.floats, r);
+                j = j + 1;
+            }
+            advance(w);
+            k = k + inner;
+        }
+        return out;
+    }
     var k = 0;
     while k < n {
-        if numpy::dtype::is_float(dtype) {
-            let x = numpy::ndarray::float_at(a, w.oa, dtype);
-            let y = numpy::ndarray::float_at(b, w.ob, dtype);
-            if is_comparison(op) {
-                push_bool(out, compare_floats(op, x, y));
+        var j = 0;
+        while j < inner {
+            let pa = w.oa + j * ia;
+            let pb = w.ob + j * ib;
+            if numpy::dtype::is_float(dtype) {
+                let x = numpy::ndarray::float_at(a, pa, dtype);
+                let y = numpy::ndarray::float_at(b, pb, dtype);
+                if is_comparison(op) {
+                    push_bool(out, compare_floats(op, x, y));
+                } else {
+                    std::array::push(out.floats, float_op(op, x, y, dtype));
+                }
             } else {
-                std::array::push(out.floats, float_op(op, x, y, dtype));
+                let x = numpy::ndarray::int_at(a, pa);
+                let y = numpy::ndarray::int_at(b, pb);
+                if is_comparison(op) {
+                    push_bool(out, compare_ints(op, x, y));
+                } else if dtype == 0 {
+                    std::array::push(out.ints, bool_op(op, x, y));
+                } else {
+                    std::array::push(out.ints, int_op(op, x, y));
+                }
             }
-        } else {
-            let x = numpy::ndarray::int_at(a, w.oa);
-            let y = numpy::ndarray::int_at(b, w.ob);
-            if is_comparison(op) {
-                push_bool(out, compare_ints(op, x, y));
-            } else if dtype == 0 {
-                std::array::push(out.ints, bool_op(op, x, y));
-            } else {
-                std::array::push(out.ints, int_op(op, x, y));
-            }
+            j = j + 1;
         }
         advance(w);
-        k = k + 1;
+        k = k + inner;
     }
     out
 }
@@ -688,16 +773,27 @@ pub fn where_(in condition: numpy::ndarray::NdArray, in x: numpy::ndarray::NdArr
     let dtype = numpy::dtype::result_type(x.dtype, x.weak, y.dtype, y.weak);
     var out = numpy::ndarray::build(dtype, numpy::ndarray::copy_shape(shape), std::array::empty(), std::array::empty());
     let n = numpy::ndarray::product(shape);
-    var w = walk(shape, condition.shape, x.shape, y.shape);
+    var w = rows(shape, condition.shape, x.shape, y.shape);
+    let inner = row_length(shape);
+    let ia = last_of(w.sa);
+    let ib = last_of(w.sb);
+    let ic = last_of(w.sc);
     var k = 0;
     while k < n {
-        if numpy::ndarray::truth_at(condition, w.oa) {
-            numpy::ndarray::push_converted(out, x, w.ob);
-        } else {
-            numpy::ndarray::push_converted(out, y, w.oc);
+        var j = 0;
+        while j < inner {
+            let pa = w.oa + j * ia;
+            let pb = w.ob + j * ib;
+            let pc = w.oc + j * ic;
+            if numpy::ndarray::truth_at(condition, pa) {
+                numpy::ndarray::push_converted(out, x, pb);
+            } else {
+                numpy::ndarray::push_converted(out, y, pc);
+            }
+            j = j + 1;
         }
         advance(w);
-        k = k + 1;
+        k = k + inner;
     }
     out
 }
@@ -751,46 +847,57 @@ pub fn clip(in x: numpy::ndarray::NdArray, in low: numpy::ndarray::NdArray, in h
     let strict = numpy::ndarray::ndim(low) == 0 && numpy::ndarray::ndim(high) == 0;
     var out = numpy::ndarray::build(dtype, numpy::ndarray::copy_shape(shape), std::array::empty(), std::array::empty());
     let n = numpy::ndarray::product(shape);
-    var w = walk(shape, x.shape, low.shape, high.shape);
+    var w = rows(shape, x.shape, low.shape, high.shape);
+    let inner = row_length(shape);
+    let ia = last_of(w.sa);
+    let ib = last_of(w.sb);
+    let ic = last_of(w.sc);
     var k = 0;
     while k < n {
-        if numpy::dtype::is_float(dtype) {
-            let v = numpy::ndarray::float_at(x, w.oa, dtype);
-            let lo = numpy::ndarray::float_at(low, w.ob, dtype);
-            let hi = numpy::ndarray::float_at(high, w.oc, dtype);
-            var r = v;
-            if v != v || lo != lo || hi != hi {
-                r = numpy::ieee::nan();
-            } else if strict {
+        var j = 0;
+        while j < inner {
+            let pa = w.oa + j * ia;
+            let pb = w.ob + j * ib;
+            let pc = w.oc + j * ic;
+            if numpy::dtype::is_float(dtype) {
+                let v = numpy::ndarray::float_at(x, pa, dtype);
+                let lo = numpy::ndarray::float_at(low, pb, dtype);
+                let hi = numpy::ndarray::float_at(high, pc, dtype);
+                var r = v;
+                if v != v || lo != lo || hi != hi {
+                    r = numpy::ieee::nan();
+                } else if strict {
+                    if r < lo {
+                        r = lo;
+                    }
+                    if r > hi {
+                        r = hi;
+                    }
+                } else {
+                    if r <= lo {
+                        r = lo;
+                    }
+                    if r >= hi {
+                        r = hi;
+                    }
+                }
+                std::array::push(out.floats, r);
+            } else {
+                var r = numpy::ndarray::int_at(x, pa);
+                let lo = numpy::ndarray::int_at(low, pb);
+                let hi = numpy::ndarray::int_at(high, pc);
                 if r < lo {
                     r = lo;
                 }
                 if r > hi {
                     r = hi;
                 }
-            } else {
-                if r <= lo {
-                    r = lo;
-                }
-                if r >= hi {
-                    r = hi;
-                }
+                std::array::push(out.ints, r);
             }
-            std::array::push(out.floats, r);
-        } else {
-            var r = numpy::ndarray::int_at(x, w.oa);
-            let lo = numpy::ndarray::int_at(low, w.ob);
-            let hi = numpy::ndarray::int_at(high, w.oc);
-            if r < lo {
-                r = lo;
-            }
-            if r > hi {
-                r = hi;
-            }
-            std::array::push(out.ints, r);
+            j = j + 1;
         }
         advance(w);
-        k = k + 1;
+        k = k + inner;
     }
     out
 }
