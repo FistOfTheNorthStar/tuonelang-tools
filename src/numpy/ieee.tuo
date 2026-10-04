@@ -429,6 +429,85 @@ pub fn negate(take x: Float) -> Float {
 /// The correctly rounded square root: NaN for a negative `x`, `x` itself
 /// for a zero (keeping its sign), an infinity, or NaN.
 ///
+/// `x` is scaled by a power of four into `[1, 4)`, so the root's scale is
+/// the matching power of two; three Newton steps from a quadratic fit
+/// bring the root to within a unit or so of double precision; and an
+/// exact integer test settles it. With `F = f * 2^52`, the candidate
+/// significand `q` is the nearest integer to `sqrt(F * 2^52)` exactly when
+/// `-q < F * 2^52 - q^2 <= q` (no tie: `(q + 1/2)^2` is never an integer),
+/// and that difference is computed exactly from 26-bit halves of `q`.
+/// `sqrt_digits` is the slow reference it is checked against.
+///
+/// # Example
+/// ```tuo
+/// let r = numpy::ieee::sqrt(2.0); // 1.4142135623730951
+/// ```
+pub fn sqrt(take x: Float) -> Float {
+    if is_nan(x) || x == 0.0 {
+        return x;
+    }
+    if x < 0.0 {
+        return nan();
+    }
+    if x > max64() {
+        return x;
+    }
+    // x = f * 4^k with f in [1, 4), and s = 2^k.
+    var f = x;
+    var s = 1.0;
+    if f >= 4.0 {
+        var step = 256;
+        while step >= 1 {
+            if f >= up(2 * step) {
+                f = f * down(2 * step);
+                s = s * up(step);
+            }
+            step = step / 2;
+        }
+    } else if f < 1.0 {
+        if f * up(512) < 4.0 {
+            f = f * up(512);
+            s = s * down(256);
+        }
+        var step = 256;
+        while step >= 1 {
+            if f * up(2 * step) < 4.0 {
+                f = f * up(2 * step);
+                s = s * down(step);
+            }
+            step = step / 2;
+        }
+    }
+    var g = 0.5349632742383923 + f * (0.5129962111754349 - 0.037414034827730494 * f);
+    g = 0.5 * (g + f / g);
+    g = 0.5 * (g + f / g);
+    g = 0.5 * (g + f / g);
+    let big = (f * 4503599627370496.0) as Int;
+    var q = (g * 4503599627370496.0) as Int;
+    var settled = false;
+    var tries = 0;
+    while !settled && tries < 8 {
+        let a = q >> 26;
+        let b = q & 67108863;
+        let t = 2 * a * b;
+        let low = b * b + (t & 67108863) * 67108864;
+        let high = a * a + (t >> 26) + (low >> 52);
+        let d = (big - high) * 4503599627370496 - (low & 4503599627370495);
+        if d > q {
+            q = q + 1;
+        } else if d <= 0 - q {
+            q = q - 1;
+        } else {
+            settled = true;
+        }
+        tries = tries + 1;
+    }
+    (q as Float) * 2.220446049250313e-16 * s
+}
+
+/// The correctly rounded square root computed digit by digit — the
+/// reference `sqrt` is checked against, and a fifth of its speed.
+///
 /// The significand, made even in its exponent, is the radicand of a
 /// binary digit-by-digit root to 54 bits; the 54th bit rounds. A tie
 /// cannot occur: an odd 54-bit root would square to an odd radicand,
@@ -436,9 +515,9 @@ pub fn negate(take x: Float) -> Float {
 ///
 /// # Example
 /// ```tuo
-/// let r = numpy::ieee::sqrt(2.0); // 1.4142135623730951
+/// let r = numpy::ieee::sqrt_digits(2.0); // 1.4142135623730951
 /// ```
-pub fn sqrt(take x: Float) -> Float {
+pub fn sqrt_digits(take x: Float) -> Float {
     if is_nan(x) || x == 0.0 {
         return x;
     }
@@ -666,6 +745,13 @@ spec round32 {
     then round32(scale(1.0, 128)) > max64();
 }
 
+spec sqrt_digits {
+    then sqrt_digits(2.0) == 1.4142135623730951;
+    then sqrt_digits(scale(1.0, 0 - 1074)) == scale(1.0, 0 - 537);
+    then sqrt_digits(max64()) == sqrt(max64());
+    then sqrt_digits(0.01) == sqrt(0.01);
+}
+
 spec sqrt {
     then sqrt(2.0) == 1.4142135623730951;
     then sqrt(4.0) == 2.0;
@@ -676,6 +762,9 @@ spec sqrt {
     then is_nan(sqrt(0.0 - 1.0));
     then sqrt(infinity()) > max64();
     then round32(sqrt(2.0)) == round32(1.4142135623730951);
+    then sqrt(4.0 - scale(1.0, 0 - 51)) == sqrt_digits(4.0 - scale(1.0, 0 - 51));
+    then sqrt(scale(3.0, 0 - 1074)) == sqrt_digits(scale(3.0, 0 - 1074));
+    then sqrt(1.0 + scale(1.0, 0 - 52)) == 1.0;
 }
 
 spec rint {

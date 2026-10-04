@@ -493,6 +493,9 @@ pub fn squeeze(in a: NdArray, in axis: NdArray) -> NdArray {
 /// let x = numpy::ndarray::float_at(a, 0, numpy::dtype::float64());
 /// ```
 pub fn float_at(in a: NdArray, take i: Int, take target: Int) -> Float {
+    if a.dtype == target {
+        return std::array::get(a.floats, i);
+    }
     if numpy::dtype::is_float(a.dtype) {
         let x = std::array::get(a.floats, i);
         if target == 2 && a.dtype == 3 {

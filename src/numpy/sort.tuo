@@ -17,65 +17,101 @@ fn before_float(take x: Float, take y: Float) -> Bool {
     x < y || (y != y && x == x)
 }
 
-/// Indices `0..n` of the fiber at `base`, `inner` apart, in stable sorted
-/// order of its elements.
-fn order(in a: numpy::ndarray::NdArray, take base: Int, take n: Int, take inner: Int) -> Array[Int] {
-    var idx = std::array::empty();
-    var tmp = std::array::empty();
+/// Whether element `i` of the fiber at `base` sorts before element `j`.
+fn before(in a: numpy::ndarray::NdArray, take floats: Bool, take base: Int, take inner: Int, take i: Int, take j: Int) -> Bool {
+    if floats {
+        return before_float(std::array::get(a.floats, base + i * inner), std::array::get(a.floats, base + j * inner));
+    }
+    std::array::get(a.ints, base + i * inner) < std::array::get(a.ints, base + j * inner)
+}
+
+/// One merge pass: runs of `width` in `src[0..n]`, merged pairwise into `dst`.
+fn merge_pass(in a: numpy::ndarray::NdArray, take floats: Bool, take base: Int, take inner: Int, in src: Array[Int], mut dst: Array[Int], take n: Int, take width: Int) {
+    var lo = 0;
+    while lo < n {
+        var mid = lo + width;
+        if mid > n {
+            mid = n;
+        }
+        var hi = lo + 2 * width;
+        if hi > n {
+            hi = n;
+        }
+        var l = lo;
+        var r = mid;
+        var k = lo;
+        while k < hi {
+            var left_first = l < mid;
+            if left_first && r < hi {
+                let li = base + std::array::get(src, l) * inner;
+                let ri = base + std::array::get(src, r) * inner;
+                if floats {
+                    left_first = !before_float(std::array::get(a.floats, ri), std::array::get(a.floats, li));
+                } else {
+                    left_first = std::array::get(a.ints, ri) >= std::array::get(a.ints, li);
+                }
+            }
+            if left_first {
+                std::array::set(dst, k, std::array::get(src, l));
+                l = l + 1;
+            } else {
+                std::array::set(dst, k, std::array::get(src, r));
+                r = r + 1;
+            }
+            k = k + 1;
+        }
+        lo = hi;
+    }
+}
+
+/// Sets `idx[0..n]` to the indices of the fiber at `base`, `inner` apart,
+/// in stable sorted order of its elements: runs of 16 by insertion, then
+/// merge passes back and forth between `idx` and `tmp` (both at least `n`
+/// long, reused from fiber to fiber).
+fn order(in a: numpy::ndarray::NdArray, take base: Int, take n: Int, take inner: Int, mut idx: Array[Int], mut tmp: Array[Int]) {
+    let floats = numpy::dtype::is_float(a.dtype);
     var i = 0;
     while i < n {
-        std::array::push(idx, i);
-        std::array::push(tmp, i);
+        std::array::set(idx, i, i);
         i = i + 1;
     }
-    let floats = numpy::dtype::is_float(a.dtype);
-    var width = 1;
+    var run = 0;
+    while run < n {
+        var end = run + 16;
+        if end > n {
+            end = n;
+        }
+        i = run + 1;
+        while i < end {
+            let v = std::array::get(idx, i);
+            var j = i - 1;
+            while j >= run && before(a, floats, base, inner, v, std::array::get(idx, j)) {
+                std::array::set(idx, j + 1, std::array::get(idx, j));
+                j = j - 1;
+            }
+            std::array::set(idx, j + 1, v);
+            i = i + 1;
+        }
+        run = end;
+    }
+    var width = 16;
+    var in_idx = true;
     while width < n {
-        var lo = 0;
-        while lo < n {
-            var mid = lo + width;
-            if mid > n {
-                mid = n;
-            }
-            var hi = lo + 2 * width;
-            if hi > n {
-                hi = n;
-            }
-            var l = lo;
-            var r = mid;
-            var k = lo;
-            while k < hi {
-                var take_right = false;
-                if l >= mid {
-                    take_right = true;
-                } else if r < hi {
-                    let li = std::array::get(idx, l);
-                    let ri = std::array::get(idx, r);
-                    if floats {
-                        take_right = before_float(std::array::get(a.floats, base + ri * inner), std::array::get(a.floats, base + li * inner));
-                    } else {
-                        take_right = std::array::get(a.ints, base + ri * inner) < std::array::get(a.ints, base + li * inner);
-                    }
-                }
-                if take_right {
-                    std::array::set(tmp, k, std::array::get(idx, r));
-                    r = r + 1;
-                } else {
-                    std::array::set(tmp, k, std::array::get(idx, l));
-                    l = l + 1;
-                }
-                k = k + 1;
-            }
-            lo = hi;
+        if in_idx {
+            merge_pass(a, floats, base, inner, idx, tmp, n, width);
+        } else {
+            merge_pass(a, floats, base, inner, tmp, idx, n, width);
         }
-        var c = 0;
-        while c < n {
-            std::array::set(idx, c, std::array::get(tmp, c));
-            c = c + 1;
-        }
+        in_idx = !in_idx;
         width = width * 2;
     }
-    idx
+    if !in_idx {
+        i = 0;
+        while i < n {
+            std::array::set(idx, i, std::array::get(tmp, i));
+            i = i + 1;
+        }
+    }
 }
 
 fn sorted(in a: numpy::ndarray::NdArray, in axis: numpy::ndarray::NdArray, take indices: Bool) -> numpy::ndarray::NdArray {
@@ -122,12 +158,20 @@ fn sorted(in a: numpy::ndarray::NdArray, in axis: numpy::ndarray::NdArray, take 
         }
         i = i + 1;
     }
+    var idx = std::array::empty();
+    var tmp = std::array::empty();
+    i = 0;
+    while i < n {
+        std::array::push(idx, 0);
+        std::array::push(tmp, 0);
+        i = i + 1;
+    }
     var o = 0;
     while o < outer {
         var j = 0;
         while j < inner {
             let base = o * n * inner + j;
-            let idx = order(a, base, n, inner);
+            order(a, base, n, inner, idx, tmp);
             var t = 0;
             while t < n {
                 let from = std::array::get(idx, t);

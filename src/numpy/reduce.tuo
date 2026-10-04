@@ -152,24 +152,35 @@ fn sum_floats(in values: Array[Float], in p: Plan, take dtype: Int) -> Array[Flo
     var out = std::array::empty();
     var o = 0;
     while o < p.outer {
-        var j = 0;
-        while j < p.inner {
-            let base = o * p.length * p.inner + j;
-            // From the identity, 0.0: a sum of -0.0s is 0.0.
-            var s = 0.0;
-            if p.inner == 1 {
-                // An axis followed only by axes of length one (or the
-                // whole array) is adjacent in memory: numpy's inner loop.
-                s = add_in(s, pairwise(values, base, p.length, 1, dtype), dtype);
-            } else {
-                var t = 0;
-                while t < p.length {
-                    s = add_in(s, std::array::get(values, base + t * p.inner), dtype);
-                    t = t + 1;
-                }
+        if p.inner == 1 {
+            // An axis followed only by axes of length one (or the whole
+            // array) is adjacent in memory: numpy's inner loop. From the
+            // identity, 0.0: a sum of -0.0s is 0.0.
+            std::array::push(out, add_in(0.0, pairwise(values, o * p.length, p.length, 1, dtype), dtype));
+        } else {
+            // Slice by slice, as numpy does — and in memory order, which
+            // adds to each output in the same order as walking its column.
+            var acc = std::array::empty();
+            var j = 0;
+            while j < p.inner {
+                std::array::push(acc, 0.0);
+                j = j + 1;
             }
-            std::array::push(out, s);
-            j = j + 1;
+            var t = 0;
+            while t < p.length {
+                let row = (o * p.length + t) * p.inner;
+                j = 0;
+                while j < p.inner {
+                    std::array::set(acc, j, add_in(std::array::get(acc, j), std::array::get(values, row + j), dtype));
+                    j = j + 1;
+                }
+                t = t + 1;
+            }
+            j = 0;
+            while j < p.inner {
+                std::array::push(out, std::array::get(acc, j));
+                j = j + 1;
+            }
         }
         o = o + 1;
     }
